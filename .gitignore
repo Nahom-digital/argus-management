@@ -1,0 +1,11 @@
+# secrets & host-specific runtime — never commit these
+.env
+.session_secret
+.wallet_secret
+deploy.json
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
