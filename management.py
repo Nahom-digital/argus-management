@@ -1716,8 +1716,15 @@ def restart_service(cfg):
     step("restarting the service …")
     rc, _, stderr = run(sudo_prefix() + ["systemctl", "restart", SERVICE_NAME], timeout=180)
     if rc != 0:
-        err(f"could not restart {SERVICE_NAME}: {stderr.strip()[:200]}")
-        info(f"check the log:  journalctl -u {SERVICE_NAME} -n 50 --no-pager")
+        lines = stderr.strip().splitlines()
+        if any("password" in ln or "terminal is required" in ln for ln in lines):
+            err("restarting the service needs root, and sudo could not ask for "
+                "your password here")
+            info("the code is already updated — finish it with:")
+            print(_c(f"      sudo systemctl restart {SERVICE_NAME}", "1;37"))
+        else:
+            err(f"could not restart {SERVICE_NAME}: {(lines or [''])[-1][:200]}")
+            info(f"check the log:  journalctl -u {SERVICE_NAME} -n 50 --no-pager")
         return False
 
     host, port = cfg["host"], int(cfg["port"])
