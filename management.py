@@ -1528,9 +1528,31 @@ def choose_binding(cfg):
         cfg["port"] = port
         break
 
-    cfg["base_path"] = ask("URL base path ('' = domain root)", cfg["base_path"])
-    if cfg["base_path"] and not cfg["base_path"].startswith("/"):
-        cfg["base_path"] = "/" + cfg["base_path"]
+    # A sub-path is only correct when a reverse proxy mounts the panel under one.
+    # Setting it for a plain local install makes the browser ask for
+    # "<base>/static/dash.css", which this app does not serve at the root — the
+    # page then loads unstyled. Say so plainly instead of just showing a default.
+    print()
+    info("URL base path — leave this EMPTY unless a reverse proxy mounts the")
+    info("panel under a sub-path of a bigger site (e.g. example.com/management).")
+    info("For a normal or local install, empty is what you want.")
+    while True:
+        base = ask("URL base path (press Enter for none)", cfg["base_path"]).strip()
+        if not base or base == "/":
+            cfg["base_path"] = ""
+            break
+        if not base.startswith("/"):
+            base = "/" + base
+        base = base.rstrip("/")
+        shown = "127.0.0.1" if cfg["host"] in ("0.0.0.0", "::") else cfg["host"]
+        warn(f"the panel will only answer on http://{shown}:{cfg['port']}{base}/")
+        info(f"plain http://{shown}:{cfg['port']}/ will redirect there")
+        if ask_yes(f"Keep the base path '{base}'?", False):
+            cfg["base_path"] = base
+            break
+        info("cleared — leaving the base path empty")
+        cfg["base_path"] = ""
+        break
     return cfg
 
 
@@ -1663,7 +1685,145 @@ def announce_service(cfg):
 
 
 # --------------------------------------------------------------------------- #
-# 11. Run the panel
+# 11. --upgrade: pull the latest code from GitHub and restart
+# --------------------------------------------------------------------------- #
+def git(*args, timeout=600):
+    return run(["git", "-C", HERE] + list(args), timeout=timeout)
+
+def is_git_checkout():
+    rc, out, _ = git("rev-parse", "--is-inside-work-tree", timeout=60)
+    return rc == 0 and out.strip() == "true"
+
+def restart_service(cfg):
+    """Restart the systemd unit and confirm it comes back listening."""
+    if not systemd_available() or not os.path.exists(UNIT_PATH):
+        warn(f"{SERVICE_NAME} is not installed as a service — nothing to restart")
+        info("run it in the foreground with:  python3 management.py --serve")
+        info("or install the service with:    python3 management.py --service")
+        return False
+
+    # The unit embeds the interpreter path; regenerate it if that has drifted
+    # (e.g. the upgrade introduced a .venv that did not exist before).
+    try:
+        with open(UNIT_PATH) as f:
+            if f.read() != build_unit(cfg):
+                step("service definition changed — rewriting the unit")
+                if write_unit(cfg):
+                    run(sudo_prefix() + ["systemctl", "daemon-reload"], timeout=120)
+    except OSError:
+        pass
+
+    step("restarting the service …")
+    rc, _, stderr = run(sudo_prefix() + ["systemctl", "restart", SERVICE_NAME], timeout=180)
+    if rc != 0:
+        err(f"could not restart {SERVICE_NAME}: {stderr.strip()[:200]}")
+        info(f"check the log:  journalctl -u {SERVICE_NAME} -n 50 --no-pager")
+        return False
+
+    host, port = cfg["host"], int(cfg["port"])
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    for _ in range(20):
+        time.sleep(0.5)
+        if service_is_active() and port_is_open(probe_host, port, timeout=1):
+            ok(f"{SERVICE_NAME} is back up on port {port}")
+            return True
+    err(f"{SERVICE_NAME} did not come back on port {port}")
+    info(f"check the log:  journalctl -u {SERVICE_NAME} -n 50 --no-pager")
+    return False
+
+def upgrade_mode():
+    """`--upgrade`: git pull the latest code, refresh deps/schema, restart."""
+    banner()
+    head("Upgrading from GitHub")
+
+    if not shutil.which("git"):
+        err("git is not installed — cannot pull updates")
+        return 1
+    if not is_git_checkout():
+        err(f"{HERE} is not a git checkout, so there is nothing to pull")
+        info("this install was copied rather than cloned; re-clone it with:")
+        info("  git clone https://github.com/Nahom-digital/argus-management.git")
+        return 1
+
+    rc, branch, _ = git("rev-parse", "--abbrev-ref", "HEAD", timeout=60)
+    branch = branch.strip() or "main"
+    rc, origin, _ = git("remote", "get-url", "origin", timeout=60)
+    if rc != 0:
+        err("this checkout has no 'origin' remote to pull from")
+        return 1
+    info(f"repository: {origin.strip()}")
+    info(f"branch:     {branch}")
+
+    # Never throw away work that is only on this machine.
+    rc, dirty, _ = git("status", "--porcelain", timeout=120)
+    tracked = [ln for ln in dirty.splitlines() if ln and not ln.startswith("??")]
+    if tracked:
+        err("there are uncommitted changes to tracked files:")
+        for line in tracked[:10]:
+            info("  " + line)
+        info("commit or stash them, then run --upgrade again")
+        return 1
+
+    step("fetching from origin …")
+    rc, _, stderr = git("fetch", "--prune", "origin")
+    if rc != 0:
+        err(f"git fetch failed: {stderr.strip()[:200]}")
+        return 1
+
+    rc, log, _ = git("log", "--oneline", f"HEAD..origin/{branch}", timeout=120)
+    incoming = [ln for ln in log.splitlines() if ln.strip()]
+
+    if not incoming:
+        ok("already up to date — no new commits on origin")
+        updated = False
+    else:
+        print(f"  {_c(len(incoming), '1;37')} new commit(s) to apply:")
+        for line in incoming[:15]:
+            info("  " + line)
+        if len(incoming) > 15:
+            info(f"  … and {len(incoming) - 15} more")
+        step("pulling …")
+        rc, _, stderr = git("pull", "--ff-only", "origin", branch)
+        if rc != 0:
+            err(f"fast-forward pull failed: {stderr.strip()[:200]}")
+            info("your branch has diverged from origin; reconcile it by hand")
+            return 1
+        rc, after, _ = git("rev-parse", "--short", "HEAD", timeout=60)
+        ok(f"code updated to {after.strip()}")
+        updated = True
+
+    # A new revision may have added dependencies or tables.
+    if _missing_dependencies():
+        ensure_python_deps()
+    else:
+        ok("dependencies already satisfied")
+
+    cfg = load_config()
+    if os.path.exists(CONFIG_PATH):
+        working, reason = verify_app_connection(cfg)
+        if working:
+            missing_tables = [t for t in SCHEMA_TABLES
+                              if t not in verify_schema(cfg)]
+            if missing_tables:
+                step(f"applying {len(missing_tables)} new table(s)")
+                apply_schema(cfg)
+            else:
+                ok("database schema already up to date")
+        else:
+            warn(f"skipping the schema check — database unreachable: {reason}")
+    else:
+        warn("no deploy.json yet — run the setup wizard before serving")
+        return 1
+
+    head("Restarting")
+    if not restart_service(cfg):
+        return 1
+    announce_service(cfg)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# 12. Run the panel
 # --------------------------------------------------------------------------- #
 def serve(cfg):
     """Run the FastAPI panel in this process (blocks until stopped)."""
@@ -1866,6 +2026,7 @@ USAGE = """
 
     python3 management.py             run the setup wizard, then start the panel
     python3 management.py --service   install + start the systemd service, then exit
+    python3 management.py --upgrade   git pull the latest code, then restart the service
     python3 management.py --serve     run in the foreground from deploy.json
     python3 management.py --status    show configuration / database / service status
     python3 management.py --setup     force the wizard even without a TTY
@@ -1881,6 +2042,8 @@ def main():
     if "--status" in args:
         show_status()
         return
+    if "--upgrade" in args:
+        sys.exit(upgrade_mode())
     if "--service" in args:
         service_mode()
         return

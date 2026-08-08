@@ -182,6 +182,39 @@ class _CloudflareOnly(BaseHTTPMiddleware):
             return Response(status_code=403)
         return await call_next(request)
 
+class _BasePathStrip:
+    """Accept <MGMT_BASE>/… as well as /… .
+
+    Every route below is registered at a bare path because nginx strips the
+    public prefix before proxying. Reached directly — no proxy, or a proxy that
+    forwards the prefix intact — the browser asks for "<MGMT_BASE>/login" and
+    "<MGMT_BASE>/static/dash.css", which 404 and leave the page unstyled. Taking
+    a leading MGMT_BASE off the path here makes both shapes route identically,
+    so the panel is no longer dependent on someone else rewriting URLs for it.
+
+    Plain ASGI rather than BaseHTTPMiddleware so the terminal's websocket
+    handshake gets the same treatment as HTTP requests.
+    """
+
+    def __init__(self, app, base=""):
+        self.app = app
+        self.base = (base or "").rstrip("/")
+
+    async def __call__(self, scope, receive, send):
+        if self.base and scope.get("type") in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path == self.base or path.startswith(self.base + "/"):
+                scope = dict(scope)
+                scope["path"] = path[len(self.base):] or "/"
+                raw = scope.get("raw_path")
+                if raw:
+                    # raw_path carries the query string in some servers; only
+                    # the prefix comes off, the rest is left untouched.
+                    prefix = self.base.encode()
+                    if raw.startswith(prefix):
+                        scope["raw_path"] = raw[len(prefix):] or b"/"
+        await self.app(scope, receive, send)
+
 class _SecurityHeaders(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
@@ -755,6 +788,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Management", lifespan=lifespan)
 app.add_middleware(_SecurityHeaders)
 app.add_middleware(_CloudflareOnly)
+# Added last => outermost, so the prefix is gone before anything else looks at
+# the path. A no-op when MGMT_BASE is "" (the reverse-proxied deployment).
+app.add_middleware(_BasePathStrip, base=MGMT_BASE)
 
 def _need_auth():
     return JSONResponse(status_code=401, content={"error": "Unauthorized"})
