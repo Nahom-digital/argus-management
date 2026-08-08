@@ -1,4 +1,15 @@
+# You do NOT need to install these by hand.
+#
+#   python3 management.py
+#
+# installs whatever is missing on its own — including on Debian/Kali/Ubuntu,
+# where pip refuses to touch system site-packages (PEP 668). If every install
+# route is blocked it builds a private .venv next to this file and uses that.
+#
+# This list is kept for reference, containers and CI.
+
 fastapi>=0.110
 uvicorn>=0.27
 starlette>=0.36
 psycopg2-binary>=2.9
+websockets>=12.0
