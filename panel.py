@@ -113,12 +113,44 @@ def _bump_auth_epoch() -> int:
     _EPOCH_CACHE["value"], _EPOCH_CACHE["read_at"] = nxt, time.time()
     return nxt
 
+# The epoch above is global: bumping it signs out everybody, which is right for
+# the admin changing their own password and wrong for the admin resetting one
+# staff member's. So each staff row carries its own epoch too, and a token is
+# valid only while both still match. Cached briefly because it is read on every
+# single request; _forget_user_epoch() makes a reset take effect immediately
+# for the path that performed it.
+_USER_EPOCH_CACHE = {}
+_USER_EPOCH_TTL = 10.0
+
+def _user_epoch(username: str) -> int:
+    if not username:
+        return 0
+    now = time.time()
+    hit = _USER_EPOCH_CACHE.get(username)
+    if hit and now - hit[1] <= _USER_EPOCH_TTL:
+        return hit[0]
+    try:
+        conn = DB.get_connection()
+        try:
+            value = panel_users.auth_epoch_for(conn, username)
+        finally:
+            DB.release_connection(conn)
+    except Exception:
+        # A database blip must not sign anybody out mid-session. Reuse the last
+        # known value, and only fall back to 0 if we have never read one.
+        return hit[0] if hit else 0
+    _USER_EPOCH_CACHE[username] = (value, now)
+    return value
+
+def _forget_user_epoch(username: str) -> None:
+    _USER_EPOCH_CACHE.pop(username, None)
+
 def _create_session_token(username: str = "admin", sid: str = None) -> str:
     if sid is None:
         sid = secrets.token_hex(16)
     payload = json.dumps({"exp": int(time.time()) + 86400,
                           "username": username, "sid": sid,
-                          "ae": _auth_epoch()}).encode()
+                          "ae": _auth_epoch(), "ue": _user_epoch(username)}).encode()
     sig = hmac.new(_JWT_SECRET.encode(), payload, hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(payload).decode() + "." + sig
 
@@ -135,6 +167,10 @@ def _get_token_data(token: str):
             return None
         # Tokens minted before the current epoch were revoked by a password change.
         if int(data.get("ae", 0)) != _auth_epoch():
+            return None
+        # And tokens minted before this identity's own epoch were revoked by an
+        # admin resetting that one account, without disturbing anybody else.
+        if int(data.get("ue", 0)) != _user_epoch(data.get("username", "")):
             return None
         return data
     except Exception:
@@ -599,32 +635,40 @@ _NAV = [("server", "Server", "ic-server"), ("config", "Config", "ic-settings"),
         ("terminal", "Terminal", "ic-monitor"), ("logs", "Logs", "ic-shield-alert")]
 
 def _visible_nav(perms: dict):
-    """Which top-level tabs this identity gets. The admin sees everything;
-    a staff account only sees what its grants unlock."""
-    role = perms.get("role")
-    is_admin = role == "admin"
+    """Which top-level tabs this identity gets. Config is always present,
+    because every signed-in person has an account page to look at; what it
+    contains is decided by _config_cards()."""
     out = []
     for k, label, ic in _NAV:
-        if k == "terminal" and perms.get("terminal_access", "none") == "none":
+        if k == "terminal" and perms.get("terminal", "none") == "none":
             continue
-        if k == "logs" and not (is_admin or perms.get("logs_access")):
-            continue
-        if k == "config" and not (is_admin or perms.get("database_access")):
+        if k == "logs" and not perms.get("logs_access"):
             continue
         out.append((k, label, ic))
     return out
 
 def _config_cards(perms: dict):
-    """Which Config sub-pages this identity may open."""
+    """Which Config sub-pages this identity may open, in display order.
+
+    Staff always get their own account card, and then only the cards their
+    grants unlock. The admin gets everything.
+    """
     if perms.get("role") == "admin":
         return ["users", "server", "service", "database", "proxy"]
-    if perms.get("database_access"):
-        return ["database"]
-    return []
+    cards = ["account"]
+    if perms.get("svc_status"):
+        cards.append("service")
+    if perms.get("db_read"):
+        cards.append("database")
+    if perms.get("net_proxy"):
+        cards.append("proxy")
+    return cards
 
 _CONFIG_CARD_META = {
+    "account":  ("My Account", "ic-users",
+                 "Your username, what you are allowed to do, and your password."),
     "users":    ("User Management", "ic-users",
-                 "Create staff accounts and grant terminal, database, log and disk access."),
+                 "Create staff accounts, edit what they may do, and reset their passwords."),
     "server":   ("Server Configuration", "ic-server",
                  "Where this panel listens, and SSH access to the box."),
     "service":  ("Service", "ic-sliders-horizontal",
@@ -971,14 +1015,14 @@ def _dashboard_html(mobile: bool, user: str, perms: dict) -> str:
     shell = "mgmt-mobile" if mobile else "mgmt-desktop"
     nav = _visible_nav(perms)
     panes = _PANES_TEMPLATE.replace("{config_pane}", _config_pane_html(perms))
-    perms_json = json.dumps({
-        "role": perms.get("role"),
-        "terminalAccess": perms.get("terminal_access"),
-        "databaseAccess": bool(perms.get("database_access")),
-        "databaseWrite": bool(perms.get("database_write")),
-        "logsAccess": bool(perms.get("logs_access")),
-        "diskAccess": bool(perms.get("disk_access")),
-    })
+    # The whole resolved grant set goes to the client so the interface can hide
+    # controls nobody can use. This is a convenience for the person looking at
+    # the page and never a security boundary: every one of these is enforced
+    # again server-side, and the browser copy is assumed to be tampered with.
+    client_perms = {"role": perms.get("role"), "username": perms.get("username", ""),
+                    "fullName": perms.get("full_name", "")}
+    client_perms.update({k: perms.get(k) for k in panel_users.GRANT_KEYS})
+    perms_json = json.dumps(client_perms)
     return (
         "<!DOCTYPE html><html lang=\"en\"><head>"
         "<meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
@@ -1264,6 +1308,12 @@ def _set_admin_password(username: str, password: str) -> int:
 async def api_recovery_status(request: Request):
     if not _authed(request):
         return _need_auth()
+    # Recovery codes exist so the one irreplaceable account cannot be locked
+    # out. A staff account is replaceable: the admin resets its password in
+    # person, which is a stronger check than a code sitting in a text file.
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     username = _admin_name(request)
 
     def work():
@@ -1328,6 +1378,9 @@ async def api_account_recovery_codes(request: Request):
     """Mint a new set. Re-authenticates first: this is a credential-issuing action."""
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     username, ip = _admin_name(request), _client_ip(request)
     body = await _json_body(request)
 
@@ -1476,21 +1529,15 @@ def _resolve_permissions(username: str) -> dict:
     finally:
         DB.release_connection(conn)
 
-_NO_PERMISSIONS = {
-    "role": "none", "terminal_access": "none", "os_username": None,
-    "database_write": False, "database_access": False,
-    "logs_access": False, "disk_access": False,
-}
-
 async def _current_permissions(request: Request) -> dict:
     username = _admin_name(request)
     if not username:
-        return dict(_NO_PERMISSIONS)
+        return panel_users.no_permissions()
     return await DB.run(_resolve_permissions, username)
 
 async def _require(request: Request, check):
     """check(perms) -> bool. Returns (perms, None) if allowed, or
-    (None, JSONResponse 403) if not -- always call _authed() first."""
+    (None, JSONResponse 403) if not. Always call _authed() first."""
     perms = await _current_permissions(request)
     if not check(perms):
         return None, JSONResponse(status_code=403, content={"error": "Not permitted."})
@@ -1498,6 +1545,31 @@ async def _require(request: Request, check):
 
 def _is_admin(perms):
     return perms.get("role") == "admin"
+
+def _grant(key):
+    """A _require check for one named grant from the registry.
+
+    The admin resolves to every grant at its widest, so there is deliberately
+    no "or is admin" escape hatch here. One grant, one check, and the form the
+    admin sees is generated from the same registry these keys come from.
+    """
+    return lambda p: bool(p.get(key))
+
+def _can_browse(perms):
+    return perms.get("disk_scope", "none") != "none"
+
+def _disk_root(perms):
+    """The prefix every requested path must resolve inside, or None when the
+    caller may see the whole filesystem.
+
+    A staff member scoped to their own files but with no system account has
+    nothing legitimate to browse, so they get a path that cannot exist rather
+    than an accidental view of /.
+    """
+    if perms.get("disk_scope") != panel_users.DISK_OWN:
+        return None
+    os_username = perms.get("os_username")
+    return f"/home/{os_username}" if os_username else "/nonexistent-no-home"
 
 # ---- dashboard ----
 @app.get("/", response_class=HTMLResponse)
@@ -1531,6 +1603,9 @@ async def api_stats(request: Request):
 async def api_processes(request: Request, by: str = "cpu"):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _grant("cpumem_detail"))
+    if denied:
+        return denied
     try:
         return await DB.run(System.top_processes, "mem" if by == "mem" else "cpu")
     except Exception as e:
@@ -1540,20 +1615,23 @@ async def api_processes(request: Request, by: str = "cpu"):
 async def api_connections(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _grant("net_detail"))
+    if denied:
+        return denied
     try:
         return await DB.run(System.net_connections)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/api/system/files")
-async def api_files(request: Request, path: str = "/"):
+async def api_files(request: Request, path: str = ""):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("disk_access"))
+    perms, denied = await _require(request, _can_browse)
     if denied:
         return denied
     try:
-        return await DB.run(System.list_dir, path)
+        return await DB.run(System.list_dir, path or None, _disk_root(perms))
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -1561,10 +1639,10 @@ async def api_files(request: Request, path: str = "/"):
 async def api_download(request: Request, path: str = ""):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("disk_access"))
+    perms, denied = await _require(request, lambda p: _can_browse(p) and p.get("disk_download"))
     if denied:
         return denied
-    full, reason = System.resolve_download(path)
+    full, reason = System.resolve_download(path, root=_disk_root(perms))
     if reason == "not_found":
         return JSONResponse(status_code=404, content={"error": "not found"})
     if reason == "blocked":
@@ -1577,13 +1655,12 @@ async def api_download(request: Request, path: str = ""):
 async def api_delete_file(request: Request):
     if not _authed(request):
         return _need_auth()
-    # Deleting is admin-only, full stop -- disk_access only ever grants browsing/download.
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, lambda p: _can_browse(p) and p.get("disk_delete"))
     if denied:
         return denied
     body = await _json_body(request)
     path = body.get("path") or ""
-    ok, reason = await DB.run(System.delete_file, path)
+    ok, reason = await DB.run(System.delete_file, path, _disk_root(perms))
     if not ok:
         code = 404 if reason == "not_found" else 400 if reason == "is_directory" else 403 if reason == "blocked" else 500
         return JSONResponse(status_code=code, content={"error": reason or "delete failed"})
@@ -1623,7 +1700,7 @@ async def api_config_set(request: Request):
 async def api_services(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("svc_status"))
     if denied:
         return denied
     return await DB.run(list_services)
@@ -1632,16 +1709,27 @@ async def api_services(request: Request):
 async def api_service_detail(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("svc_status"))
     if denied:
         return denied
     return await DB.run(service_detail, name)
+
+# Bringing a service up and taking one down are separately granted: a staff
+# member who may restart a wedged service is not automatically trusted to stop
+# it. Anything not in this map is refused before it reaches systemctl.
+_SERVICE_ACTION_GRANT = {
+    "start": "svc_restart", "restart": "svc_restart", "reload": "svc_restart",
+    "stop": "svc_stop",
+}
 
 @app.post("/api/services/{name}/{action}")
 async def api_service_action(request: Request, name: str, action: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    needed = _SERVICE_ACTION_GRANT.get(action)
+    if not needed:
+        return JSONResponse(status_code=400, content={"error": "Unsupported action."})
+    perms, denied = await _require(request, _grant(needed))
     if denied:
         return denied
     ok, message = await DB.run(control_service, name, action)
@@ -1784,6 +1872,10 @@ async def api_ssh_private_key(request: Request):
                      headers={"Content-Disposition": "attachment; filename=id_ed25519"})
 
 # ---- Config: User Management (admin only) ----
+# Usernames end up in a derived system account name and in every audit row, so
+# they are restricted to characters that are unambiguous in both places.
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+
 def _list_panel_users():
     conn = DB.get_connection()
     try:
@@ -1800,14 +1892,28 @@ async def api_users_list(request: Request):
         return denied
     return {"users": await DB.run(_list_panel_users)}
 
-def _create_panel_user(username, password, terminal_access, database_access,
-                        logs_access, disk_access, created_by):
+@app.get("/api/config/grants")
+async def api_grants_registry(request: Request):
+    """The grant registry, so the admin form is generated from the same
+    definition the enforcement reads. Any signed-in user may read it: it is a
+    description of the permission vocabulary, not of anybody's permissions."""
+    if not _authed(request):
+        return _need_auth()
+    return {"groups": panel_users.grant_groups(), "grants": panel_users.describe_grants()}
+
+def _create_panel_user(username, password, grants, created_by):
     conn = DB.get_connection()
     try:
-        return panel_users.create_user(conn, username, password, terminal_access,
-                                        database_access, logs_access, disk_access, created_by)
+        return panel_users.create_user(conn, username, password, grants, created_by)
     finally:
         DB.release_connection(conn)
+
+def _grant_summary(grants):
+    """A short, readable record of a grant set for the audit trail."""
+    on = [k for k in panel_users.GRANT_KEYS
+          if k not in panel_users.CHOICE_KEYS and grants.get(k)]
+    choices = [f"{k}={grants.get(k)}" for k in sorted(panel_users.CHOICE_KEYS)]
+    return ", ".join(choices + sorted(on)) or "no grants"
 
 @app.post("/api/config/users")
 async def api_users_create(request: Request):
@@ -1819,61 +1925,75 @@ async def api_users_create(request: Request):
     body = await _json_body(request)
     username = (body.get("username") or "").strip()
     password = body.get("password") or ""
-    terminal_access = body.get("terminal_access") or "none"
     if not username or len(username) > 100:
         return JSONResponse(status_code=400, content={"error": "Enter a username."})
+    if not _USERNAME_RE.match(username):
+        return JSONResponse(status_code=400, content={
+            "error": "Usernames may use letters, digits, dot, dash and underscore only."})
     problem = recovery.password_problem(password, username)
     if problem:
         return JSONResponse(status_code=400, content={"error": problem})
-    if terminal_access not in panel_users.TERMINAL_LEVELS:
-        return JSONResponse(status_code=400, content={"error": "Unknown terminal access level."})
+    # normalize_grants is the only thing that decides what a grant payload
+    # means, so an unknown or malformed key can only ever narrow the request.
+    grants = panel_users.normalize_grants(body.get("grants"))
     try:
-        os_username = await DB.run(
-            _create_panel_user, username, password, terminal_access,
-            bool(body.get("database_access")), bool(body.get("logs_access")),
-            bool(body.get("disk_access")), _admin_name(request),
-        )
+        os_username = await DB.run(_create_panel_user, username, password, grants,
+                                    _admin_name(request))
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     except Exception as e:
         msg = "That username is already taken." if "unique" in str(e).lower() else "Could not create the user."
         return JSONResponse(status_code=400, content={"error": msg})
     write_log("ACTION", "SECURITY", "Created panel user", actor=_admin_name(request),
-              ip=_client_ip(request), target=username, detail=f"terminal={terminal_access}")
+              ip=_client_ip(request), target=username, detail=_grant_summary(grants))
     return {"status": "ok", "os_username": os_username}
 
-def _update_panel_user_perms(username, **fields):
+def _update_panel_user(username, **fields):
     conn = DB.get_connection()
     try:
-        return panel_users.update_permissions(conn, username, **fields)
+        return panel_users.update_user(conn, username, **fields)
     finally:
         DB.release_connection(conn)
 
-@app.post("/api/config/users/{username}/permissions")
+@app.post("/api/config/users/{username}")
 async def api_users_update(request: Request, username: str):
+    """Edit one staff account: their grants, their password, their display
+    name. Username is deliberately not editable, the system account and the
+    whole audit trail are keyed on it."""
     if not _authed(request):
         return _need_auth()
     perms, denied = await _require(request, _is_admin)
     if denied:
         return denied
     body = await _json_body(request)
-    fields = {}
-    if "terminal_access" in body:
-        fields["terminal_access"] = body["terminal_access"]
-    if "database_access" in body:
-        fields["database_access"] = bool(body["database_access"])
-    if "logs_access" in body:
-        fields["logs_access"] = bool(body["logs_access"])
-    if "disk_access" in body:
-        fields["disk_access"] = bool(body["disk_access"])
+    fields, notes = {}, []
+
+    if "grants" in body:
+        fields["grants"] = panel_users.normalize_grants(body.get("grants"))
+        notes.append(_grant_summary(fields["grants"]))
+    if body.get("password"):
+        problem = recovery.password_problem(body["password"], username)
+        if problem:
+            return JSONResponse(status_code=400, content={"error": problem})
+        fields["password"] = body["password"]
+        notes.append("password reset")
+    if "full_name" in body:
+        fields["full_name"] = str(body.get("full_name") or "")
+        notes.append("name changed")
+
+    if not fields:
+        return JSONResponse(status_code=400, content={"error": "Nothing to change."})
     try:
-        ok = await DB.run(_update_panel_user_perms, username, **fields)
+        ok = await DB.run(_update_panel_user, username, **fields)
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     if not ok:
         return JSONResponse(status_code=404, content={"error": "No such user."})
-    write_log("ACTION", "SECURITY", "Updated panel user permissions", actor=_admin_name(request),
-              ip=_client_ip(request), target=username, detail=str(fields))
+    # Drop the cached epoch so a reset or a narrowed grant set takes hold on the
+    # target's very next request rather than up to ten seconds later.
+    _forget_user_epoch(username)
+    write_log("ACTION", "SECURITY", "Updated panel user", actor=_admin_name(request),
+              ip=_client_ip(request), target=username, detail="; ".join(notes))
     return {"status": "ok"}
 
 def _delete_panel_user(username):
@@ -1912,7 +2032,7 @@ def _db_tables_present():
 async def api_db_tables(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("database_access"))
+    perms, denied = await _require(request, _grant("db_read"))
     if denied:
         return denied
     return {"tables": await DB.run(_db_tables_present), "write": perms.get("role") == "admin"}
@@ -1926,7 +2046,7 @@ def _db_table_page(name, page):
 async def api_db_table(request: Request, name: str, page: int = 1):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("database_access"))
+    perms, denied = await _require(request, _grant("db_read"))
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -2009,7 +2129,7 @@ def _db_add_column(name, col_name, col_type):
 async def api_db_row_insert(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("db_write"))
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -2028,7 +2148,7 @@ async def api_db_row_insert(request: Request, name: str):
 async def api_db_row_update(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("db_write"))
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -2050,7 +2170,7 @@ async def api_db_row_update(request: Request, name: str):
 async def api_db_row_delete(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("db_write"))
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -2071,7 +2191,7 @@ async def api_db_row_delete(request: Request, name: str):
 async def api_db_add_column(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("db_write"))
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -2096,7 +2216,7 @@ async def api_db_add_column(request: Request, name: str):
 async def api_proxy_list(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("net_proxy"))
     if denied:
         return denied
     return {"installed": nginx_proxy.nginx_installed(),
@@ -2106,7 +2226,7 @@ async def api_proxy_list(request: Request):
 async def api_proxy_create(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("net_proxy"))
     if denied:
         return denied
     body = await _json_body(request)
@@ -2127,7 +2247,7 @@ async def api_proxy_create(request: Request):
 async def api_proxy_delete(request: Request, filename: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _is_admin)
+    perms, denied = await _require(request, _grant("net_proxy"))
     if denied:
         return denied
     try:
@@ -2145,7 +2265,7 @@ async def api_proxy_delete(request: Request, filename: str):
 async def api_logs(request: Request, level: str = "", category: str = "", q: str = "", limit: int = 200):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return {"logs": await DB.run(query_logs, level, category, q, limit)}
@@ -2154,7 +2274,7 @@ async def api_logs(request: Request, level: str = "", category: str = "", q: str
 async def api_logs_counts(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return await DB.run(log_counts)
@@ -2164,7 +2284,7 @@ async def api_logs_counts(request: Request):
 async def api_ssh_logs(request: Request, since: str = "", limit: int = 200):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     try:
@@ -2176,7 +2296,7 @@ async def api_ssh_logs(request: Request, since: str = "", limit: int = 200):
 async def api_ssh_sessions(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return {"sessions": await DB.run(_get_current_ssh_sessions)}
@@ -2185,7 +2305,7 @@ async def api_ssh_sessions(request: Request):
 async def api_web_login_logs(request: Request, page: int = 1, limit: int = 50):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return await DB.run(DB.get_web_login_logs, page, limit)
@@ -2194,7 +2314,7 @@ async def api_web_login_logs(request: Request, page: int = 1, limit: int = 50):
 async def api_web_blocked_ips(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return {"blocked": await DB.run(DB.get_web_blocked_ips)}
@@ -2236,7 +2356,7 @@ async def api_web_block(request: Request):
 async def api_access_log(request: Request, page: int = 1, limit: int = 100, ip: str = "", path: str = ""):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return await DB.run(DB.get_http_access_logs, page, min(limit, 500), ip, path)
@@ -2245,7 +2365,7 @@ async def api_access_log(request: Request, page: int = 1, limit: int = 100, ip: 
 async def api_access_log_entry(request: Request, id: int):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     entry = await DB.run(DB.get_http_access_entry, id)
@@ -2257,7 +2377,7 @@ async def api_access_log_entry(request: Request, id: int):
 async def api_web_sessions(request: Request, limit: int = 100):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return await DB.run(DB.get_web_sessions, limit)
@@ -2266,7 +2386,7 @@ async def api_web_sessions(request: Request, limit: int = 100):
 async def api_ip_profile(request: Request, ip: str = ""):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     if not (ip or "").strip():
@@ -2277,7 +2397,7 @@ async def api_ip_profile(request: Request, ip: str = ""):
 async def api_security_log_counts(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return await DB.run(DB.get_security_log_counts)
@@ -2303,7 +2423,7 @@ async def api_clear_log(request: Request):
 async def api_fp_blocked(request: Request):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     return {"blocked": await DB.run(DB.get_fp_blocked)}
@@ -2327,7 +2447,7 @@ async def api_fp_unblock(request: Request):
 async def api_ssh_attacker(request: Request, ip: str = ""):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    perms, denied = await _require(request, _grant("logs_access"))
     if denied:
         return denied
     if not (ip or "").strip():
@@ -2500,11 +2620,11 @@ async def terminal_ws(websocket: WebSocket):
         return
     username = token_data.get("username", "")
     perms = await DB.run(_resolve_permissions, username)
-    terminal_access = perms.get("terminal_access", "none")
-    if terminal_access == "none":
+    terminal_access = perms.get("terminal", "none")
+    if terminal_access == panel_users.TERMINAL_NONE:
         await websocket.close(code=1008)
         return
-    run_as = perms.get("os_username") if terminal_access == "limited" else None
+    run_as = perms.get("os_username") if terminal_access == panel_users.TERMINAL_LIMITED else None
     is_admin = perms.get("role") == "admin"
 
     await websocket.accept()
