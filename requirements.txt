@@ -2,7 +2,7 @@
 #
 #   python3 management.py
 #
-# installs whatever is missing on its own — including on Debian/Kali/Ubuntu,
+# installs whatever is missing on its own, including on Debian/Kali/Ubuntu,
 # where pip refuses to touch system site-packages (PEP 668). If every install
 # route is blocked it builds a private .venv next to this file and uses that.
 #

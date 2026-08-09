@@ -512,10 +512,35 @@ def _download_blocked(path):
     return False
 
 
-def list_dir(path=None):
+def _sandbox_root(root):
+    """Normalize a sandbox prefix, or None for unrestricted access."""
+    return os.path.realpath(root) if root else None
+
+
+def _within(root, full):
+    """True when an already-resolved path lies inside the sandbox.
+
+    Both sides are passed through realpath before this runs, which is what
+    stops a symlink planted inside the sandbox from pointing back out of it.
+    """
+    if not root:
+        return True
+    return full == root or full.startswith(root + os.sep)
+
+
+def list_dir(path=None, root=None):
     """Read-only directory listing for the file browser. Folders first, then
-    files; each file is flagged downloadable unless it is source or a secret."""
-    base = os.path.realpath(os.path.expanduser(path or "/"))
+    files; each file is flagged downloadable unless it is source or a secret.
+
+    When root is set the listing is confined to that subtree: a path outside it
+    is refused, and the parent link stops at the sandbox instead of walking up
+    into the rest of the filesystem.
+    """
+    root = _sandbox_root(root)
+    base = os.path.realpath(os.path.expanduser(path or root or "/"))
+    if not _within(root, base):
+        return {"error": "Outside your permitted area", "path": root,
+                "parent": None, "entries": []}
     if not os.path.isdir(base):
         return {"error": "Not a directory", "path": base, "parent": None, "entries": []}
     try:
@@ -540,14 +565,18 @@ def list_dir(path=None):
         except Exception:
             continue
     entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
-    return {"path": base, "parent": (os.path.dirname(base) if base != "/" else None),
+    top = root or "/"
+    return {"path": base, "parent": (os.path.dirname(base) if base != top else None),
             "entries": entries}
 
 
-def resolve_download(path):
+def resolve_download(path, root=None):
     """Validate a download request. Returns (abspath, None) when allowed, or
-    (None, reason) when the file is missing or blocked."""
+    (None, reason) when the file is missing, blocked, or outside the sandbox."""
+    root = _sandbox_root(root)
     full = os.path.realpath(os.path.expanduser(path or ""))
+    if not _within(root, full):
+        return None, "blocked"
     if not os.path.isfile(full):
         return None, "not_found"
     if _download_blocked(full):
@@ -570,10 +599,13 @@ def _delete_blocked(path):
     return _download_blocked(path)  # never delete secrets, keys, or source either
 
 
-def resolve_delete(path):
-    """Validate a delete request. Directories are refused outright -- this is
-    a file browser, not rm -rf. Returns (abspath, None) or (None, reason)."""
+def resolve_delete(path, root=None):
+    """Validate a delete request. Directories are refused outright, this is
+    a file browser and not rm -rf. Returns (abspath, None) or (None, reason)."""
+    root = _sandbox_root(root)
     full = os.path.realpath(os.path.expanduser(path or ""))
+    if not _within(root, full):
+        return None, "blocked"
     if not os.path.exists(full):
         return None, "not_found"
     if os.path.isdir(full):
@@ -583,8 +615,8 @@ def resolve_delete(path):
     return full, None
 
 
-def delete_file(path):
-    full, reason = resolve_delete(path)
+def delete_file(path, root=None):
+    full, reason = resolve_delete(path, root=root)
     if reason:
         return False, reason
     try:

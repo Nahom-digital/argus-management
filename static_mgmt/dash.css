@@ -305,43 +305,6 @@
   }
   .pane-header strong { color: var(--black); font-family: var(--display); font-weight: 700; letter-spacing: 0.2px; }
 
-  /* ---- TRACE TERMINAL ---- */
-  .trace-scroll {
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px 20px;
-    background: var(--white);
-  }
-  .trace-card {
-    border: 1px solid var(--gray-200);
-    border-left: 3px solid var(--black);
-    border-radius: 4px;
-    padding: 10px 12px;
-    margin-bottom: 10px;
-    background: var(--white);
-  }
-  .trace-card.in { border-left-color: var(--success); }
-  .trace-card.out { border-left-color: var(--danger); }
-  .trace-meta {
-    display: flex;
-    justify-content: space-between;
-    font-size: 11px;
-    color: var(--gray-400);
-    margin-bottom: 4px;
-  }
-  .trace-route { font-size: 12px; font-weight: 600; color: var(--black); margin-bottom: 3px; }
-  .trace-action { font-size: 11px; color: var(--gray-600); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px; }
-  .trace-body {
-    font-family: var(--mono);
-    font-size: 11px;
-    background: var(--gray-50);
-    border: 1px solid var(--gray-100);
-    padding: 7px 9px;
-    border-radius: 3px;
-    white-space: pre-wrap;
-    word-break: break-all;
-    color: var(--gray-800);
-  }
   .empty-state { color: var(--gray-400); font-size: 13px; padding: 20px 0; }
 
   /* ---- DRAG DIVIDER ---- */
@@ -707,11 +670,28 @@
   .metric-now { font-size:25px; font-weight:700; font-family:var(--display); color:var(--black); letter-spacing:0px; }
   .metric-chart { width:100%; display:block; margin-top:6px; }
   .metric-foot { font-size:11px; color:var(--gray-600); font-family:var(--mono); margin-top:6px; }
-  .core-bars { display:flex; gap:3px; margin-top:10px; height:26px; align-items:flex-end; }
-  .core-bar { flex:1; background:var(--gray-100); border-radius:2px; position:relative; overflow:hidden; min-height:3px; }
-  .core-bar > span { position:absolute; bottom:0; left:0; right:0; background:var(--black); transition:height 0.4s ease, background 0.4s; }
+  /* align-items must stay stretch. The fill is absolutely positioned, so a
+     core cell has no intrinsic height, and flex-end collapsed every cell to
+     its 3px minimum: the meters could never show more than a hairline. */
+  .core-bars { display:flex; gap:3px; margin-top:10px; height:26px; align-items:stretch; }
+  .core-bar { flex:1; background:var(--gray-100); border-radius:2px; position:relative; overflow:hidden; }
+  /* Both meters below are full-size and scaled down, rather than sized in
+     percent. Scaling is a compositor operation, so a live dashboard updating
+     every second never triggers a layout pass. */
+  .core-bar > span {
+    position:absolute; inset:0; background:var(--black);
+    transform:scaleY(0.03); transform-origin:bottom;
+    transition:transform 0.4s cubic-bezier(0.23,1,0.32,1), background 0.4s ease;
+  }
   .disk-bar { height:10px; border-radius:5px; background:var(--gray-100); overflow:hidden; margin-top:10px; }
-  .disk-fill { height:100%; width:0%; background:var(--black); transition:width 0.5s ease, background 0.5s; border-radius:5px; }
+  .disk-fill {
+    height:100%; width:100%; background:var(--black); border-radius:5px;
+    transform:scaleX(0); transform-origin:left;
+    transition:transform 0.5s cubic-bezier(0.23,1,0.32,1), background 0.5s ease;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .core-bar > span, .disk-fill { transition:background 0.3s ease; }
+  }
 
   .device-card { border:1px solid var(--gray-200); border-radius:8px; padding:16px 18px; margin-top:16px; background:var(--white); }
   .device-title { font-size:13px; font-weight:700; color:var(--black); margin-bottom:14px; }
@@ -861,8 +841,6 @@
 
     /* Trace / HTTP panels */
     .traffic-footer { height: 150px; }
-    .trace-body { font-size: 10.5px; }
-    .trace-scroll { padding: 10px 12px; }
     .traffic-scroll { padding: 8px 12px; }
 
     /* Server */
@@ -882,7 +860,6 @@
     .eng-btn  { padding: 4px 8px; font-size: 10.5px; }
     .theme-btn { width: 30px; height: 30px; }
     .brand-sub { display: none; }
-    .trace-card { padding: 8px 10px; }
     .metric-now { font-size: 21px; }
   }
 
@@ -1096,3 +1073,136 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
 .log-cat-tab:hover { background: var(--gray-100); }
 .log-cat-tab.active { background: var(--accent); color: #fbf2e2; border-color: transparent; }
 [data-theme="dark"] .log-cat-tab.active { color: #20160c; }
+
+/* ===================================================================
+   PERMISSION GRANTS
+   Generated from the server's grant registry, so this has to stay
+   legible at any number of rows. Grouped fieldsets carry the structure,
+   a hairline between rows carries the rhythm, and every colour is a
+   token so both themes are covered by construction.
+   =================================================================== */
+.cfg-card-wide { max-width: 720px; }
+
+.grant-form { margin: 4px 0 20px; }
+.grant-group {
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  padding: 6px 16px 10px;
+  margin-bottom: 14px;
+  background: var(--white);
+}
+.grant-legend {
+  font-family: var(--display);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--accent);
+  padding: 0 7px;
+}
+[data-theme="dark"] .grant-legend { color: var(--gray-700); }
+
+.grant-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--gray-100);
+}
+.grant-row:last-child { border-bottom: none; }
+.grant-row-toggle { cursor: pointer; }
+.grant-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.grant-label { font-size: 13px; font-weight: 600; color: var(--black); line-height: 1.3; }
+/* gray-500 against --white clears 4.5:1 in both themes; gray-400 does not. */
+.grant-help { font-size: 11.5px; color: var(--gray-500); line-height: 1.45; }
+
+.grant-row-toggle input[type="checkbox"] {
+  width: 17px; height: 17px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+@media (hover: hover) and (pointer: fine) {
+  .grant-row-toggle:hover .grant-label { color: var(--accent); }
+}
+.grant-row-toggle:has(input:focus-visible) { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px; }
+
+.grant-row-choice { flex-direction: column; align-items: stretch; gap: 9px; }
+.grant-seg-group { display: flex; flex-wrap: wrap; gap: 6px; }
+.grant-seg {
+  position: relative;
+  padding: 6px 13px;
+  border: 1px solid var(--gray-200);
+  border-radius: 6px;
+  font-family: var(--display);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--gray-600);
+  background: var(--white);
+  cursor: pointer;
+  transition: background 0.15s cubic-bezier(0.23, 1, 0.32, 1),
+              color 0.15s cubic-bezier(0.23, 1, 0.32, 1),
+              border-color 0.15s cubic-bezier(0.23, 1, 0.32, 1);
+}
+.grant-seg input { position: absolute; opacity: 0; width: 0; height: 0; }
+.grant-seg:active { transform: scale(0.97); }
+@media (hover: hover) and (pointer: fine) {
+  .grant-seg:hover { background: var(--gray-100); border-color: var(--gray-300); color: var(--black); }
+}
+.grant-seg.on { background: var(--accent); border-color: var(--accent); color: #fff7ea; }
+[data-theme="dark"] .grant-seg.on { color: #20160c; }
+.grant-seg:has(input:focus-visible) { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+/* Read-only mirror shown to staff on their own account. Choice rows stay a
+   column, so centring is scoped away from them: align-items on a column flex
+   is horizontal, and it would push the label and pill into the middle. */
+.grant-form-readonly .grant-row { padding: 10px 2px; }
+.grant-form-readonly .grant-row:not(.grant-row-choice) { align-items: center; }
+.grant-on, .grant-off {
+  font-family: var(--display); font-size: 11px; font-weight: 700;
+  letter-spacing: 0.5px; text-transform: uppercase; flex-shrink: 0;
+}
+.grant-on { color: var(--success); }
+.grant-off { color: var(--gray-500); }
+.grant-seg-on {
+  padding: 4px 11px; border-radius: 6px; background: var(--accent-soft);
+  color: var(--accent); font-family: var(--display); font-size: 11.5px; font-weight: 600;
+}
+[data-theme="dark"] .grant-seg-on { color: var(--gray-800); }
+
+/* ---- staff list ---- */
+.staff-row {
+  display: flex; align-items: center; gap: 14px;
+  padding: 13px 0; border-bottom: 1px solid var(--gray-100);
+}
+.staff-row:last-child { border-bottom: none; }
+.staff-main { flex: 1; min-width: 0; }
+.staff-name { font-family: var(--display); font-weight: 700; font-size: 13.5px; color: var(--black); }
+.staff-full { font-family: var(--font); font-weight: 400; font-size: 12px; color: var(--gray-500); }
+.staff-grants { font-size: 11.5px; color: var(--gray-500); margin-top: 3px; line-height: 1.45; }
+.staff-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.staff-del { color: var(--danger); }
+.staff-del:hover { border-color: var(--danger); }
+
+.nu-actions { display: flex; align-items: center; gap: 10px; }
+
+/* ---- account facts ---- */
+.acct-facts { display: grid; grid-template-columns: auto 1fr; gap: 8px 18px; margin-top: 12px; }
+.acct-facts dt {
+  font-family: var(--display); font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.6px; text-transform: uppercase; color: var(--gray-600);
+  align-self: center;
+}
+.acct-facts dd { font-size: 13.5px; color: var(--black); font-weight: 600; }
+
+@media (max-width: 720px) {
+  .cfg-card-wide { max-width: 100%; }
+  .staff-row { flex-direction: column; align-items: flex-start; gap: 9px; }
+  .staff-actions { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .grant-seg { transition: none; }
+  .grant-seg:active { transform: none; }
+}
