@@ -101,10 +101,17 @@ def normalize_grants(raw):
         value = raw.get(g.key, g.default)
         if g.kind == "choice":
             out[g.key] = value if value in g.choices else g.default
+        elif isinstance(value, bool):
+            out[g.key] = value
         elif isinstance(value, str):
             out[g.key] = value.strip().lower() in _TRUTHY
+        elif isinstance(value, (int, float)):
+            out[g.key] = value != 0
         else:
-            out[g.key] = bool(value)
+            # A dict or a list arriving where a boolean belongs is malformed,
+            # not permission. Python would call a non-empty one truthy, so it
+            # collapses to the default instead of being trusted.
+            out[g.key] = bool(g.default)
     return out
 
 
@@ -249,6 +256,20 @@ def deprovision_os_account(os_username):
     subprocess.run(["userdel", "-r", os_username], capture_output=True, text=True)
 
 
+def is_admin_username(conn, username):
+    """Whether this name belongs to the primary admin account.
+
+    resolve_permissions() checks the admin table first and returns every grant
+    for a match. So a staff row sharing that name would be resolved as the
+    admin, which is why creation refuses it and verify_login refuses it.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM admin WHERE username = %s", (username,))
+    found = cur.fetchone() is not None
+    cur.close()
+    return found
+
+
 def needs_os_account(grants):
     """A real system account is required both for a locked-down shell and for
     a home directory to sandbox file access into."""
@@ -258,6 +279,8 @@ def needs_os_account(grants):
 def create_user(conn, username, password, grants, created_by):
     ensure_table(conn)
     username = (username or "").strip()
+    if is_admin_username(conn, username):
+        raise ValueError("that name belongs to the admin account, pick another")
     grants = normalize_grants(grants)
 
     os_username = None
@@ -328,8 +351,14 @@ _ABSENT_HASH = recovery.hash_password("\x00 no such account \x00")
 
 
 def verify_login(conn, username, password):
-    user = get_user(conn, username)
     candidate = recovery.hash_password(password)
+    # Closes the escalation even for a row created before create_user started
+    # refusing the name: a staff row called "admin" would otherwise sign in
+    # here and then resolve to full admin permissions.
+    if is_admin_username(conn, username):
+        hmac.compare_digest(candidate, _ABSENT_HASH)
+        return None
+    user = get_user(conn, username)
     if not user:
         hmac.compare_digest(candidate, _ABSENT_HASH)
         return None

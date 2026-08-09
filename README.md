@@ -104,15 +104,19 @@ throttled per-IP and globally, and every attempt, accepted or not, lands in
 ## Config
 
 The Config tab is where the panel administers itself. The admin sees all five
-cards; a staff account only ever sees the ones its grants unlock.
+cards; a staff account sees its own account card plus whatever its grants
+unlock.
 
-- **User Management.** Create staff accounts with their own login and a
-  narrower set of grants than the admin: terminal access (none, a restricted
-  account of their own, or root), read-only database access, log access, and
-  disk-browser access. A "restricted" terminal grant provisions a real,
-  unprivileged OS account (`useradd`, no password, no SSH key) that the panel
-  drops privileges into before spawning that user's shell, so their terminal
-  can never reach anything the admin's can.
+- **User Management.** Create staff accounts with their own login and their own
+  set of grants, edit those grants later, reset their password, or delete them.
+  Their username is fixed once created, because the derived system account and
+  the whole audit trail are keyed on it.
+
+  A "restricted" terminal grant provisions a real, unprivileged OS account
+  (`useradd`, no password, no SSH key) that the panel drops privileges into
+  before spawning that user's shell, so their terminal can never reach anything
+  the admin's can. Granting "their own files" disk access provisions the same
+  account, so there is a home directory to confine file browsing to.
 - **Server Configuration.** The host/port this panel binds to, and SSH access
   to the box: generate an ed25519 keypair (the public half is added to root's
   `authorized_keys`, the private half stays on disk and a copy is kept
@@ -124,16 +128,50 @@ cards; a staff account only ever sees the ones its grants unlock.
   own tab.
 - **Database.** A row-level viewer and editor over this panel's own tables
   only, never anything else that might live in the same Postgres database.
-  Admin gets full read/write plus add-column; a staff account with database
-  access gets read-only.
+  Reading, changing and seeing the change log are three separate grants, so a
+  staff account can be given any combination of them.
 - **Proxy.** Detects the nginx server blocks already on the box and lets you
   add or remove reverse-proxy hosts (domain, target, optional WebSocket
   support) for ones this panel created. TLS/Let's Encrypt is out of scope
   here, deliberately, that stays whatever you already use.
 
-Every Config action is re-checked server-side by role, not just hidden in the
-UI, so a staff account can't reach anything past its grants by calling the
-API directly.
+### Permissions
+
+There are fourteen grants, defined in one place: the `PERMISSIONS` registry in
+`panel_users.py`. That registry is what validates a submitted permission set,
+what the request path reads when it decides whether to answer, and what the
+admin's form is generated from. Building the form from the same definition the
+enforcement reads is deliberate: it makes it impossible to ship a checkbox no
+endpoint honours, or an endpoint gated on something the admin cannot grant.
+
+| group | grants |
+|-------|--------|
+| Terminal | none, own account only, or root |
+| Disk | reach nothing / their own files / the whole filesystem, plus download and delete as separate switches |
+| Database | read tables, change rows, view the change log |
+| Network | connection detail in the Server section, manage proxy hosts |
+| CPU and memory | the top-process lists behind both meters |
+| Services | see status, start and restart, stop |
+| Logs | the Logs tab and its readers |
+
+Adding a permission means adding one line to the registry and one check at its
+endpoint. Nothing else needs a migration, because grants are stored as a single
+normalized JSON object per account.
+
+Three things worth knowing about how this is enforced:
+
+- **Hiding is a courtesy, refusing is the boundary.** Every grant is checked
+  server-side on every request. The copy sent to the browser only decides which
+  controls are worth drawing, and is assumed to be tampered with.
+- **Files are confined by resolved path.** A staff account scoped to its own
+  files has every requested path passed through `realpath` before the prefix
+  comparison, so a symlink planted inside the sandbox cannot point out of it.
+- **Revocation is per account.** Resetting one staff password, or taking a grant
+  away, signs out that person on their next request and nobody else.
+
+Recovery codes belong to the admin account alone. A staff member who forgets
+their password asks an admin, who resets it from the user list, which is a
+stronger check than a code sitting in a file.
 
 ## Files
 

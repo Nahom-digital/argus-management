@@ -980,7 +980,7 @@ _PANES_TEMPLATE = """
         <svg class="ic" style="color:var(--danger)"><use href="#ic-triangle-alert"/></svg> Anyone holding a code can take over the panel.</div>
       <div class="cfg-running" id="acct-codes-state">Checking&hellip;</div>
       <div class="field-group" style="margin-top:16px;"><label class="field-label" for="acct-regen-pw">Current password</label>
-        <div class="field-hint">Required - issuing new codes retires every existing one.</div>
+        <div class="field-hint">Required, because issuing new codes retires every existing one.</div>
         <input class="field-input" id="acct-regen-pw" type="password" autocomplete="current-password"></div>
       <button class="save-btn" id="acct-regen" onclick="regenerateRecoveryCodes()">Generate New Codes</button>
       <div class="save-feedback" id="acct-regen-feedback"></div>
