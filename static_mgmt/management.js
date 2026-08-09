@@ -99,7 +99,7 @@ async function loadAccount(){
       el.innerHTML='<b style="color:var(--danger)">All '+d.total+' codes used.</b> Generate a new set.';
     } else {
       const low=d.unused<=1;
-      el.innerHTML='<b style="color:'+(low?'var(--danger)':'#27ae60')+'">'+d.unused+' of '+d.total+
+      el.innerHTML='<b style="color:'+(low?'var(--danger)':'var(--success)')+'">'+d.unused+' of '+d.total+
         '</b> code'+(d.unused===1?'':'s')+' unused'+
         (d.generated_at?' <span style="color:var(--gray-500);">(issued '+esc(d.generated_at.slice(0,10))+')</span>':'');
     }
@@ -229,7 +229,9 @@ async function pollServerStats(){
     drawLineChart('chart-cpu',[cpuHist],100,['--black']);
     drawLineChart('chart-ram',[ramHist],100,['--black']);
     const netMax=Math.max(1,...netInHist,...netOutHist);
-    drawLineChart('chart-net',[netInHist,netOutHist],netMax,['#22c55e','#f97316']);
+    // drawLineChart resolves a leading "--" through getComputedStyle, so these
+    // follow the theme instead of staying light-mode green and orange.
+    drawLineChart('chart-net',[netInHist,netOutHist],netMax,['--success','--warn']);
   }catch(e){}
 }
 function pushHist(a,v){
@@ -253,18 +255,14 @@ function renderCoreBars(cores){
   }
 }
 
-/* getComputedStyle forces a style flush, so reading the token once per theme
-   beats reading it once per core per second. */
-let _inkCache=null,_inkTheme=null;
-function inkColor(){
-  const theme=document.documentElement.getAttribute('data-theme');
-  if(_inkCache===null||_inkTheme!==theme){
-    _inkTheme=theme;
-    _inkCache=getComputedStyle(document.documentElement).getPropertyValue('--black').trim()||'#0a0a0a';
-  }
-  return _inkCache;
+/* These are CSS backgrounds, never canvas fills, so they can stay as var()
+   references. That means no getComputedStyle at all and the bars re-theme
+   themselves the instant the theme attribute changes. */
+function barColor(p){
+  if(p>=90) return 'var(--danger)';
+  if(p>=70) return 'var(--warn)';
+  return 'var(--black)';
 }
-function barColor(p){ if(p>=90) return '#c0392b'; if(p>=70) return '#f97316'; return inkColor(); }
 function drawLineChart(id,series,max,colors){
   const canvas=$(id); if(!canvas) return;
   const w=canvas.clientWidth||canvas.parentElement.clientWidth; const dpr=window.devicePixelRatio||1; const h=canvas.height;
@@ -290,10 +288,50 @@ function drawLineChart(id,series,max,colors){
 let _srvDetailKind=null, _fbPath='/', _accessDetailId=null;
 let _ipDetailTarget=null, _ipProfileData=null, _lineDetailObj=null, _lineDetailTitle='';
 const _SRV_TITLES={cpu:'CPU: Top Processes',mem:'Memory: Top Processes',net:'Network: Active Connections',disk:'Disk: File Browser'};
+/* Which grant each drill-down needs. The server refuses without it either way;
+   this is so the person sees a sentence instead of a failed request. */
+const _SRV_DETAIL_GRANT={cpu:'cpumem_detail',mem:'cpumem_detail',net:'net_detail'};
+
+function _mayOpenDetail(kind){
+  const needed=_SRV_DETAIL_GRANT[kind];
+  if(kind==='disk') return (window.MGMT_PERMS||{}).disk_scope!=='none';
+  if(!needed) return true;
+  return !!(window.MGMT_PERMS||{})[needed];
+}
+
+const _SRV_DENIED={
+  cpu:'Seeing which processes are using the CPU needs the "CPU and memory detail" permission.',
+  mem:'Seeing which processes are using memory needs the "CPU and memory detail" permission.',
+  net:'Seeing active connections needs the "Network detail" permission.',
+  disk:'Browsing files needs disk access.',
+};
+
 function openServerDetail(kind){
   _srvDetailKind=kind;
   $('srv-detail-title').textContent=_SRV_TITLES[kind]||'Detail';
-  $('srv-detail-overlay').classList.add('open'); loadServerDetail();
+  $('srv-detail-overlay').classList.add('open');
+  if(!_mayOpenDetail(kind)){
+    $('srv-detail-body').innerHTML=`<div class="detail-denied">
+      <svg class="ic ic-lg"><use href="#ic-shield-alert"/></svg>
+      <p>${esc(_SRV_DENIED[kind]||'You do not have permission to open this.')}</p>
+      <p class="detail-denied-sub">An admin can grant it from Config, User Management.</p>
+    </div>`;
+    return;
+  }
+  loadServerDetail();
+}
+
+/* Marks the meters that cannot be opened, so the pointer and hover state stop
+   promising something that will be refused. */
+function applyMetricPermissions(){
+  document.querySelectorAll('.metric-card[onclick]').forEach(card=>{
+    const m=/openServerDetail\('([a-z]+)'\)/.exec(card.getAttribute('onclick')||'');
+    if(!m) return;
+    const allowed=_mayOpenDetail(m[1]);
+    card.classList.toggle('metric-clickable',allowed);
+    card.classList.toggle('metric-locked',!allowed);
+    if(!allowed) card.title=_SRV_DENIED[m[1]]||'Not permitted';
+  });
 }
 function closeServerDetail(){ $('srv-detail-overlay').classList.remove('open'); _srvDetailKind=null; }
 function refreshServerDetail(){ loadServerDetail(); }
@@ -325,14 +363,14 @@ async function renderNetDetail(){
     const rows=(d.connections||[]).map(c=>{
       const isAuth=c.process&&c.process.includes('sshd-auth'), isSess=c.process&&c.process.includes('sshd-session');
       let rowStyle='',stateCell=esc(c.status),processCell=esc(c.process);
-      if(isAuth){ rowStyle='background:rgba(231,76,60,0.08);'; stateCell='<span style="color:#e74c3c;font-weight:700;">ESTAB</span>';
-        processCell='<span style="color:#e74c3c;font-weight:600;">sshd-auth</span> <span style="font-size:10px;color:#e74c3c;background:rgba(231,76,60,0.12);border-radius:3px;padding:1px 5px;">TCP only, NOT authenticated</span>'; }
-      else if(isSess){ rowStyle='background:rgba(39,174,96,0.08);'; stateCell='<span style="color:#27ae60;font-weight:700;">ESTAB</span>';
-        processCell=`<span style="color:#27ae60;font-weight:600;">${esc(c.process)}</span> <span style="font-size:10px;color:#27ae60;background:rgba(39,174,96,0.12);border-radius:3px;padding:1px 5px;">SSH authenticated session</span>`; }
+      if(isAuth){ rowStyle='background:color-mix(in srgb, var(--danger) 8%, transparent);'; stateCell='<span style="color:var(--danger);font-weight:700;">ESTAB</span>';
+        processCell='<span style="color:var(--danger);font-weight:600;">sshd-auth</span> <span style="font-size:10px;color:var(--danger);background:color-mix(in srgb, var(--danger) 12%, transparent);border-radius:3px;padding:1px 5px;">TCP only, NOT authenticated</span>'; }
+      else if(isSess){ rowStyle='background:color-mix(in srgb, var(--success) 8%, transparent);'; stateCell='<span style="color:var(--success);font-weight:700;">ESTAB</span>';
+        processCell=`<span style="color:var(--success);font-weight:600;">${esc(c.process)}</span> <span style="font-size:10px;color:var(--success);background:color-mix(in srgb, var(--success) 12%, transparent);border-radius:3px;padding:1px 5px;">SSH authenticated session</span>`; }
       return `<tr style="${rowStyle}"><td>${esc(c.proto)}</td><td>${esc(c.laddr)}</td><td><b>${esc(c.raddr)}</b></td><td>${stateCell}</td><td>${esc(c.pid)}</td><td>${processCell}</td></tr>`;
     }).join('');
     b.innerHTML=`<div style="font-size:12px;color:var(--gray-600);margin-bottom:10px;line-height:1.6;">Listening sockets first. On port 22:
-      <span style="color:#e74c3c;font-weight:600;">sshd-auth</span> = connected but not authenticated · <span style="color:#27ae60;font-weight:600;">sshd-session</span> = authenticated shell.</div>
+      <span style="color:var(--danger);font-weight:600;">sshd-auth</span> = connected but not authenticated · <span style="color:var(--success);font-weight:600;">sshd-session</span> = authenticated shell.</div>
       <table><thead><tr><th>Proto</th><th>Local</th><th>Remote IP</th><th>State</th><th>PID</th><th>Process</th></tr></thead>
       <tbody>${rows||'<tr><td colspan="6">No connections.</td></tr>'}</tbody></table>`;
   }catch(e){ b.innerHTML=`<div class="empty-state">Failed: ${esc(String(e))}</div>`; }
@@ -381,7 +419,7 @@ async function renderAccessDetail(){
   let bodyText=d.response_body;
   if(bodyText==null) bodyText='(no response body captured)';
   else if((d.content_type||'').includes('json')){ try{ bodyText=JSON.stringify(JSON.parse(d.response_body),null,2); }catch(_){} }
-  const sc=d.status_code<300?'#27ae60':d.status_code<400?'#2980b9':d.status_code<500?'#e67e22':'#e74c3c';
+  const sc=d.status_code<300?'var(--success)':d.status_code<400?'var(--info)':d.status_code<500?'var(--warn)':'var(--danger)';
   b.innerHTML=`<div style="margin-bottom:6px;"><span style="font-weight:700;color:${sc};font-size:14px;">${d.method} ${esc(d.path)} → ${d.status_code}</span></div>
     <table style="margin-bottom:16px;">${meta}</table>
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;"><div style="font-weight:700;font-size:13px;">Response body</div>
@@ -409,7 +447,7 @@ async function renderIpProfile(){
   if(d.error){ b.innerHTML=`<div class="empty-state">Error: ${esc(d.error)}</div>`; return; }
   _ipProfileData=d; const s=d.summary||{};
   const card=(label,val,color)=>`<div class="metric-card" style="min-width:120px;"><div class="metric-head"><span class="metric-title">${label}</span><span class="metric-now" style="${color?'color:'+color:''}">${val}</span></div></div>`;
-  const blocked=s.blocked?`<span style="background:rgba(231,76,60,0.12);color:#c0392b;padding:2px 9px;border-radius:4px;font-weight:700;">BLOCKED</span>`:`<button class="db-action-btn" onclick="blockIpFromProfile('${escAttr(ip)}')">Block this IP</button>`;
+  const blocked=s.blocked?`<span style="background:color-mix(in srgb, var(--danger) 12%, transparent);color:var(--danger);padding:2px 9px;border-radius:4px;font-weight:700;">BLOCKED</span>`:`<button class="db-action-btn" onclick="blockIpFromProfile('${escAttr(ip)}')">Block this IP</button>`;
   const users=(s.usernames||[]).filter(Boolean);
   const section=(title,inner)=>`<div style="margin-top:18px;"><div style="font-weight:700;font-size:13px;margin-bottom:6px;">${title}</div>${inner}</div>`;
   const none='<div style="color:var(--gray-400);font-size:12px;">None.</div>';
@@ -417,12 +455,12 @@ async function renderIpProfile(){
   const httpRows=(http.recent||[]).slice(0,60).map((r,i)=>`<tr style="cursor:pointer;" onclick="openLineDetail('HTTP request',_ipProfileData.http.recent[${i}])"><td style="font-size:11px;white-space:nowrap;">${esc(String(r.ts).slice(0,19))}</td><td style="font-weight:700;">${esc(r.method)}</td><td style="font-family:monospace;font-size:11px;">${esc(r.path)}</td><td>${esc(r.status_code)}</td><td style="font-size:11px;color:var(--gray-600);">${esc(r.authed_user||'n/a')}</td></tr>`).join('');
   const topPaths=(http.top_paths||[]).map(p=>`<span style="display:inline-block;background:var(--gray-100);border-radius:3px;padding:1px 7px;margin:2px;font-size:11px;font-family:monospace;">${esc(p.path)} <b>×${p.count}</b></span>`).join('');
   const wl=d.web_logins||{};
-  const wlRows=(wl.recent||[]).slice(0,40).map((r,i)=>`<tr style="cursor:pointer;${r.success?'':'background:rgba(231,76,60,0.05)'}" onclick="openLineDetail('Web login',_ipProfileData.web_logins.recent[${i}])"><td style="font-size:11px;white-space:nowrap;">${esc(String(r.ts).slice(0,19))}</td><td style="font-family:monospace;">${esc(r.username||'n/a')}</td><td style="color:${r.success?'#27ae60':'#e74c3c'};font-weight:700;">${r.success?'OK':'FAIL'}</td><td>${(!r.success&&r.tried_password)?`<code style="font-size:11px;color:#c0392b;">${esc(r.tried_password)}</code>`:'<span style="color:var(--gray-400)">n/a</span>'}</td></tr>`).join('');
+  const wlRows=(wl.recent||[]).slice(0,40).map((r,i)=>`<tr style="cursor:pointer;${r.success?'':'background:color-mix(in srgb, var(--danger) 5%, transparent)'}" onclick="openLineDetail('Web login',_ipProfileData.web_logins.recent[${i}])"><td style="font-size:11px;white-space:nowrap;">${esc(String(r.ts).slice(0,19))}</td><td style="font-family:monospace;">${esc(r.username||'n/a')}</td><td style="color:${r.success?'var(--success)':'var(--danger)'};font-weight:700;">${r.success?'OK':'FAIL'}</td><td>${(!r.success&&r.tried_password)?`<code style="font-size:11px;color:var(--danger);">${esc(r.tried_password)}</code>`:'<span style="color:var(--gray-400)">n/a</span>'}</td></tr>`).join('');
   const sess=(d.sessions||[]).map((r,i)=>`<tr style="cursor:pointer;" onclick="openLineDetail('Web session',_ipProfileData.sessions[${i}])"><td style="font-size:11px;white-space:nowrap;">${esc(String(r.login_at).slice(0,19))}</td><td style="font-family:monospace;">${esc(r.username)}</td><td>${esc(r.status)}</td><td style="font-size:11px;color:var(--gray-600);">${esc(String(r.logout_at||'').slice(0,19)||'n/a')}</td></tr>`).join('');
   const ssh=d.ssh||{};
   const sshRows=(ssh.recent||[]).slice(0,40).map((r,i)=>`<tr style="cursor:pointer;" onclick="openLineDetail('SSH event',_ipProfileData.ssh.recent[${i}])"><td style="font-size:11px;white-space:nowrap;">${esc(String(r.ts).slice(0,19))}</td><td>${esc(r.event_type)}</td><td>${esc(r.username||'n/a')}</td><td style="font-family:monospace;font-size:10px;">${esc(r.fingerprint||'')}</td></tr>`).join('');
   b.innerHTML=`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:6px;">
-      ${card('HTTP requests',s.http_requests??0)}${card('Login attempts',s.web_login_attempts??0)}${card('Failed logins',s.web_login_failed??0,(s.web_login_failed?'#e74c3c':''))}${card('Sessions',s.sessions??0)}${card('SSH events',s.ssh_events??0)}</div>
+      ${card('HTTP requests',s.http_requests??0)}${card('Login attempts',s.web_login_attempts??0)}${card('Failed logins',s.web_login_failed??0,(s.web_login_failed?'var(--danger)':''))}${card('Sessions',s.sessions??0)}${card('SSH events',s.ssh_events??0)}</div>
     <div style="margin:6px 0 2px;">${blocked}${users.length?`<span style="margin-left:10px;font-size:12px;color:var(--gray-600);">Accounts seen: ${users.map(u=>`<b>${esc(u)}</b>`).join(', ')}</span>`:''}</div>
     <div style="font-size:11px;color:var(--gray-500);">First seen ${esc(http.first||'n/a')} • last ${esc(http.last||'n/a')} • ${http.distinct_paths??0} distinct paths</div>
     ${section(`HTTP access (${http.total??0}), most-hit paths`,topPaths||none)}
@@ -470,7 +508,7 @@ async function loadSshStatus(){
     const r=await api('/api/system/ssh-status'); const d=await r.json();
     if(!r.ok||d.error){ stateEl.textContent='Status error: '+esc(d.error||'unknown'); return; }
     const on=!!d.active;
-    stateEl.innerHTML=`SSH is <b style="color:${on?'#27ae60':'var(--danger)'}">${on?'ON':'OFF'}</b> <span style="color:var(--gray-500);">(${esc(d.state)}, on boot: ${esc(d.enabled)})</span>`;
+    stateEl.innerHTML=`SSH is <b style="color:${on?'var(--success)':'var(--danger)'}">${on?'ON':'OFF'}</b> <span style="color:var(--gray-500);">(${esc(d.state)}, on boot: ${esc(d.enabled)})</span>`;
     btn.textContent=on?'Turn SSH Off':'Turn SSH On'; btn.dataset.enable=on?'0':'1'; btn.disabled=false;
   }catch(e){ stateEl.textContent='Could not reach server.'; }
 }
@@ -874,10 +912,10 @@ function renderServices(){
   body.innerHTML=`<table><thead><tr><th>Service</th><th>State</th><th>Description</th><th>Actions</th></tr></thead><tbody>`+
     list.map(s=>{ const on=s.active==='active';
       return `<tr><td style="font-family:var(--mono);font-size:12px;">${esc(s.short)}</td>
-        <td><span style="font-weight:700;color:${on?'#27ae60':(s.active==='failed'?'#e74c3c':'var(--gray-500)')}">${esc(s.active)}</span><span style="color:var(--gray-500);font-size:11px;"> / ${esc(s.sub)}</span></td>
+        <td><span style="font-weight:700;color:${on?'var(--success)':(s.active==='failed'?'var(--danger)':'var(--gray-500)')}">${esc(s.active)}</span><span style="color:var(--gray-500);font-size:11px;"> / ${esc(s.sub)}</span></td>
         <td style="color:var(--gray-600);">${esc(s.description)}</td>
         <td style="white-space:nowrap;"><button class="db-action-btn" onclick="svc('${esc(s.short)}','restart')">Restart</button>
-          ${on?`<button class="db-action-btn" style="border-color:#e74c3c;color:#c0392b;" onclick="svc('${esc(s.short)}','stop')">Stop</button>`:`<button class="db-action-btn" style="border-color:#27ae60;color:#1e8449;" onclick="svc('${esc(s.short)}','start')">Start</button>`}
+          ${on?`<button class="db-action-btn" style="border-color:var(--danger);color:var(--danger);" onclick="svc('${esc(s.short)}','stop')">Stop</button>`:`<button class="db-action-btn" style="border-color:var(--success);color:var(--success);" onclick="svc('${esc(s.short)}','start')">Start</button>`}
           <button class="db-action-btn" onclick="svcDetail('${esc(s.short)}')">Status</button></td></tr>`;
     }).join('')+`</tbody></table>`;
 }
@@ -910,7 +948,7 @@ function showSecSection(name){
 }
 function secHeader(label,clearKind,liveNote){
   const n=_secCounts[clearKind]; const total=(n===undefined||n===null)?'n/a':n.toLocaleString();
-  const clearBtn=clearKind?`<button class="db-action-btn" style="border-color:#e74c3c;color:#c0392b;" onclick="clearSecLog('${clearKind}','${esc(label)}')"><svg class="ic"><use href="#ic-trash-2"/></svg>Clear ${esc(label)}</button>`:'';
+  const clearBtn=clearKind?`<button class="db-action-btn" style="border-color:var(--danger);color:var(--danger);" onclick="clearSecLog('${clearKind}','${esc(label)}')"><svg class="ic"><use href="#ic-trash-2"/></svg>Clear ${esc(label)}</button>`:'';
   return `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;"><span style="font-size:12px;color:var(--gray-600);">${esc(liveNote||'')}</span>
     <span style="margin-left:auto;font-size:12px;font-weight:700;padding:3px 9px;border-radius:4px;background:var(--gray-100);">Total stored: ${total}</span>${clearBtn}</div>`;
 }
@@ -967,18 +1005,18 @@ function renderSecSection(){
     c.innerHTML=secHeader('SSH Events','ssh','SSH key fingerprints presented during authentication.')+`<table><thead><tr><th>Timestamp</th><th>IP</th><th>Fingerprint</th></tr></thead><tbody>${rows||'<tr><td colspan="3" style="color:var(--gray-400);text-align:center;">No fingerprint events.</td></tr>'}</tbody></table>`; return;
   }
   if(_secSection==='ssh-top-ips'){
-    const rows=(_secSSHData.ip_stats||[]).map(s=>`<tr><td style="cursor:pointer;text-decoration:underline dotted;" onclick="sshAttacker('${escAttr(s.ip)}')"><b>${esc(s.ip)}</b></td><td>${s.attempts}</td><td style="color:${s.success>0?'#27ae60':'#e74c3c'}">${s.success>0?s.success+' ✓':'0'}</td><td style="color:var(--gray-600);font-size:11px;">${esc(s.last_seen)}</td><td><button class="db-action-btn" style="border-color:#e74c3c;color:#c0392b;font-size:11px;padding:2px 8px;" onclick="sshBlock('${escAttr(s.ip)}')">Block device</button></td></tr>`).join('');
+    const rows=(_secSSHData.ip_stats||[]).map(s=>`<tr><td style="cursor:pointer;text-decoration:underline dotted;" onclick="sshAttacker('${escAttr(s.ip)}')"><b>${esc(s.ip)}</b></td><td>${s.attempts}</td><td style="color:${s.success>0?'var(--success)':'var(--danger)'}">${s.success>0?s.success+' ✓':'0'}</td><td style="color:var(--gray-600);font-size:11px;">${esc(s.last_seen)}</td><td><button class="db-action-btn" style="border-color:var(--danger);color:var(--danger);font-size:11px;padding:2px 8px;" onclick="sshBlock('${escAttr(s.ip)}')">Block device</button></td></tr>`).join('');
     c.innerHTML=secHeader('SSH Events','ssh','Top IPs by connection attempts (green = got in). Click an IP to see what it tried.')+`<table><thead><tr><th>IP</th><th>Attempts</th><th>Success</th><th>Last Seen</th><th>Action</th></tr></thead><tbody>${rows||'<tr><td colspan="5" style="color:var(--gray-400);text-align:center;">No data.</td></tr>'}</tbody></table>`; return;
   }
   if(_secSection==='ssh-events'){
-    const rows=(_secSSHData.events||[]).slice(0,200).map(e=>{ const color=e.event==='ACCEPTED'?'#27ae60':e.event==='FAILED'?'#e74c3c':'var(--gray-600)';
+    const rows=(_secSSHData.events||[]).slice(0,200).map(e=>{ const color=e.event==='ACCEPTED'?'var(--success)':e.event==='FAILED'?'var(--danger)':'var(--gray-600)';
       return `<tr><td style="white-space:nowrap;font-size:11px;">${esc(e.ts)}</td><td style="color:${color};font-weight:${e.event==='ACCEPTED'?'700':'400'}">${esc(e.event)}</td><td>${esc(e.ip??'n/a')}</td><td>${esc(e.user??'n/a')}</td><td>${esc(e.method??'n/a')}</td><td style="font-family:monospace;font-size:10px;">${esc(e.fingerprint??'')}</td></tr>`;}).join('');
     c.innerHTML=secHeader('SSH Events','ssh','All SSH events (most recent first), persisted across journald rotation.')+`<table><thead><tr><th>Timestamp</th><th>Event</th><th>IP</th><th>User</th><th>Method</th><th>Fingerprint</th></tr></thead><tbody>${rows||'<tr><td colspan="6" style="color:var(--gray-400);text-align:center;">No events.</td></tr>'}</tbody></table>`; return;
   }
   if(_secSection==='web-logs'){
     const rows=(_secSSHData._webLogs||[]).map((e,i)=>{ const ok=e.success;
-      const pwCell=!ok&&e.tried_password?`<code style="background:rgba(231,76,60,0.1);color:#c0392b;padding:1px 5px;border-radius:3px;font-size:11px;">${esc(e.tried_password)}</code>`:'<span style="color:var(--gray-400);">n/a</span>';
-      return `<tr style="${!ok?'background:rgba(231,76,60,0.04)':''}"><td style="white-space:nowrap;font-size:11px;cursor:pointer;text-decoration:underline dotted;" onclick="openLineDetail('Web login',_secSSHData._webLogs[${i}])">${esc(String(e.ts).slice(0,19))}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="openIpDetail('${escAttr(e.ip)}')"><b>${esc(e.ip)}</b></td><td style="font-family:monospace;">${esc(e.username??'n/a')}</td><td style="color:${ok?'#27ae60':'#e74c3c'};font-weight:700">${ok?'OK':'FAIL'}</td><td>${pwCell}</td><td style="font-size:11px;color:var(--gray-600);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(e.user_agent??'')}">${esc((e.user_agent??'').slice(0,45))}</td><td style="font-size:11px;color:var(--gray-600);">${esc(e.details??'')}</td></tr>`;}).join('');
+      const pwCell=!ok&&e.tried_password?`<code style="background:color-mix(in srgb, var(--danger) 10%, transparent);color:var(--danger);padding:1px 5px;border-radius:3px;font-size:11px;">${esc(e.tried_password)}</code>`:'<span style="color:var(--gray-400);">n/a</span>';
+      return `<tr style="${!ok?'background:color-mix(in srgb, var(--danger) 4%, transparent)':''}"><td style="white-space:nowrap;font-size:11px;cursor:pointer;text-decoration:underline dotted;" onclick="openLineDetail('Web login',_secSSHData._webLogs[${i}])">${esc(String(e.ts).slice(0,19))}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="openIpDetail('${escAttr(e.ip)}')"><b>${esc(e.ip)}</b></td><td style="font-family:monospace;">${esc(e.username??'n/a')}</td><td style="color:${ok?'var(--success)':'var(--danger)'};font-weight:700">${ok?'OK':'FAIL'}</td><td>${pwCell}</td><td style="font-size:11px;color:var(--gray-600);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(e.user_agent??'')}">${esc((e.user_agent??'').slice(0,45))}</td><td style="font-size:11px;color:var(--gray-600);">${esc(e.details??'')}</td></tr>`;}).join('');
     c.innerHTML=secHeader('Web Login Logs','web_logins',`Panel login history, ${_secSSHData._webTotal??0} total · ${_secSSHData._webSuccess??0} ok · ${_secSSHData._webFailed??0} failed.`)+`<table><thead><tr><th>Timestamp</th><th>IP</th><th>Username</th><th>Result</th><th>Tried Password</th><th>User Agent</th><th>Details</th></tr></thead><tbody>${rows||'<tr><td colspan="7" style="color:var(--gray-400);text-align:center;">No login records.</td></tr>'}</tbody></table>`; return;
   }
 }
@@ -987,14 +1025,14 @@ async function loadPanelActions(c){
   const lvl=$('pa-level')?.value||'', cat=$('pa-cat')?.value||'', q=$('pa-q')?.value||'';
   const d=await getJSON('/api/logs?level='+lvl+'&category='+cat+'&q='+encodeURIComponent(q)+'&limit=400'); if(!d) return;
   const cc=await getJSON('/api/logs/counts');
-  const lvlColor=l=>({INFO:'var(--gray-600)',ACTION:'var(--accent)',WARN:'#b9772a',ERROR:'#e74c3c'}[l]||'var(--gray-600)');
+  const lvlColor=l=>({INFO:'var(--gray-600)',ACTION:'var(--accent)',WARN:'#b9772a',ERROR:'var(--danger)'}[l]||'var(--gray-600)');
   const rows=(d.logs||[]).map(l=>`<tr>
     <td style="white-space:nowrap;font-size:11px;font-family:var(--mono);color:var(--gray-600);">${esc(l.ts)}</td>
     <td style="font-weight:700;color:${lvlColor(l.level)};">${esc(l.level)}</td>
     <td><span style="font-size:11px;background:var(--gray-100);border-radius:3px;padding:1px 7px;">${esc(l.category)}</span></td>
     <td>${esc(l.action)}${l.target?` <span style="color:var(--gray-500);">→ ${esc(l.target)}</span>`:''}</td>
     <td>${esc(l.actor)}${l.ip?` <span style="color:var(--gray-500);">· ${esc(l.ip)}</span>`:''}</td>
-    <td style="color:${l.status==='ok'?'#27ae60':(l.status==='failed'||l.status==='denied'?'#e74c3c':'var(--gray-600)')};font-weight:600;">${esc(l.status)}</td>
+    <td style="color:${l.status==='ok'?'var(--success)':(l.status==='failed'||l.status==='denied'?'var(--danger)':'var(--gray-600)')};font-weight:600;">${esc(l.status)}</td>
     <td style="font-size:11px;font-family:var(--mono);color:var(--gray-600);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(l.detail)}">${esc((l.detail||'').slice(0,120))}</td></tr>`).join('');
   const b=cc?cc.by_level:{};
   c.innerHTML=`<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
@@ -1008,7 +1046,7 @@ async function loadPanelActions(c){
       <span style="font-size:12px;font-weight:700;padding:3px 9px;border-radius:4px;background:var(--gray-100);">${cc?cc.total:0} total</span>
       <span style="font-size:12px;padding:3px 9px;border-radius:4px;background:rgba(122,83,38,.12);color:var(--accent);">${b.ACTION||0} actions</span>
       <span style="font-size:12px;padding:3px 9px;border-radius:4px;background:rgba(185,119,42,.14);color:#b9772a;">${b.WARN||0} warn</span>
-      <span style="font-size:12px;padding:3px 9px;border-radius:4px;background:rgba(231,76,60,.12);color:#e74c3c;">${b.ERROR||0} error</span></div>
+      <span style="font-size:12px;padding:3px 9px;border-radius:4px;background:color-mix(in srgb, var(--danger) 12%, transparent);color:var(--danger);">${b.ERROR||0} error</span></div>
     <table><thead><tr><th>Time</th><th>Level</th><th>Category</th><th>Action</th><th>Actor</th><th>Status</th><th>Detail</th></tr></thead>
     <tbody>${rows||'<tr><td colspan="7" style="color:var(--gray-400);text-align:center;">No actions logged yet.</td></tr>'}</tbody></table>`;
   // restore filter values
@@ -1021,8 +1059,8 @@ async function loadAccessLog(c,page,ipF,pathF){
   const params=new URLSearchParams({page,limit:100}); if(ipF) params.set('ip',ipF); if(pathF) params.set('path',pathF);
   try{
     const d=await (await api('/api/system/access-log?'+params)).json(); const logs=d.logs||[];
-    const methodColor=m=>({GET:'#2980b9',POST:'#27ae60',DELETE:'#e74c3c',PUT:'#e67e22',PATCH:'#8e44ad'}[m]||'#555');
-    const statusColor=s=>s<300?'#27ae60':s<400?'#2980b9':s<500?'#e67e22':'#e74c3c';
+    const methodColor=m=>({GET:'var(--info)',POST:'var(--success)',DELETE:'var(--danger)',PUT:'var(--warn)',PATCH:'#8e44ad'}[m]||'#555');
+    const statusColor=s=>s<300?'var(--success)':s<400?'var(--info)':s<500?'var(--warn)':'var(--danger)';
     const rows=logs.map(r=>{ const ua=r.user_agent||'';
       const browser=ua.match(/Chrome\/[\d.]+/)?'Chrome':ua.match(/Firefox\/[\d.]+/)?'Firefox':ua.match(/Safari\/[\d.]+/)?'Safari':ua.match(/curl/)?'curl':ua.match(/[Pp]ython/)?'Python':ua.match(/bot|crawl|spider/i)?'Bot':ua.slice(0,14)||'n/a';
       const pathCell=r.query?`${esc(r.path)}<span style="color:var(--gray-400);font-size:10px;">?${esc(r.query.slice(0,40))}</span>`:esc(r.path);
@@ -1030,7 +1068,7 @@ async function loadAccessLog(c,page,ipF,pathF){
     const totalPages=Math.max(1,Math.ceil((d.total||0)/100));
     const prevBtn=page>1?`<button class="db-action-btn" onclick="loadAccessLog(document.getElementById('sec-content'),${page-1})">← Prev</button>`:'';
     const nextBtn=page<totalPages?`<button class="db-action-btn" onclick="loadAccessLog(document.getElementById('sec-content'),${page+1})">Next →</button>`:'';
-    const activeFilter=(ipF||pathF)?`<span style="background:rgba(41,128,185,0.1);color:#2980b9;padding:2px 8px;border-radius:3px;font-size:11px;margin-left:8px;">${ipF?'IP: '+esc(ipF):''}${ipF&&pathF?' · ':''}${pathF?'Path: '+esc(pathF):''} <span style="cursor:pointer;" onclick="loadAccessLog(document.getElementById('sec-content'),1,'','')">× clear</span></span>`:'';
+    const activeFilter=(ipF||pathF)?`<span style="background:rgba(41,128,185,0.1);color:var(--info);padding:2px 8px;border-radius:3px;font-size:11px;margin-left:8px;">${ipF?'IP: '+esc(ipF):''}${ipF&&pathF?' · ':''}${pathF?'Path: '+esc(pathF):''} <span style="cursor:pointer;" onclick="loadAccessLog(document.getElementById('sec-content'),1,'','')">× clear</span></span>`:'';
     c.innerHTML=secHeader('Access Log','access','Every page and API request hitting the server (logins and admin actions included).')+`
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;"><div style="font-size:12px;color:var(--gray-600);"><b>${d.total??0}</b> requests • <b>${d.unique_ips??0}</b> IPs • page ${page}/${totalPages}${activeFilter}</div>
         <div style="margin-left:auto;display:flex;gap:6px;align-items:center;"><input id="al-ip-f" placeholder="Filter IP" value="${escAttr(ipF)}" style="width:120px;padding:5px 8px;border:1px solid var(--gray-200);border-radius:4px;font-size:12px;background:var(--white);color:var(--black);"><input id="al-path-f" placeholder="Filter path" value="${escAttr(pathF)}" style="width:140px;padding:5px 8px;border:1px solid var(--gray-200);border-radius:4px;font-size:12px;background:var(--white);color:var(--black);"><button class="db-action-btn" onclick="loadAccessLog(document.getElementById('sec-content'),1,document.getElementById('al-ip-f').value,document.getElementById('al-path-f').value)">Filter</button>${prevBtn}${nextBtn}</div></div>
@@ -1042,11 +1080,11 @@ async function loadWebSessions(c){
   try{
     const d=await (await api('/api/system/web-sessions?limit=100')).json();
     const rows=(d.sessions||[]).map(s=>{ const isActive=s.status==='active', isExpired=s.status==='expired';
-      const statusLabel=isActive?'<span style="color:#27ae60;font-weight:700;">● ACTIVE</span>':isExpired?'<span style="color:#e67e22;">EXPIRED</span>':'<span style="color:#999;">LOGGED OUT</span>';
+      const statusLabel=isActive?'<span style="color:var(--success);font-weight:700;">● ACTIVE</span>':isExpired?'<span style="color:var(--warn);">EXPIRED</span>':'<span style="color:#999;">LOGGED OUT</span>';
       const ua=s.user_agent||''; const browser=ua.match(/Chrome\/[\d.]+/)?'Chrome':ua.match(/Firefox\/[\d.]+/)?'Firefox':ua.match(/Safari\/[\d.]+/)?'Safari':ua.slice(0,20)||'n/a';
-      return `<tr style="${isActive?'background:rgba(39,174,96,0.05)':''}"><td style="font-family:monospace;font-size:11px;" title="${escAttr(s.session_id)}">${esc((s.session_id||'').slice(0,12))}…</td><td style="font-weight:600;">${esc(s.username)}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="openIpDetail('${escAttr(s.ip)}')"><b>${esc(s.ip)}</b></td><td style="font-size:11px;color:var(--gray-600);" title="${escAttr(ua)}">${esc(browser)}</td><td style="font-size:11px;white-space:nowrap;">${esc(String(s.login_at).slice(0,19))}</td><td style="font-size:11px;white-space:nowrap;">${esc(String(s.expires_at).slice(0,19))}</td><td style="font-size:11px;white-space:nowrap;">${s.logout_at?esc(String(s.logout_at).slice(0,19)):'<span style="color:var(--gray-400)">n/a</span>'}</td><td>${statusLabel}</td></tr>`;}).join('');
+      return `<tr style="${isActive?'background:color-mix(in srgb, var(--success) 5%, transparent)':''}"><td style="font-family:monospace;font-size:11px;" title="${escAttr(s.session_id)}">${esc((s.session_id||'').slice(0,12))}…</td><td style="font-weight:600;">${esc(s.username)}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="openIpDetail('${escAttr(s.ip)}')"><b>${esc(s.ip)}</b></td><td style="font-size:11px;color:var(--gray-600);" title="${escAttr(ua)}">${esc(browser)}</td><td style="font-size:11px;white-space:nowrap;">${esc(String(s.login_at).slice(0,19))}</td><td style="font-size:11px;white-space:nowrap;">${esc(String(s.expires_at).slice(0,19))}</td><td style="font-size:11px;white-space:nowrap;">${s.logout_at?esc(String(s.logout_at).slice(0,19)):'<span style="color:var(--gray-400)">n/a</span>'}</td><td>${statusLabel}</td></tr>`;}).join('');
     c.innerHTML=secHeader('Sessions','sessions','Every web login session (active, expired, logged out).')+`
-      <div style="display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap;"><div style="padding:10px 18px;border-radius:6px;border:1px solid var(--gray-200);background:var(--gray-50);"><div style="font-size:11px;color:var(--gray-600);text-transform:uppercase;letter-spacing:.6px;">Active Now</div><div style="font-size:22px;font-weight:700;color:#27ae60;">${d.active??0}</div></div><div style="padding:10px 18px;border-radius:6px;border:1px solid var(--gray-200);background:var(--gray-50);"><div style="font-size:11px;color:var(--gray-600);text-transform:uppercase;letter-spacing:.6px;">Total Sessions</div><div style="font-size:22px;font-weight:700;">${d.total??0}</div></div></div>
+      <div style="display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap;"><div style="padding:10px 18px;border-radius:6px;border:1px solid var(--gray-200);background:var(--gray-50);"><div style="font-size:11px;color:var(--gray-600);text-transform:uppercase;letter-spacing:.6px;">Active Now</div><div style="font-size:22px;font-weight:700;color:var(--success);">${d.active??0}</div></div><div style="padding:10px 18px;border-radius:6px;border:1px solid var(--gray-200);background:var(--gray-50);"><div style="font-size:11px;color:var(--gray-600);text-transform:uppercase;letter-spacing:.6px;">Total Sessions</div><div style="font-size:22px;font-weight:700;">${d.total??0}</div></div></div>
       <table><thead><tr><th>Session ID</th><th>User</th><th>IP</th><th>Browser</th><th>Login</th><th>Expires</th><th>Logged Out</th><th>Status</th></tr></thead><tbody>${rows||'<tr><td colspan="8" style="color:var(--gray-400);text-align:center;">No sessions yet.</td></tr>'}</tbody></table>`;
   }catch(e){ c.innerHTML=`<div class="empty-state">Error: ${esc(String(e))}</div>`; }
 }
@@ -1054,7 +1092,7 @@ async function loadWebBlocked(c){
   try{
     const d=await (await api('/api/system/web-blocked-ips')).json();
     const rows=(d.blocked||[]).map(b=>{ const isB=b.blocked_until&&new Date(b.blocked_until)>new Date();
-      return `<tr><td><b>${esc(b.ip)}</b></td><td style="color:#e74c3c;font-weight:600;">${b.fail_count}</td><td style="font-size:11px;">${esc(String(b.first_fail).slice(0,19))}</td><td style="font-size:11px;">${esc(String(b.last_fail).slice(0,19))}</td><td style="font-size:11px;">${isB?`<span style="color:#e74c3c;font-weight:600;">${esc(String(b.blocked_until).slice(0,19))}</span>`:'<span style="color:var(--gray-400)">n/a</span>'}</td><td style="font-size:11px;color:var(--gray-600);">${esc(b.note??'')}</td><td><button class="db-action-btn" style="color:#e74c3c;" onclick="unblockWebIp('${escAttr(b.ip)}',this)">Unblock</button></td></tr>`;}).join('');
+      return `<tr><td><b>${esc(b.ip)}</b></td><td style="color:var(--danger);font-weight:600;">${b.fail_count}</td><td style="font-size:11px;">${esc(String(b.first_fail).slice(0,19))}</td><td style="font-size:11px;">${esc(String(b.last_fail).slice(0,19))}</td><td style="font-size:11px;">${isB?`<span style="color:var(--danger);font-weight:600;">${esc(String(b.blocked_until).slice(0,19))}</span>`:'<span style="color:var(--gray-400)">n/a</span>'}</td><td style="font-size:11px;color:var(--gray-600);">${esc(b.note??'')}</td><td><button class="db-action-btn" style="color:var(--danger);" onclick="unblockWebIp('${escAttr(b.ip)}',this)">Unblock</button></td></tr>`;}).join('');
     c.innerHTML=secHeader('Blocked IPs','blocked','IPs locked out of the panel.')+`
       <div style="background:var(--gray-50);border:1px solid var(--gray-200);border-radius:6px;padding:14px 16px;margin-bottom:16px;"><div style="font-weight:700;font-size:13px;margin-bottom:10px;">Block an IP manually</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;"><input id="block-ip-input" placeholder="IP (1.2.3.4 or 1.2.3.0/24)" style="flex:1;min-width:180px;padding:7px 10px;border:1px solid var(--gray-200);border-radius:4px;font-family:monospace;font-size:13px;background:var(--white);color:var(--black);"><select id="block-ip-dur" style="padding:7px 10px;border:1px solid var(--gray-200);border-radius:4px;font-size:13px;background:var(--white);color:var(--black);"><option value="1">1 hour</option><option value="24">24 hours</option><option value="168">1 week</option><option value="8760" selected>1 year</option></select><input id="block-ip-note" placeholder="Note (optional)" style="width:160px;padding:7px 10px;border:1px solid var(--gray-200);border-radius:4px;font-size:13px;background:var(--white);color:var(--black);"><button class="db-action-btn" style="background:var(--black);color:var(--white);padding:7px 16px;" onclick="manualBlockIp()">Block IP</button></div>
@@ -1068,7 +1106,7 @@ async function loadFpBlocked(c){
     const d=await (await api('/api/system/fp-blocked')).json();
     const rows=(d.blocked||[]).map(b=>{ const isB=b.blocked_until&&new Date(b.blocked_until)>new Date(); let sample=b.sample||'';
       try{ const o=JSON.parse(b.sample); sample=[o.platform,o.screen,o.timezone,o.gpu].filter(Boolean).join(' · '); }catch(_){}
-      return `<tr><td><code style="font-size:11px;">${esc((b.fp_hash||'').slice(0,16))}</code></td><td style="color:#e74c3c;font-weight:600;">${b.fail_count}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="openIpDetail('${escAttr(b.last_ip||'')}')"><b>${esc(b.last_ip||'n/a')}</b></td><td style="font-size:11px;color:var(--gray-600);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(b.sample||'')}">${esc(sample.slice(0,60))}</td><td style="font-size:11px;">${esc(String(b.last_fail).slice(0,19))}</td><td style="font-size:11px;">${isB?`<span style="color:#e74c3c;font-weight:600;">${esc(String(b.blocked_until).slice(0,19))}</span>`:'<span style="color:var(--gray-400)">expired</span>'}</td><td><button class="db-action-btn" style="color:#e74c3c;" onclick="unblockFp('${escAttr(b.fp_hash)}',this)">Unblock</button></td></tr>`;}).join('');
+      return `<tr><td><code style="font-size:11px;">${esc((b.fp_hash||'').slice(0,16))}</code></td><td style="color:var(--danger);font-weight:600;">${b.fail_count}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="openIpDetail('${escAttr(b.last_ip||'')}')"><b>${esc(b.last_ip||'n/a')}</b></td><td style="font-size:11px;color:var(--gray-600);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(b.sample||'')}">${esc(sample.slice(0,60))}</td><td style="font-size:11px;">${esc(String(b.last_fail).slice(0,19))}</td><td style="font-size:11px;">${isB?`<span style="color:var(--danger);font-weight:600;">${esc(String(b.blocked_until).slice(0,19))}</span>`:'<span style="color:var(--gray-400)">expired</span>'}</td><td><button class="db-action-btn" style="color:var(--danger);" onclick="unblockFp('${escAttr(b.fp_hash)}',this)">Unblock</button></td></tr>`;}).join('');
     c.innerHTML=secHeader('Blocked Devices','fp_blocked','Machines locked out by device fingerprint (stay blocked even if IP changes).')+`<table><thead><tr><th>Device fingerprint</th><th>Fails</th><th>Last IP</th><th>Device summary</th><th>Last Attempt</th><th>Blocked Until</th><th>Action</th></tr></thead><tbody>${rows||'<tr><td colspan="7" style="color:var(--gray-400);text-align:center;">No devices blocked.</td></tr>'}</tbody></table>`;
   }catch(e){ c.innerHTML=`<div class="empty-state">Error: ${esc(String(e))}</div>`; }
 }
@@ -1086,12 +1124,12 @@ async function sshBlock(ip){
   catch(e){ appToast('Error: '+e,'err'); } }
 async function manualBlockIp(){
   const ip=($('block-ip-input').value||'').trim(), hours=$('block-ip-dur').value, note=($('block-ip-note').value||'').trim()||'Manually blocked', msg=$('block-ip-msg');
-  if(!ip){ msg.style.color='#e74c3c'; msg.textContent='Enter an IP address.'; return; }
+  if(!ip){ msg.style.color='var(--danger)'; msg.textContent='Enter an IP address.'; return; }
   msg.style.color='var(--gray-600)'; msg.textContent='Blocking…';
   try{ const d=await (await api('/api/system/web-block',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip,hours:parseInt(hours),note})})).json();
-    if(d.status==='blocked'){ msg.style.color='#27ae60'; msg.textContent=`${ip} blocked.`; $('block-ip-input').value=''; $('block-ip-note').value=''; setTimeout(()=>loadWebBlocked($('sec-content')),800); }
-    else{ msg.style.color='#e74c3c'; msg.textContent=d.error||'Failed.'; } }
-  catch(e){ msg.style.color='#e74c3c'; msg.textContent=String(e); } }
+    if(d.status==='blocked'){ msg.style.color='var(--success)'; msg.textContent=`${ip} blocked.`; $('block-ip-input').value=''; $('block-ip-note').value=''; setTimeout(()=>loadWebBlocked($('sec-content')),800); }
+    else{ msg.style.color='var(--danger)'; msg.textContent=d.error||'Failed.'; } }
+  catch(e){ msg.style.color='var(--danger)'; msg.textContent=String(e); } }
 async function unblockWebIp(ip,btn){ btn.disabled=true; btn.textContent='…';
   try{ await api('/api/system/web-unblock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})}); btn.textContent='Unblocked'; setTimeout(()=>loadWebBlocked($('sec-content')),600); }
   catch{ btn.disabled=false; btn.textContent='Error'; } }
@@ -1222,5 +1260,6 @@ window.addEventListener('orientationchange',()=>{ if(CURRENT==='terminal') setTi
   applyTheme(localStorage.getItem('theme')==='dark');
   document.querySelectorAll('[data-nav]').forEach(b=>b.addEventListener('click',()=>switchSection(b.dataset.nav)));
   const ss=$('svc-search'); if(ss) ss.addEventListener('input',renderServices);
+  applyMetricPermissions();
   switchSection('server');
 })();

@@ -42,6 +42,8 @@
     --accent-soft: #efe0c6;
     --danger: #a8392a;
     --success: #5f7a30;
+    --warn: #a2621b;      /* 4xx, elevated load, "degraded" */
+    --info: #2f5d7c;      /* 3xx, neutral notices */
     --bg: #e7d6b8;        /* page backdrop (light brown) */
     --text: #2a1d0e;
     --ring: rgba(122, 83, 38, 0.28);
@@ -68,6 +70,8 @@
     --accent-soft: #3a2b18;
     --danger: #e07a5f;
     --success: #9cbf63;
+    --warn: #e0a458;      /* lifted for the dark surface, not the light value */
+    --info: #7fb2d6;
     --bg: #1b130a;
     --text: #f3e7d2;
     --ring: rgba(204, 154, 89, 0.32);
@@ -613,7 +617,25 @@
 
   /* ---- SERVER PANE ---- */
   .metric-clickable { cursor:pointer; transition:transform .08s, box-shadow .08s; }
-  .metric-clickable:hover { transform:translateY(-2px); box-shadow:0 4px 14px rgba(0,0,0,.10); }
+  @media (hover: hover) and (pointer: fine) {
+    .metric-clickable:hover { transform:translateY(-2px); box-shadow:0 4px 14px rgba(0,0,0,.10); }
+  }
+  .metric-clickable:active { transform:translateY(0) scale(0.995); }
+  /* A meter nobody may drill into stops offering to be drilled into. */
+  .metric-locked { cursor:default; }
+
+  .detail-denied {
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:10px; text-align:center; padding:56px 24px; color:var(--gray-600);
+  }
+  .detail-denied .ic { width:26px; height:26px; color:var(--gray-400); }
+  .detail-denied p { max-width:44ch; font-size:13.5px; line-height:1.5; }
+  .detail-denied-sub { font-size:12px; color:var(--gray-500); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .metric-clickable { transition:none; }
+    .metric-clickable:hover, .metric-clickable:active { transform:none; }
+  }
   #srv-detail-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.45);
     z-index:2000; padding:30px; }
   #srv-detail-overlay.open { display:flex; align-items:center; justify-content:center; }
@@ -631,16 +653,36 @@
   #qr-lb-addr { font-family:monospace; font-size:12px; word-break:break-all; user-select:all;
     margin-top:12px; color:#333; background:#f3f3f3; border-radius:6px; padding:8px; }
   #qr-lb-close { margin-top:14px; }
-  #srv-detail-modal { background:var(--white,#fff); color:var(--ink,#222); width:min(1000px,96vw);
+  /* color must be a real token. This said var(--ink,#222) and --ink is not
+     defined anywhere, so in dark mode the fallback painted #222 text onto the
+     #241a0f surface: technically present, effectively invisible. */
+  #srv-detail-modal { background:var(--white); color:var(--black); width:min(1000px,96vw);
     height:min(86vh,900px); border-radius:10px; display:flex; flex-direction:column; overflow:hidden;
     box-shadow:0 20px 60px rgba(0,0,0,.35); }
   #srv-detail-head { display:flex; justify-content:space-between; align-items:center; gap:10px;
     padding:14px 18px; border-bottom:1px solid var(--gray-200); flex-shrink:0; }
-  #srv-detail-title { font-weight:700; font-size:16px; }
+  #srv-detail-title { font-weight:700; font-size:16px; color:var(--black); }
   #srv-detail-body { flex:1; overflow:auto; padding:14px 18px; }
-  #srv-detail-body table { width:100%; border-collapse:collapse; font-size:12.5px; }
-  #srv-detail-body th, #srv-detail-body td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--gray-100); white-space:nowrap; }
-  #srv-detail-body th { position:sticky; top:0; background:var(--white,#fff); }
+  #srv-detail-body table { width:100%; border-collapse:separate; border-spacing:0; font-size:12.5px; }
+  #srv-detail-body th, #srv-detail-body td { text-align:left; padding:6px 8px; white-space:nowrap; }
+  #srv-detail-body td { border-bottom:1px solid var(--gray-100); }
+  /* A sticky header needs its own stacking order and an opaque background, or
+     the rows scroll straight over the top of it. border-collapse:separate is
+     required too: with collapse, borders on a sticky cell scroll away from it,
+     which is why the divider used to detach from the header. */
+  #srv-detail-body thead th {
+    position:sticky; top:0; z-index:3;
+    background:var(--white);
+    color:var(--gray-600);
+    /* Three shadows doing three jobs: the accent rule under the header, a
+       solid block filling the container's 14px top padding, and nothing else.
+       Sticky top:0 anchors to the padding box, so without that second shadow
+       rows scroll through the gap and appear above the header. */
+    box-shadow:
+      inset 0 -2px 0 var(--accent),
+      0 -14px 0 var(--white),
+      0 -15px 0 var(--white);
+  }
   .fb-crumbs { font-family:monospace; font-size:12px; word-break:break-all; margin-bottom:10px; color:var(--gray-600); }
   .fb-row { display:flex; align-items:center; gap:10px; padding:6px 4px; border-bottom:1px solid var(--gray-100); }
   .fb-name { flex:1; cursor:default; word-break:break-all; }
@@ -963,7 +1005,7 @@ html, body { height: 100%; }
 body.mgmt { display: flex; flex-direction: column; min-height: 100dvh; background: var(--white); color: var(--black);
   font-family: var(--font); margin: 0; }
 .mgmt-top { display: flex; align-items: center; gap: 14px; padding: 0 18px; height: 58px; flex-shrink: 0;
-  border-bottom: 1px solid var(--gray-200); background: var(--card, var(--white)); }
+  border-bottom: 1px solid var(--gray-200); background: var(--white); }
 .mgmt-brand { display: flex; align-items: center; gap: 10px; font-family: var(--display); font-weight: 700;
   font-size: 17px; letter-spacing: .5px; }
 .mgmt-crest { width: 34px; height: 34px; border-radius: 9px; background: var(--accent); color: #fbf2e2;
