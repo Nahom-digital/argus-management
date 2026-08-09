@@ -2,7 +2,9 @@
 # permission set (terminal, database, logs, disk) narrower than the admin's.
 # Mirrors recovery.py's shape: its own SCHEMA tuple, plain functions that
 # take an already-open connection, no pool of its own.
+import collections
 import hmac
+import json
 import re
 import subprocess
 
@@ -12,6 +14,133 @@ TERMINAL_NONE = "none"
 TERMINAL_LIMITED = "limited"
 TERMINAL_ROOT = "root"
 TERMINAL_LEVELS = (TERMINAL_NONE, TERMINAL_LIMITED, TERMINAL_ROOT)
+
+DISK_NONE = "none"
+DISK_OWN = "own"
+DISK_FULL = "full"
+DISK_SCOPES = (DISK_NONE, DISK_OWN, DISK_FULL)
+
+# ---------------------------------------------------------------------------
+# The grant registry.
+#
+# This tuple is the only place a permission is defined. It drives storage
+# defaults, payload validation, what resolve_permissions() hands the request
+# path, and the form the admin fills in. Generating the form from the same
+# definition the enforcement reads is what makes it impossible to ship a
+# checkbox no endpoint honours, or an endpoint no checkbox exposes.
+#
+# Adding a permission means adding a line here and one check at its endpoint.
+# ---------------------------------------------------------------------------
+Grant = collections.namedtuple("Grant", "key kind choices default group label help")
+
+PERMISSIONS = (
+    Grant("terminal", "choice", TERMINAL_LEVELS, TERMINAL_NONE, "terminal",
+          "Terminal access",
+          "None, a locked-down shell as their own system user, or full root."),
+
+    Grant("disk_scope", "choice", DISK_SCOPES, DISK_NONE, "disk",
+          "Files they can reach",
+          "Nothing, only their own home directory, or the whole filesystem."),
+    Grant("disk_download", "bool", None, False, "disk",
+          "Download files", "Copy files off the server."),
+    Grant("disk_delete", "bool", None, False, "disk",
+          "Delete files", "Remove files permanently. There is no undo."),
+
+    Grant("db_read", "bool", None, False, "database",
+          "Read tables", "Browse the rows in this panel's tables."),
+    Grant("db_write", "bool", None, False, "database",
+          "Change rows", "Insert, edit and delete rows, and add columns."),
+    Grant("db_log", "bool", None, False, "database",
+          "View change log", "See who changed which row, and when."),
+
+    Grant("net_detail", "bool", None, False, "network",
+          "Network detail", "Open the active connection list in the Server section."),
+    Grant("net_proxy", "bool", None, False, "network",
+          "Manage proxy hosts", "Create and edit reverse proxy hosts."),
+
+    Grant("cpumem_detail", "bool", None, False, "compute",
+          "CPU and memory detail",
+          "Open the top-process lists behind the CPU and memory meters."),
+
+    Grant("svc_status", "bool", None, False, "services",
+          "See service status", "List services and read whether they are running."),
+    Grant("svc_restart", "bool", None, False, "services",
+          "Start and restart", "Bring a service back up."),
+    Grant("svc_stop", "bool", None, False, "services",
+          "Stop services", "Take a running service down."),
+
+    Grant("logs_access", "bool", None, False, "logs",
+          "Logs section", "Open the Logs tab and everything that reads from it."),
+)
+
+GRANT_KEYS = frozenset(g.key for g in PERMISSIONS)
+_BY_KEY = {g.key: g for g in PERMISSIONS}
+CHOICE_KEYS = frozenset(g.key for g in PERMISSIONS if g.kind == "choice")
+
+GROUP_ORDER = ("terminal", "disk", "database", "network", "compute", "services", "logs")
+GROUP_LABELS = {
+    "terminal": "Terminal", "disk": "Disk", "database": "Database",
+    "network": "Network", "compute": "CPU and memory", "services": "Services",
+    "logs": "Logs",
+}
+
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def normalize_grants(raw):
+    """Exactly one entry per registry key and nothing else.
+
+    Anything unrecognized, mistyped or out of range collapses to that grant's
+    default, so a hostile payload can only ever ask for less than it sent.
+    Callers must run every inbound grant dict through this before storing it.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    out = {}
+    for g in PERMISSIONS:
+        value = raw.get(g.key, g.default)
+        if g.kind == "choice":
+            out[g.key] = value if value in g.choices else g.default
+        elif isinstance(value, str):
+            out[g.key] = value.strip().lower() in _TRUTHY
+        else:
+            out[g.key] = bool(value)
+    return out
+
+
+def all_grants(enabled=True):
+    """Every grant at its widest setting, used for the admin identity so a
+    newly added permission is never accidentally withheld from the admin."""
+    out = {}
+    for g in PERMISSIONS:
+        if g.kind == "choice":
+            out[g.key] = g.choices[-1] if enabled else g.default
+        else:
+            out[g.key] = bool(enabled)
+    return out
+
+
+def describe_grants():
+    """The registry as JSON for the admin form. Ordered by group so the form
+    renders in a stable, meaningful sequence."""
+    order = {name: i for i, name in enumerate(GROUP_ORDER)}
+    # Stable sort, so registry order survives inside each group. That keeps
+    # disk_scope ahead of the download and delete switches it governs.
+    ordered = sorted(PERMISSIONS, key=lambda g: order.get(g.group, 99))
+    return [
+        {
+            "key": g.key, "kind": g.kind,
+            "choices": list(g.choices) if g.choices else None,
+            "default": g.default, "group": g.group,
+            "label": g.label, "help": g.help,
+        }
+        for g in ordered
+    ]
+
+
+def grant_groups():
+    """Group identifiers with their display labels, in render order."""
+    return [{"key": k, "label": GROUP_LABELS[k]} for k in GROUP_ORDER]
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS panel_user (
