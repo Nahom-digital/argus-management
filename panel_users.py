@@ -156,15 +156,67 @@ SCHEMA = (
         created_by       VARCHAR(100) NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS idx_panel_user_username ON panel_user(username)",
+    # Permission model v2. The four legacy grant columns above are left in
+    # place and are no longer read. Rows created from here on leave them at
+    # their defaults, so rolling the code back removes access rather than
+    # granting it by accident.
+    "ALTER TABLE panel_user ADD COLUMN IF NOT EXISTS grants JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE panel_user ADD COLUMN IF NOT EXISTS auth_epoch INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE panel_user ADD COLUMN IF NOT EXISTS full_name VARCHAR(120)",
 )
 
+# A row written before v2 has an empty grants object. New rows always store a
+# full normalized set, so an empty object is an unambiguous "not migrated yet".
+_BACKFILL_SENTINEL = "SELECT username, terminal_access, database_access, logs_access, " \
+                     "disk_access FROM panel_user WHERE grants = '{}'::jsonb"
 
-def ensure_table(conn):
+
+def _backfill_legacy_grants(conn):
+    """Translate pre-v2 rows into the registry, once.
+
+    Deliberately conservative: disk_access became browse plus download, never
+    delete, and database_access became read, never write. Nobody gains a
+    destructive permission from a migration they did not ask for.
+    """
+    cur = conn.cursor()
+    cur.execute(_BACKFILL_SENTINEL)
+    rows = cur.fetchall()
+    for username, terminal_access, database_access, logs_access, disk_access in rows:
+        grants = normalize_grants({
+            "terminal": terminal_access,
+            "db_read": bool(database_access),
+            "logs_access": bool(logs_access),
+            "disk_scope": DISK_FULL if disk_access else DISK_NONE,
+            "disk_download": bool(disk_access),
+            "disk_delete": False,
+        })
+        cur.execute("UPDATE panel_user SET grants = %s WHERE username = %s",
+                    (json.dumps(grants), username))
+    if rows:
+        conn.commit()
+    cur.close()
+    return len(rows)
+
+
+_schema_ready = False
+
+
+def ensure_table(conn, force=False):
+    """Idempotent, and after the first call in a process it is free.
+
+    get_user() calls this on every lookup, so without the guard every
+    permission check would replay eight DDL statements and a backfill scan.
+    """
+    global _schema_ready
+    if _schema_ready and not force:
+        return
     cur = conn.cursor()
     for stmt in SCHEMA:
         cur.execute(stmt)
     conn.commit()
     cur.close()
+    _backfill_legacy_grants(conn)
+    _schema_ready = True
 
 
 def _os_username_for(username):
@@ -197,15 +249,19 @@ def deprovision_os_account(os_username):
     subprocess.run(["userdel", "-r", os_username], capture_output=True, text=True)
 
 
-def create_user(conn, username, password, terminal_access, database_access,
-                 logs_access, disk_access, created_by):
+def needs_os_account(grants):
+    """A real system account is required both for a locked-down shell and for
+    a home directory to sandbox file access into."""
+    return grants.get("terminal") == TERMINAL_LIMITED or grants.get("disk_scope") == DISK_OWN
+
+
+def create_user(conn, username, password, grants, created_by):
     ensure_table(conn)
     username = (username or "").strip()
-    if terminal_access not in TERMINAL_LEVELS:
-        terminal_access = TERMINAL_NONE
+    grants = normalize_grants(grants)
 
     os_username = None
-    if terminal_access == TERMINAL_LIMITED:
+    if needs_os_account(grants):
         os_username = _os_username_for(username)
         ok, err = provision_os_account(os_username)
         if not ok:
@@ -214,11 +270,10 @@ def create_user(conn, username, password, terminal_access, database_access,
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO panel_user
-           (username, password_hash, terminal_access, os_username,
-            database_access, logs_access, disk_access, created_by)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-        (username, recovery.hash_password(password), terminal_access, os_username,
-         bool(database_access), bool(logs_access), bool(disk_access), created_by),
+           (username, password_hash, os_username, grants, created_by)
+           VALUES (%s, %s, %s, %s, %s)""",
+        (username, recovery.hash_password(password), os_username,
+         json.dumps(grants), created_by),
     )
     conn.commit()
     cur.close()
@@ -229,17 +284,18 @@ def list_users(conn):
     ensure_table(conn)
     cur = conn.cursor()
     cur.execute(
-        """SELECT username, terminal_access, os_username, database_access,
-                  logs_access, disk_access, created_at, created_by
+        """SELECT username, os_username, grants, full_name, auth_epoch,
+                  created_at, created_by
            FROM panel_user ORDER BY created_at ASC"""
     )
     rows = cur.fetchall()
     cur.close()
     return [
         {
-            "username": r[0], "terminal_access": r[1], "os_username": r[2],
-            "database_access": r[3], "logs_access": r[4], "disk_access": r[5],
-            "created_at": r[6].isoformat() if r[6] else None, "created_by": r[7],
+            "username": r[0], "os_username": r[1],
+            "grants": normalize_grants(r[2]), "full_name": r[3] or "",
+            "auth_epoch": r[4],
+            "created_at": r[5].isoformat() if r[5] else None, "created_by": r[6],
         }
         for r in rows
     ]
@@ -249,8 +305,8 @@ def get_user(conn, username):
     ensure_table(conn)
     cur = conn.cursor()
     cur.execute(
-        """SELECT username, password_hash, terminal_access, os_username,
-                  database_access, logs_access, disk_access
+        """SELECT username, password_hash, os_username, grants, full_name,
+                  auth_epoch
            FROM panel_user WHERE username = %s""",
         (username,),
     )
@@ -259,50 +315,93 @@ def get_user(conn, username):
     if not row:
         return None
     return {
-        "username": row[0], "password_hash": row[1], "terminal_access": row[2],
-        "os_username": row[3], "database_access": row[4], "logs_access": row[5],
-        "disk_access": row[6],
+        "username": row[0], "password_hash": row[1], "os_username": row[2],
+        "grants": normalize_grants(row[3]), "full_name": row[4] or "",
+        "auth_epoch": row[5],
     }
+
+
+# Comparing against this when the account does not exist keeps a miss and a
+# wrong password costing the same work, so response time does not disclose
+# which usernames are real.
+_ABSENT_HASH = recovery.hash_password("\x00 no such account \x00")
 
 
 def verify_login(conn, username, password):
     user = get_user(conn, username)
+    candidate = recovery.hash_password(password)
     if not user:
+        hmac.compare_digest(candidate, _ABSENT_HASH)
         return None
-    if not hmac.compare_digest(recovery.hash_password(password), user["password_hash"]):
+    if not hmac.compare_digest(candidate, user["password_hash"]):
         return None
     return user
 
 
-def update_permissions(conn, username, terminal_access=None, database_access=None,
-                        logs_access=None, disk_access=None):
+def auth_epoch_for(conn, username):
+    """The session generation for one identity. A token minted before the
+    current value is stale and must be rejected."""
+    cur = conn.cursor()
+    cur.execute("SELECT auth_epoch FROM panel_user WHERE username = %s", (username,))
+    row = cur.fetchone()
+    cur.close()
+    return int(row[0]) if row else 0
+
+
+def _is_narrowing(old, new):
+    """True when the new grant set takes anything away. Widening a grant set
+    is safe for a live session; taking something away is not, so only the
+    narrowing case forces a re-login."""
+    for g in PERMISSIONS:
+        before, after = old.get(g.key), new.get(g.key)
+        if g.kind == "choice":
+            if g.choices.index(after) < g.choices.index(before):
+                return True
+        elif before and not after:
+            return True
+    return False
+
+
+def update_user(conn, username, grants=None, password=None, full_name=None):
+    """Edit a staff account in one place: their grants, their password, their
+    display name, or any combination. Grants are replaced wholesale rather
+    than merged, so the form the admin submits is exactly what is stored and
+    an unchecked box always means revoked."""
     user = get_user(conn, username)
     if not user:
         return False
 
     fields, params = [], []
-    if terminal_access is not None and terminal_access in TERMINAL_LEVELS:
-        fields.append("terminal_access = %s")
-        params.append(terminal_access)
-        if terminal_access == TERMINAL_LIMITED and not user["os_username"]:
+    revoke_sessions = False
+
+    if grants is not None:
+        new_grants = normalize_grants(grants)
+        if _is_narrowing(user["grants"], new_grants):
+            revoke_sessions = True
+        if needs_os_account(new_grants) and not user["os_username"]:
             os_username = _os_username_for(username)
             ok, err = provision_os_account(os_username)
             if not ok:
                 raise RuntimeError(f"could not create system account: {err}")
             fields.append("os_username = %s")
             params.append(os_username)
-    if database_access is not None:
-        fields.append("database_access = %s")
-        params.append(bool(database_access))
-    if logs_access is not None:
-        fields.append("logs_access = %s")
-        params.append(bool(logs_access))
-    if disk_access is not None:
-        fields.append("disk_access = %s")
-        params.append(bool(disk_access))
+        fields.append("grants = %s")
+        params.append(json.dumps(new_grants))
+
+    if password is not None:
+        fields.append("password_hash = %s")
+        params.append(recovery.hash_password(password))
+        revoke_sessions = True
+
+    if full_name is not None:
+        fields.append("full_name = %s")
+        params.append(full_name.strip()[:120])
 
     if not fields:
         return True
+    if revoke_sessions:
+        fields.append("auth_epoch = auth_epoch + 1")
+
     params.append(username)
     cur = conn.cursor()
     cur.execute(f"UPDATE panel_user SET {', '.join(fields)} WHERE username = %s", params)
@@ -326,32 +425,41 @@ def delete_user(conn, username):
 
 def resolve_permissions(conn, username):
     """The single source of truth for what a signed-in identity may do.
-    The primary admin account is always full-access; a panel_user row
-    carries its own narrower grants; anything else gets nothing."""
+
+    Every grant key sits at the top level of the returned dict, so a request
+    handler asks perms["db_write"] and never has to know how it was stored.
+    The primary admin is always every grant at its widest, computed from the
+    registry rather than written out, so adding a permission can never
+    accidentally withhold it from the admin.
+    """
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM admin WHERE username = %s", (username,))
     is_admin = cur.fetchone() is not None
     cur.close()
     if is_admin:
-        return {
-            "role": "admin", "terminal_access": TERMINAL_ROOT, "os_username": None,
-            "database_write": True, "database_access": True,
-            "logs_access": True, "disk_access": True,
-        }
+        out = {"role": "admin", "username": username, "os_username": None,
+               "full_name": "", "auth_epoch": 0}
+        out.update(all_grants(True))
+        return out
 
     user = get_user(conn, username)
     if not user:
-        return {
-            "role": "none", "terminal_access": TERMINAL_NONE, "os_username": None,
-            "database_write": False, "database_access": False,
-            "logs_access": False, "disk_access": False,
-        }
-    return {
-        "role": "staff",
-        "terminal_access": user["terminal_access"],
-        "os_username": user["os_username"],
-        "database_write": False,
-        "database_access": bool(user["database_access"]),
-        "logs_access": bool(user["logs_access"]),
-        "disk_access": bool(user["disk_access"]),
-    }
+        out = {"role": "none", "username": username, "os_username": None,
+               "full_name": "", "auth_epoch": 0}
+        out.update(all_grants(False))
+        return out
+
+    out = {"role": "staff", "username": user["username"],
+           "os_username": user["os_username"], "full_name": user["full_name"],
+           "auth_epoch": user["auth_epoch"]}
+    out.update(user["grants"])
+    return out
+
+
+def no_permissions(username=""):
+    """What an unauthenticated request resolves to. Kept here so the deny-all
+    shape is derived from the registry too, never hand-maintained."""
+    out = {"role": "none", "username": username, "os_username": None,
+           "full_name": "", "auth_epoch": 0}
+    out.update(all_grants(False))
+    return out
