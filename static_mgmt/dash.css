@@ -1248,3 +1248,34 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
   .grant-seg { transition: none; }
   .grant-seg:active { transform: none; }
 }
+
+/* ===================================================================
+   DATABASE TABLE CELLS
+   Wide values used to crush every neighbouring column. Each cell now
+   caps its visible width and ends in an ellipsis, while the full value
+   stays in the title attribute so hovering still reveals all of it.
+   The "there is more here" affordance is only drawn on cells that are
+   actually truncated, which JS marks after layout.
+   =================================================================== */
+.db-cell { vertical-align: top; }
+.db-cell-text {
+  display: block;
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.db-cell.is-clipped { cursor: help; }
+.db-cell.is-clipped .db-cell-text {
+  border-bottom: 1px dotted var(--gray-400);
+}
+.db-cell.db-null .db-cell-text { color: var(--gray-400); font-style: italic; }
+
+/* A few columns are worth more room, and a few are worth less. */
+.db-cell-text.wide { max-width: 52ch; }
+.db-cell-text.narrow { max-width: 14ch; }
+
+@media (max-width: 720px) {
+  .db-cell-text { max-width: 20ch; }
+  .db-cell-text.wide { max-width: 24ch; }
+}

@@ -57,7 +57,9 @@ function switchSection(name){
   document.querySelectorAll('[data-nav]').forEach(b=>b.classList.toggle('active', b.dataset.nav===name));
   document.querySelectorAll('.mtab').forEach(b=>b.classList.toggle('active', b.dataset.nav===name));
   if(name==='server'){ startServerPolling(); } else stopServerPolling();
-  if(name==='config') configBack();
+  // fromHistory=true: arriving at the tab resets to the card grid without
+  // spending a history entry, which is not the same as pressing Back.
+  if(name==='config') configBack(true);
   if(name==='terminal') setTimeout(initTerminal,30);
   if(name==='logs') loadSecurityLogs();
   if(name==='account') loadAccount();
@@ -72,15 +74,47 @@ const CONFIG_LOADERS={
   database: loadDbTables,
   proxy: loadProxyHosts,
 };
-function configOpen(key){
+/* The drill-down already replaced the card grid rather than sitting under it.
+   What made it look like it opened "at the bottom" was the scroll position:
+   the pane stayed where it was, so a card near the bottom of a scrolled list
+   swapped in a page you were already scrolled past. Both directions now start
+   at the top, and the browser's own Back button works too. */
+let _configOpenKey=null;
+
+function _configScrollTop(){
+  const pane=document.querySelector('[data-pane="config"] .pane-scroll');
+  if(pane) pane.scrollTop=0;
+}
+
+function configOpen(key, fromHistory){
   const menu=$('config-menu'); if(menu) menu.hidden=true;
   document.querySelectorAll('.config-sub').forEach(el=>{ el.hidden=(el.dataset.cfgsub!==key); });
+  _configOpenKey=key;
+  _configScrollTop();
+  if(!fromHistory){
+    try{ history.pushState({config:key},'',location.href); }catch(e){}
+  }
   const fn=CONFIG_LOADERS[key]; if(fn) fn();
 }
-function configBack(){
+
+function configBack(fromHistory){
   const menu=$('config-menu'); if(menu) menu.hidden=false;
   document.querySelectorAll('.config-sub').forEach(el=>{ el.hidden=true; });
+  const wasOpen=_configOpenKey;
+  _configOpenKey=null;
+  _configScrollTop();
+  // Keep the history stack honest: pressing the in-page Back button should
+  // consume the entry it pushed, not leave it for the browser button later.
+  if(!fromHistory && wasOpen){
+    try{ history.back(); }catch(e){}
+  }
 }
+
+window.addEventListener('popstate', e=>{
+  if(CURRENT!=='config') return;
+  const key=(e.state||{}).config;
+  if(key) configOpen(key,true); else configBack(true);
+});
 
 /* ================= ACCOUNT ================= */
 async function loadAccount(){
@@ -808,7 +842,15 @@ async function loadDbTable(page){
     const head=DB_COLUMNS.map(c=>`<th>${esc(c)}</th>`).join('')+(DB_WRITE?'<th></th>':'');
     const rows=(d.rows||[]).map(r=>{
       const pkVal=r[0];
-      const cells=r.map((v,i)=>`<td class="cell-tip" title="${escAttr(v==null?'':String(v))}">${esc(v==null?'':String(v).slice(0,80))}</td>`).join('');
+      // The full value goes in title so the hover tooltip still shows
+      // everything. The visible text is capped by CSS ellipsis rather than by
+      // slicing, so a wide column shortens instead of crushing its neighbours.
+      const cells=r.map(v=>{
+        const full=v==null?'':String(v);
+        const nul=v==null?' db-null':'';
+        return `<td class="db-cell${nul}" title="${escAttr(full)}">`
+             + `<span class="db-cell-text">${esc(v==null?'null':full.slice(0,400))}</span></td>`;
+      }).join('');
       const actions=DB_WRITE?`<td class="db-row-actions"><button class="db-action-btn" onclick='dbEditRow(${JSON.stringify(String(pkVal))})'>Edit</button><button class="db-action-btn" style="color:var(--danger);" onclick="dbDeleteRow('${escAttr(pkCol)}','${escAttr(String(pkVal))}')">Delete</button></td>`:'';
       return `<tr data-pk="${escAttr(String(pkVal))}">${cells}${actions}</tr>`;
     }).join('');
@@ -817,7 +859,17 @@ async function loadDbTable(page){
       <div class="db-add-row-form"><input id="db-newcol-name" placeholder="new column name"><select id="db-newcol-type"><option>TEXT</option><option>INTEGER</option><option>BIGINT</option><option>BOOLEAN</option><option>TIMESTAMPTZ</option><option>NUMERIC</option><option>DATE</option></select><button class="db-action-btn" onclick="dbAddColumn()"><svg class="ic"><use href="#ic-plus"/></svg>Add Column</button></div>`:'';
     view.innerHTML=`<div class="db-toolbar-row"><button class="db-action-btn" onclick="loadDbTable(${Math.max(1,DB_CURRENT_PAGE-1)})" ${DB_CURRENT_PAGE<=1?'disabled':''}>Prev</button><span class="page-info">Page ${DB_CURRENT_PAGE} / ${totalPages} &middot; ${d.total} rows</span><button class="db-action-btn" onclick="loadDbTable(${DB_CURRENT_PAGE+1})" ${DB_CURRENT_PAGE>=totalPages?'disabled':''}>Next</button></div>
       <div style="overflow-x:auto;"><table><thead><tr>${head}</tr></thead><tbody>${rows||'<tr><td colspan="'+(DB_COLUMNS.length+1)+'">No rows.</td></tr>'}</tbody></table></div>${addForm}`;
+    markClippedCells(view);
   }catch(e){ view.innerHTML='<div class="empty-state">Failed to load.</div>'; }
+}
+
+/* Only cells whose text actually got cut off get the hover affordance. CSS
+   cannot ask "did this overflow", so it is measured once after layout. */
+function markClippedCells(root){
+  root.querySelectorAll('.db-cell').forEach(td=>{
+    const span=td.firstElementChild;
+    if(span && span.scrollWidth > span.clientWidth + 1) td.classList.add('is-clipped');
+  });
 }
 async function dbInsertRow(){
   const form=$('db-add-row-form'); if(!form) return;
