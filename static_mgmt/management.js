@@ -65,6 +65,7 @@ function switchSection(name){
 
 /* ================= CONFIG ================= */
 const CONFIG_LOADERS={
+  account: loadMyAccount,
   users: loadUserManagement,
   server: loadServerConfig,
   service: loadServices,
@@ -219,7 +220,9 @@ async function pollServerStats(){
     $('m-net-foot').textContent=`total ↓${d.net.total_in_h} ↑${d.net.total_out_h}`;
     $('m-disk-now').textContent=d.disk.percent.toFixed(0)+'%';
     $('m-disk-foot').textContent=`${d.disk.used_h} / ${d.disk.total_h}`;
-    $('disk-fill').style.width=d.disk.percent+'%'; $('disk-fill').style.background=barColor(d.disk.percent);
+    // scaleX rather than width: same picture, no layout pass on every sample.
+    $('disk-fill').style.transform='scaleX('+Math.max(0,Math.min(1,d.disk.percent/100)).toFixed(4)+')';
+    $('disk-fill').style.background=barColor(d.disk.percent);
     $('m-load-now').textContent=d.load['1'].toFixed(2);
     $('m-load-foot').textContent=`${d.load['1']} / ${d.load['5']} / ${d.load['15']}`;
     renderCoreBars(d.cpu_per_core);
@@ -233,12 +236,35 @@ function pushHist(a,v){
   if(a.length===0){ for(let i=0;i<HIST_LEN;i++) a.push(v); return; } // full-width from the first sample, not one dot at the right
   a.push(v); if(a.length>HIST_LEN) a.shift();
 }
+/* Built once, then only the fill is touched. Rebuilding innerHTML every second
+   threw the transition away (fresh nodes never transition) and re-laid out the
+   row on every tick. scaleY on a bottom-anchored fill stays on the compositor,
+   so a 16-core box animates without a single reflow. */
 function renderCoreBars(cores){
   if(!cores) return; const el=$('core-bars'); if(!el) return;
-  el.innerHTML=cores.map(p=>`<div class="core-bar" title="${p.toFixed(0)}%"><span style="height:${Math.max(3,p)}%;background:${barColor(p)}"></span></div>`).join('');
+  if(el.childElementCount!==cores.length){
+    el.innerHTML=cores.map(()=>'<div class="core-bar"><span></span></div>').join('');
+  }
+  for(let i=0;i<cores.length;i++){
+    const cell=el.children[i], fill=cell.firstElementChild, p=cores[i];
+    cell.title=p.toFixed(0)+'%';
+    fill.style.transform='scaleY('+Math.max(0.03,p/100).toFixed(3)+')';
+    fill.style.background=barColor(p);
+  }
 }
-function barColor(p){ if(p>=90) return '#c0392b'; if(p>=70) return '#f97316';
-  return getComputedStyle(document.documentElement).getPropertyValue('--black').trim()||'#0a0a0a'; }
+
+/* getComputedStyle forces a style flush, so reading the token once per theme
+   beats reading it once per core per second. */
+let _inkCache=null,_inkTheme=null;
+function inkColor(){
+  const theme=document.documentElement.getAttribute('data-theme');
+  if(_inkCache===null||_inkTheme!==theme){
+    _inkTheme=theme;
+    _inkCache=getComputedStyle(document.documentElement).getPropertyValue('--black').trim()||'#0a0a0a';
+  }
+  return _inkCache;
+}
+function barColor(p){ if(p>=90) return '#c0392b'; if(p>=70) return '#f97316'; return inkColor(); }
 function drawLineChart(id,series,max,colors){
   const canvas=$(id); if(!canvas) return;
   const w=canvas.clientWidth||canvas.parentElement.clientWidth; const dpr=window.devicePixelRatio||1; const h=canvas.height;
@@ -325,7 +351,7 @@ async function browseDir(path){
       const name=e.is_dir?`<span class="fb-name dir" data-path="${escAttr(e.path)}" onclick="browseDir(this.dataset.path)"><svg class="ic" style="color:var(--accent)"><use href="#ic-folder"/></svg> ${esc(e.name)}</span>`
         :`<span class="fb-name"><svg class="ic" style="color:var(--gray-400)"><use href="#ic-file-text"/></svg> ${esc(e.name)}</span>`;
       const dl=e.is_dir?'':(e.downloadable?`<a class="fb-dl" href="${BASE}/api/system/download?path=${encodeURIComponent(e.path)}" style="display:inline-flex;align-items:center;gap:4px;"><svg class="ic"><use href="#ic-download"/></svg> Download</a>`:`<span class="fb-locked">protected</span>`);
-      const canDelete=window.MGMT_PERMS&&MGMT_PERMS.role==='admin'&&!e.is_dir&&e.deletable;
+      const canDelete=!!(window.MGMT_PERMS&&MGMT_PERMS.disk_delete)&&!e.is_dir&&e.deletable;
       const del=canDelete?`<button class="db-action-btn" style="color:var(--danger);" onclick="deleteFile('${escAttr(e.path)}')"><svg class="ic"><use href="#ic-trash-2"/></svg></button>`:'';
       return `<div class="fb-row">${name}<span class="fb-size">${esc(e.size_h)}</span><span class="fb-dl" style="display:inline-flex;gap:8px;align-items:center;">${dl}${del}</span></div>`;
     }).join('');
@@ -511,50 +537,213 @@ async function toggleSshPasswordLogin(){
   }catch(e){ box.checked=!allow; fb.textContent='Network error'; fb.classList.add('err'); }
 }
 
+/* ================= PERMISSION GRANTS =================
+   The form below is generated from /api/config/grants, which serves the same
+   registry the server enforces against. That is deliberate: a permission
+   cannot appear here without an endpoint honouring it, and an endpoint cannot
+   be gated on something the admin has no way to grant. Nothing here is a
+   security boundary; every grant is checked again server-side. */
+let _GRANT_DEFS=null, _GRANT_GROUPS=null;
+
+async function loadGrantRegistry(){
+  if(_GRANT_DEFS) return _GRANT_DEFS;
+  const d=await getJSON('/api/config/grants'); if(!d) return null;
+  _GRANT_DEFS=d.grants||[]; _GRANT_GROUPS=d.groups||[];
+  return _GRANT_DEFS;
+}
+
+function grantDefaults(){
+  const out={};
+  (_GRANT_DEFS||[]).forEach(g=>{ out[g.key]=g.default; });
+  return out;
+}
+
+/* One renderer for three surfaces: the create form, the edit form, and the
+   read-only list a staff member sees on their own account. */
+function grantFormHtml(values, opts){
+  const readonly=!!(opts&&opts.readonly), idp=(opts&&opts.idPrefix)||'g';
+  if(!_GRANT_DEFS||!_GRANT_DEFS.length) return '<div class="empty-state">No permissions defined.</div>';
+  return (_GRANT_GROUPS||[]).map(group=>{
+    const defs=_GRANT_DEFS.filter(g=>g.group===group.key);
+    if(!defs.length) return '';
+    const rows=defs.map(g=>{
+      const val=values&&(g.key in values)?values[g.key]:g.default;
+      const id=idp+'-'+g.key;
+      if(g.kind==='choice'){
+        const segs=g.choices.map(c=>{
+          const on=String(val)===String(c);
+          if(readonly) return on?`<span class="grant-seg-on">${esc(CHOICE_LABELS[c]||c)}</span>`:'';
+          return `<label class="grant-seg${on?' on':''}">
+            <input type="radio" name="${escAttr(id)}" value="${escAttr(c)}"${on?' checked':''}
+                   onchange="grantSegSync(this)">
+            <span>${esc(CHOICE_LABELS[c]||c)}</span></label>`;
+        }).join('');
+        return `<div class="grant-row grant-row-choice" data-grant="${escAttr(g.key)}">
+          <div class="grant-copy"><span class="grant-label">${esc(g.label)}</span>
+            <span class="grant-help">${esc(g.help)}</span></div>
+          <div class="grant-seg-group">${segs||'<span class="grant-off">Not granted</span>'}</div>
+        </div>`;
+      }
+      if(readonly){
+        return `<div class="grant-row" data-grant="${escAttr(g.key)}">
+          <div class="grant-copy"><span class="grant-label">${esc(g.label)}</span>
+            <span class="grant-help">${esc(g.help)}</span></div>
+          <span class="${val?'grant-on':'grant-off'}">${val?'Allowed':'No'}</span>
+        </div>`;
+      }
+      return `<label class="grant-row grant-row-toggle" data-grant="${escAttr(g.key)}" for="${escAttr(id)}">
+        <input type="checkbox" id="${escAttr(id)}" data-grantkey="${escAttr(g.key)}"${val?' checked':''}>
+        <div class="grant-copy"><span class="grant-label">${esc(g.label)}</span>
+          <span class="grant-help">${esc(g.help)}</span></div>
+      </label>`;
+    }).join('');
+    return `<fieldset class="grant-group">
+      <legend class="grant-legend">${esc(group.label)}</legend>${rows}</fieldset>`;
+  }).join('');
+}
+
+const CHOICE_LABELS={none:'None',limited:'Own account only',root:'Root',
+                      own:'Their own files',full:'Whole filesystem'};
+
+/* Radio inputs cannot be styled by :checked on the label alone across the
+   whole group, so the active class is moved by hand on change. */
+function grantSegSync(input){
+  const group=input.closest('.grant-seg-group'); if(!group) return;
+  group.querySelectorAll('.grant-seg').forEach(l=>l.classList.remove('on'));
+  const label=input.closest('.grant-seg'); if(label) label.classList.add('on');
+}
+
+function readGrantForm(idPrefix){
+  const out=grantDefaults(), root=$('nu-grants'); if(!root) return out;
+  root.querySelectorAll('input[type="checkbox"][data-grantkey]').forEach(cb=>{
+    out[cb.dataset.grantkey]=cb.checked;
+  });
+  (_GRANT_DEFS||[]).filter(g=>g.kind==='choice').forEach(g=>{
+    const picked=root.querySelector(`input[name="${idPrefix}-${g.key}"]:checked`);
+    if(picked) out[g.key]=picked.value;
+  });
+  return out;
+}
+
 /* ================= USER MANAGEMENT ================= */
-const TERMINAL_LABELS={none:'No terminal',limited:'Restricted',root:'Root'};
+let _editingUser=null;
+
+function grantSummary(grants){
+  if(!_GRANT_DEFS) return '';
+  const parts=[];
+  _GRANT_DEFS.forEach(g=>{
+    const v=grants?grants[g.key]:g.default;
+    if(g.kind==='choice'){ if(v&&v!=='none') parts.push(g.label+': '+(CHOICE_LABELS[v]||v)); }
+    else if(v) parts.push(g.label);
+  });
+  return parts.length?parts.join(', '):'No permissions';
+}
+
 async function loadUserManagement(){
-  const el=$('user-list'); if(!el) return; el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
+  const el=$('user-list'); if(!el) return;
+  el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
   try{
+    await loadGrantRegistry();
+    if(!$('nu-grants').dataset.ready) resetUserForm();
     const d=await getJSON('/api/config/users'); if(!d) return;
     const users=d.users||[];
-    if(!users.length){ el.innerHTML='<div class="empty-state">No staff accounts yet.</div>'; return; }
-    const rows=users.map(u=>`<tr>
-      <td style="font-weight:700;">${esc(u.username)}</td>
-      <td>${esc(TERMINAL_LABELS[u.terminal_access]||u.terminal_access)}</td>
-      <td>${u.database_access?'Read':'No'}</td>
-      <td>${u.logs_access?'Yes':'No'}</td>
-      <td>${u.disk_access?'Yes':'No'}</td>
-      <td><button class="db-action-btn" style="color:var(--danger);" onclick="deletePanelUser('${escAttr(u.username)}')"><svg class="ic"><use href="#ic-trash-2"/></svg>Delete</button></td>
-    </tr>`).join('');
-    el.innerHTML=`<table><thead><tr><th>Username</th><th>Terminal</th><th>Database</th><th>Logs</th><th>Disk</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+    if(!users.length){ el.innerHTML='<div class="empty-state">No staff accounts yet. Create one below.</div>'; return; }
+    el.innerHTML=users.map(u=>`<div class="staff-row">
+      <div class="staff-main">
+        <div class="staff-name">${esc(u.username)}${u.full_name?` <span class="staff-full">${esc(u.full_name)}</span>`:''}</div>
+        <div class="staff-grants">${esc(grantSummary(u.grants))}</div>
+      </div>
+      <div class="staff-actions">
+        <button class="db-action-btn" onclick="editPanelUser('${escAttr(u.username)}')">
+          <svg class="ic"><use href="#ic-settings"/></svg>Edit</button>
+        <button class="db-action-btn staff-del" onclick="deletePanelUser('${escAttr(u.username)}')">
+          <svg class="ic"><use href="#ic-trash-2"/></svg>Delete</button>
+      </div>
+    </div>`).join('');
   }catch(e){ el.innerHTML='<div class="empty-state">Failed to load.</div>'; }
 }
-async function createPanelUser(){
-  const fb=$('nu-feedback'), btn=$('nu-create'); fb.textContent=''; fb.className='save-feedback';
-  const username=$('nu-username').value.trim(), password=$('nu-password').value;
-  const body={username,password,terminal_access:$('nu-terminal').value,
-    database_access:$('nu-db').checked, logs_access:$('nu-logs').checked, disk_access:$('nu-disk').checked};
+
+function resetUserForm(){
+  _editingUser=null;
+  const box=$('nu-grants'); if(!box) return;
+  box.innerHTML=grantFormHtml(grantDefaults(),{idPrefix:'nu'});
+  box.dataset.ready='1';
+  $('nu-card-title').textContent='Add a user';
+  $('nu-card-sub').textContent='Every permission below is off until you grant it.';
+  $('nu-username-group').hidden=false;
+  $('nu-username').value=''; $('nu-password').value='';
+  $('nu-password-hint').textContent='At least 8 characters, and not only digits.';
+  $('nu-submit').textContent='Create User';
+  $('nu-cancel').hidden=true;
+  const fb=$('nu-feedback'); fb.textContent=''; fb.className='save-feedback';
+}
+
+async function editPanelUser(username){
+  await loadGrantRegistry();
+  const d=await getJSON('/api/config/users'); if(!d) return;
+  const user=(d.users||[]).find(u=>u.username===username);
+  if(!user){ appToast('That account is gone','err'); loadUserManagement(); return; }
+  _editingUser=username;
+  const box=$('nu-grants');
+  box.innerHTML=grantFormHtml(user.grants,{idPrefix:'nu'});
+  box.dataset.ready='1';
+  $('nu-card-title').textContent='Edit '+username;
+  $('nu-card-sub').textContent='Unchecking a permission revokes it, and signs them out straight away.';
+  $('nu-username-group').hidden=true;
+  $('nu-password').value='';
+  $('nu-password-hint').textContent='Leave blank to keep their current password.';
+  $('nu-submit').textContent='Save Changes';
+  $('nu-cancel').hidden=false;
+  const fb=$('nu-feedback'); fb.textContent=''; fb.className='save-feedback';
+  $('nu-card').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+async function submitPanelUser(){
+  const fb=$('nu-feedback'), btn=$('nu-submit');
+  fb.textContent=''; fb.className='save-feedback';
+  const grants=readGrantForm('nu'), password=$('nu-password').value;
+  const editing=_editingUser;
+  let url, body;
+  if(editing){
+    url='/api/config/users/'+encodeURIComponent(editing);
+    body={grants}; if(password) body.password=password;
+  }else{
+    const username=$('nu-username').value.trim();
+    if(!username){ fb.textContent='Enter a username.'; fb.classList.add('err'); return; }
+    url='/api/config/users'; body={username,password,grants};
+  }
   btn.disabled=true;
   try{
-    const r=await api('/api/config/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r=await api(url,{method:'POST',headers:{'Content-Type':'application/json'},
+                           body:JSON.stringify(body)});
     const d=await r.json();
-    if(!r.ok){ fb.textContent=d.error||'Could not create the user.'; fb.classList.add('err'); }
+    if(!r.ok){ fb.textContent=d.error||'Could not save.'; fb.classList.add('err'); }
     else{
-      fb.textContent='User created.'; fb.classList.add('ok');
-      ['nu-username','nu-password'].forEach(id=>$(id).value='');
-      $('nu-db').checked=$('nu-logs').checked=$('nu-disk').checked=false; $('nu-terminal').value='none';
+      appToast(editing?'Changes saved':'User created','ok');
+      resetUserForm();
       loadUserManagement();
     }
   }catch(e){ fb.textContent='Network error'; fb.classList.add('err'); }
   btn.disabled=false;
 }
+
 async function deletePanelUser(username){
   if(!(await uiConfirm('Delete this user?',username+' will lose access immediately.'))) return;
   const r=await api('/api/config/users/'+encodeURIComponent(username),{method:'DELETE'});
   const d=await r.json();
   if(!r.ok){ appToast(d.error||'Delete failed','err'); return; }
-  appToast('User deleted','ok'); loadUserManagement();
+  appToast('User deleted','ok');
+  if(_editingUser===username) resetUserForm();
+  loadUserManagement();
+}
+
+/* The staff-facing mirror of the same registry: read-only, no controls. */
+async function loadMyAccount(){
+  const box=$('acct-grants'); if(!box) return;
+  await loadGrantRegistry();
+  box.innerHTML=grantFormHtml(window.MGMT_PERMS||{},{readonly:true,idPrefix:'ac'});
+  const role=$('acct-role');
+  if(role) role.textContent=(window.MGMT_PERMS||{}).role==='admin'?'Administrator':'Staff account';
 }
 
 /* ================= DATABASE ================= */

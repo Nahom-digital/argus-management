@@ -694,26 +694,43 @@ def _config_sub_users():
       <div class="settings-subtitle" style="margin:6px 0 14px;">Accounts you create for people who should not have the full admin login.</div>
       <div id="user-list"><div class="empty-state">Loading&hellip;</div></div>
     </div>
-    <div class="cfg-card" style="margin-top:18px;">
-      <div class="device-title">Add a user</div>
-      <div class="field-group"><label class="field-label" for="nu-username">Username</label>
+    <div class="cfg-card cfg-card-wide" style="margin-top:18px;" id="nu-card">
+      <div class="device-title" id="nu-card-title">Add a user</div>
+      <div class="settings-subtitle" id="nu-card-sub" style="margin:6px 0 16px;">Every permission below is off until you grant it.</div>
+      <div class="field-group" id="nu-username-group"><label class="field-label" for="nu-username">Username</label>
+        <div class="field-hint">Letters, digits, dot, dash and underscore. It cannot be changed afterwards.</div>
         <input class="field-input" id="nu-username" type="text" autocomplete="off" spellcheck="false"></div>
       <div class="field-group"><label class="field-label" for="nu-password">Password</label>
-        <div class="field-hint">At least 8 characters, and not only digits.</div>
+        <div class="field-hint" id="nu-password-hint">At least 8 characters, and not only digits.</div>
         <input class="field-input" id="nu-password" type="password" autocomplete="new-password"></div>
-      <div class="field-group"><label class="field-label" for="nu-terminal">Terminal access</label>
-        <select class="field-input" id="nu-terminal">
-          <option value="none">No terminal access</option>
-          <option value="limited">Restricted (own system account)</option>
-          <option value="root">Root</option>
-        </select></div>
-      <div class="field-group perm-checks">
-        <label class="perm-check"><input type="checkbox" id="nu-db">Database (read only)</label>
-        <label class="perm-check"><input type="checkbox" id="nu-logs">Logs</label>
-        <label class="perm-check"><input type="checkbox" id="nu-disk">Disk files</label>
+      <div id="nu-grants" class="grant-form"><div class="empty-state">Loading permissions&hellip;</div></div>
+      <div class="nu-actions">
+        <button class="save-btn" id="nu-submit" onclick="submitPanelUser()">Create User</button>
+        <button class="db-action-btn" id="nu-cancel" onclick="resetUserForm()" hidden>Cancel</button>
       </div>
-      <button class="save-btn" id="nu-create" onclick="createPanelUser()">Create User</button>
       <div class="save-feedback" id="nu-feedback"></div>
+    </div>
+  </div>"""
+
+def _config_sub_account(perms: dict):
+    """What a staff member sees under Config: their own account, nothing else.
+    The grant list is rendered read-only from the same registry the admin's
+    form is built from, so the two can never describe different things."""
+    return f"""
+  <div class="config-sub" data-cfgsub="account" hidden>
+    {_CONFIG_BACK}
+    <div class="mgmt-h2">My Account</div>
+    <div class="cfg-card">
+      <div class="device-title">Who you are</div>
+      <dl class="acct-facts">
+        <dt>Username</dt><dd id="acct-username">{html.escape(perms.get("username") or "")}</dd>
+        <dt>Role</dt><dd id="acct-role">Staff account</dd>
+      </dl>
+    </div>
+    <div class="cfg-card cfg-card-wide" style="margin-top:18px;">
+      <div class="device-title">What you are allowed to do</div>
+      <div class="settings-subtitle" style="margin:6px 0 14px;">Only an admin can change these. Ask one in person if you need more.</div>
+      <div id="acct-grants" class="grant-form grant-form-readonly"><div class="empty-state">Loading&hellip;</div></div>
     </div>
   </div>"""
 
@@ -820,6 +837,7 @@ def _config_sub_proxy():
   </div>"""
 
 _CONFIG_SUB_BUILDERS = {
+    "account": _config_sub_account,
     "users": lambda perms: _config_sub_users(),
     "server": lambda perms: _config_sub_server(),
     "service": lambda perms: _config_sub_service(),
@@ -859,23 +877,23 @@ _PANES_TEMPLATE = """
       <div class="metric-card metric-clickable" onclick="openServerDetail('cpu')" title="Top processes by CPU">
         <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-cpu"/></svg>CPU</span><span class="metric-now" id="m-cpu-now">0%</span></div>
         <canvas class="metric-chart" id="chart-cpu" height="70"></canvas>
-        <div class="metric-foot" id="m-cpu-foot">&mdash;</div>
+        <div class="metric-foot" id="m-cpu-foot">-</div>
         <div class="core-bars" id="core-bars"></div>
       </div>
       <div class="metric-card metric-clickable" onclick="openServerDetail('mem')" title="Top processes by memory">
         <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-memory-stick"/></svg>Memory</span><span class="metric-now" id="m-ram-now">0%</span></div>
         <canvas class="metric-chart" id="chart-ram" height="70"></canvas>
-        <div class="metric-foot" id="m-ram-foot">&mdash;</div>
+        <div class="metric-foot" id="m-ram-foot">-</div>
       </div>
       <div class="metric-card metric-clickable" onclick="openServerDetail('net')" title="Active connections">
         <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-wifi"/></svg>Network</span><span class="metric-now" id="m-net-now">&darr;0 &uarr;0</span></div>
         <canvas class="metric-chart" id="chart-net" height="70"></canvas>
-        <div class="metric-foot" id="m-net-foot">&mdash;</div>
+        <div class="metric-foot" id="m-net-foot">-</div>
       </div>
       <div class="metric-card metric-clickable" onclick="openServerDetail('disk')" title="Browse & download files">
         <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-hard-drive"/></svg>Disk</span><span class="metric-now" id="m-disk-now">0%</span></div>
         <div class="disk-bar"><div class="disk-fill" id="disk-fill"></div></div>
-        <div class="metric-foot" id="m-disk-foot">&mdash;</div>
+        <div class="metric-foot" id="m-disk-foot">-</div>
         <div class="metric-head" style="margin-top:14px;"><span class="metric-title">Load avg</span><span class="metric-now" id="m-load-now">0.00</span></div>
         <div class="metric-foot" id="m-load-foot">1m / 5m / 15m</div>
       </div>
@@ -962,7 +980,7 @@ _PANES_TEMPLATE = """
         <svg class="ic" style="color:var(--danger)"><use href="#ic-triangle-alert"/></svg> Anyone holding a code can take over the panel.</div>
       <div class="cfg-running" id="acct-codes-state">Checking&hellip;</div>
       <div class="field-group" style="margin-top:16px;"><label class="field-label" for="acct-regen-pw">Current password</label>
-        <div class="field-hint">Required &mdash; issuing new codes retires every existing one.</div>
+        <div class="field-hint">Required - issuing new codes retires every existing one.</div>
         <input class="field-input" id="acct-regen-pw" type="password" autocomplete="current-password"></div>
       <button class="save-btn" id="acct-regen" onclick="regenerateRecoveryCodes()">Generate New Codes</button>
       <div class="save-feedback" id="acct-regen-feedback"></div>
