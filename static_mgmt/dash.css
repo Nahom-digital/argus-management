@@ -18,6 +18,12 @@
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+  /* The browser's own rule for [hidden] is only display:none at user-agent
+     level, so any author rule that sets display beats it and the element stays
+     on screen. Everything the panel hides, it hides with this attribute, so the
+     rule is stated once here instead of being re-fought per component. */
+  [hidden] { display: none !important; }
+
   /* ===================================================================
      WElinkP2P, design tokens.  Warm light-brown / dark-brown / black /
      white palette.  The whole UI is token-driven, so these definitions
@@ -1192,8 +1198,15 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
 @media (hover: hover) and (pointer: fine) {
   .grant-seg:hover { background: var(--gray-100); border-color: var(--gray-300); color: var(--black); }
 }
-.grant-seg.on { background: var(--accent); border-color: var(--accent); color: #fff7ea; }
-[data-theme="dark"] .grant-seg.on { color: #20160c; }
+/* Selected state comes from the radio itself as well as from the .on class the
+   grant form sets, so a segmented group that nobody wired up in JS still shows
+   which option is chosen. */
+.grant-seg.on,
+.grant-seg:has(input:checked) {
+  background: var(--accent); border-color: var(--accent); color: #fff7ea;
+}
+[data-theme="dark"] .grant-seg.on,
+[data-theme="dark"] .grant-seg:has(input:checked) { color: #20160c; }
 .grant-seg:has(input:focus-visible) { outline: 2px solid var(--ring); outline-offset: 2px; }
 
 /* Read-only mirror shown to staff on their own account. Choice rows stay a
@@ -1278,4 +1291,189 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
 @media (max-width: 720px) {
   .db-cell-text { max-width: 20ch; }
   .db-cell-text.wide { max-width: 24ch; }
+}
+
+/* ===================================================================
+   PROXY HOSTS, form and list
+   The form is long because a server block genuinely has that many
+   knobs, so the work is in the grouping: each fieldset answers one
+   question (what arrives, where it goes, how it is secured, how it
+   behaves), and rows inside a group share one hairline rhythm. Field
+   widths are content-shaped rather than equal, so a port never gets
+   the same room as a hostname.
+   =================================================================== */
+.px-card-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+}
+/* The copy has to be allowed to shrink. Left at auto it takes its max-content
+   width, which for a sentence is wide enough to wrap the button onto its own
+   line even on a desktop. */
+.px-card-head > :first-child { flex: 1 1 260px; min-width: 0; }
+.px-card-head .save-btn, .px-card-head .db-action-btn { flex: none; }
+
+.px-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+.px-row + .px-row { margin-top: 14px; }
+.px-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.px-field-grow { flex: 1 1 220px; }
+.px-field-port { flex: 0 0 110px; }
+.px-field .field-label { margin: 0; }
+.px-field .field-hint { margin: 0 0 2px; }
+.px-row-domain .grant-seg-group { padding-bottom: 1px; }
+
+.px-stream-note {
+  margin-top: 12px; padding: 10px 12px; border-radius: 7px;
+  background: var(--gray-50); border: 1px solid var(--gray-200);
+  font-size: 12px; line-height: 1.5; color: var(--gray-600);
+}
+
+/* HTTPS flags. Checkboxes because they describe what the host IS,
+   as opposed to the switches below which change how traffic is handled. */
+.px-check-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 4px 20px; margin-top: 16px; padding-top: 14px;
+  border-top: 1px solid var(--gray-200);
+}
+.px-check-row {
+  display: flex; align-items: flex-start; gap: 10px; padding: 9px 2px;
+  cursor: pointer;
+}
+.px-check-row input[type="checkbox"] {
+  width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--accent);
+  cursor: pointer; flex: none;
+}
+.px-check-row:has(input:disabled) { cursor: default; opacity: 0.5; }
+.px-check-row:has(input:focus-visible) {
+  outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px;
+}
+
+/* Behaviour switches */
+.px-toggle-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 18px;
+  padding: 12px 2px; border-bottom: 1px solid var(--gray-200); cursor: pointer;
+}
+.px-toggle-row:last-child { border-bottom: none; }
+.px-toggle-row:has(input:focus-visible) {
+  outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px;
+}
+.px-switch { position: relative; flex: none; display: inline-flex; }
+.px-switch input {
+  position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer;
+  width: 100%; height: 100%;
+}
+.px-switch-track {
+  width: 40px; height: 22px; border-radius: 11px; display: block;
+  background: var(--gray-200); border: 1px solid var(--gray-300);
+  transition: background 0.16s cubic-bezier(0.23, 1, 0.32, 1),
+              border-color 0.16s cubic-bezier(0.23, 1, 0.32, 1);
+}
+.px-switch-knob {
+  position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+  border-radius: 50%; background: var(--white); box-shadow: var(--shadow-sm);
+  transition: transform 0.16s cubic-bezier(0.23, 1, 0.32, 1);
+}
+.px-switch input:checked ~ .px-switch-track {
+  background: var(--accent); border-color: var(--accent);
+}
+.px-switch input:checked ~ .px-switch-track .px-switch-knob {
+  transform: translateX(18px);
+}
+.px-switch input:active ~ .px-switch-track .px-switch-knob { transform: scale(0.92); }
+.px-switch input:checked:active ~ .px-switch-track .px-switch-knob {
+  transform: translateX(18px) scale(0.92);
+}
+
+/* Custom locations */
+.px-location {
+  border: 1px solid var(--gray-200); border-radius: 8px; padding: 14px;
+  margin-bottom: 12px; background: var(--gray-50);
+}
+.px-location-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 12px;
+}
+.px-location-title {
+  font-family: var(--display); font-weight: 700; font-size: 12.5px;
+  color: var(--gray-700);
+}
+.px-location .px-toggle-row { padding: 9px 2px; }
+.px-location .px-switch-knob { background: var(--white); }
+.px-location-toggles { margin-top: 6px; border-top: 1px solid var(--gray-200); }
+
+.px-form-actions { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.px-form-actions .save-feedback { margin: 0; }
+
+/* Host list */
+.proxy-host-meta {
+  display: flex; gap: 6px 12px; flex-wrap: wrap; margin-top: 5px;
+  font-size: 11px; color: var(--gray-500);
+}
+.proxy-host-actions { display: flex; gap: 6px; flex: none; align-items: center; }
+.proxy-host-readonly {
+  font-size: 11px; color: var(--gray-500); white-space: nowrap;
+  padding: 5px 2px; cursor: help;
+}
+.proxy-host.editing { border-color: var(--accent); }
+
+/* ===================================================================
+   FIREWALL SETTINGS
+   Two columns because inbound and outbound are answers to different
+   questions and reading them interleaved is how mistakes happen.
+   =================================================================== */
+.px-fw-status {
+  display: flex; gap: 8px 16px; flex-wrap: wrap; align-items: center;
+  padding: 10px 12px; margin: 12px 0 16px; border-radius: 7px;
+  background: var(--gray-50); border: 1px solid var(--gray-200);
+  font-size: 12px; color: var(--gray-600); line-height: 1.5;
+}
+.px-fw-add { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.px-fw-add .field-input { padding: 8px 10px; font-size: 12.5px; }
+.px-fw-dir, .px-fw-proto { flex: 0 0 118px; }
+.px-fw-port { flex: 0 0 100px; }
+.px-fw-note { flex: 1 1 180px; min-width: 140px; }
+.px-fw-add .save-btn { flex: none; }
+
+.px-fw-cols {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 24px; margin-top: 18px;
+}
+.px-fw-legend {
+  font-family: var(--display); font-weight: 700; font-size: 11.5px;
+  text-transform: uppercase; letter-spacing: 0.6px; color: var(--gray-500);
+  margin-bottom: 10px;
+}
+.px-fw-rule {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+  border: 1px solid var(--gray-200); border-radius: 7px; margin-bottom: 8px;
+}
+.px-fw-rule-info { flex: 1; min-width: 0; }
+.px-fw-rule-port {
+  font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--black);
+}
+.px-fw-rule-note {
+  font-size: 11px; color: var(--gray-500); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.px-fw-auto {
+  font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.5px; padding: 2px 6px; border-radius: 4px;
+  background: var(--accent-soft); color: var(--accent); flex: none;
+}
+.px-fw-block {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+  border: 1px solid var(--gray-200); border-radius: 7px; margin-bottom: 8px;
+}
+.px-fw-block-ip {
+  font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--black);
+}
+.px-fw-block-why { font-size: 11px; color: var(--gray-500); margin-top: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .px-switch-track, .px-switch-knob { transition-duration: 0.01ms; }
+}
+
+@media (max-width: 720px) {
+  .px-field-port { flex: 0 0 90px; }
+  .px-card-head { flex-direction: column; align-items: stretch; }
+  .px-card-head .save-btn { width: 100%; }
 }

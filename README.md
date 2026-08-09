@@ -130,14 +130,23 @@ unlock.
   only, never anything else that might live in the same Postgres database.
   Reading, changing and seeing the change log are three separate grants, so a
   staff account can be given any combination of them.
-- **Proxy.** Detects the nginx server blocks already on the box and lets you
-  add or remove reverse-proxy hosts (domain, target, optional WebSocket
-  support) for ones this panel created. TLS/Let's Encrypt is out of scope
-  here, deliberately, that stays whatever you already use.
+- **Proxy.** Detects every nginx server block on the box and manages the ones
+  this panel wrote. A host is described by its incoming scheme (HTTP, HTTPS,
+  TCP or UDP), the domain, and where it forwards to. An HTTPS host picks a
+  certificate and key from the files already on the server, with Force SSL,
+  HSTS, HSTS subdomains and HTTP/2 as separate switches. Cache assets, block
+  common exploits and websocket support are per-host toggles, and any number of
+  custom locations can send a path under the domain somewhere else with their
+  own toggles. Hosts written by hand are shown but never edited or deleted.
+  A saved host can be reopened and changed: the generated file carries its own
+  settings, so editing shows what was saved rather than a guess.
+- **Firewall settings.** Inbound and outbound port rules, each one on or off,
+  plus the list of blocked addresses. A proxy host puts its own inbound port on
+  the allow list as it is saved. Delegable separately from the proxy itself.
 
 ### Permissions
 
-There are fourteen grants, defined in one place: the `PERMISSIONS` registry in
+There are fifteen grants, defined in one place: the `PERMISSIONS` registry in
 `panel_users.py`. That registry is what validates a submitted permission set,
 what the request path reads when it decides whether to answer, and what the
 admin's form is generated from. Building the form from the same definition the
@@ -149,7 +158,7 @@ endpoint honours, or an endpoint gated on something the admin cannot grant.
 | Terminal | none, own account only, or root |
 | Disk | reach nothing / their own files / the whole filesystem, plus download and delete as separate switches |
 | Database | read tables, change rows, view the change log |
-| Network | connection detail in the Server section, manage proxy hosts |
+| Network | connection detail in the Server section, manage proxy hosts, manage firewall settings |
 | CPU and memory | the top-process lists behind both meters |
 | Services | see status, start and restart, stop |
 | Logs | the Logs tab and its readers |
@@ -185,7 +194,8 @@ stronger check than a code sitting in a file.
 | `vault.py`      | symmetric encryption for the few secrets that must be read back, not just verified |
 | `ssh_vault.py`  | SSH keypair generation and encrypted storage for the Server Configuration card |
 | `panel_users.py`| staff accounts and their permission grants |
-| `nginx_proxy.py`| detects and manages nginx reverse-proxy hosts for the Proxy card |
+| `nginx_proxy.py`| renders, validates and manages nginx server blocks for the Proxy card |
+| `firewall.py`   | port rules, blocked addresses, and the automatic block after repeated SSH failures |
 | `static_mgmt/`  | CSS design system + panel JS + icon sprite |
 | `vendor/`       | bundled fonts, xterm.js, icons (no external CDN needed) |
 
@@ -225,3 +235,18 @@ nginx serves the panel at the root of `argus.welinkp2p.digital` and proxies to t
 loopback port, forwarding websocket upgrades for the in-browser terminal. Set
 `base_path` to `""` when serving from a subdomain root, or to e.g. `/management` when
 mounting under a path on a shared host.
+
+### TCP and UDP hosts
+
+Forwarding raw TCP or UDP needs nginx's stream module, which Debian ships as a
+separate package and which is not loaded by default. `management.py` installs
+`libnginx-mod-stream`, creates `/etc/nginx/stream.d`, and adds a `stream` block
+to `nginx.conf` that includes it, rolling the change back if `nginx -t` refuses.
+Until both are in place the panel refuses to write a TCP or UDP host and says
+why, because a `stream` block nginx does not understand stops it from starting
+at all and would take every other host down with it.
+
+The same reasoning covers forward hostnames. nginx resolves a `proxy_pass` name
+when it loads the config, not per request, so a name that does not resolve is a
+fatal error rather than one broken host. The form checks that the name resolves
+before writing anything.

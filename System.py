@@ -301,7 +301,7 @@ class PtySession:
         except OSError:
             os._exit(126)
         if os.getuid() == 0:
-            os._exit(126)  # setuid silently no-op'd somehow -- refuse to run as root
+            os._exit(126)  # setuid silently no-op'd somehow, so refuse to run as root
         return pw.pw_dir
 
     def spawn(self, rows=24, cols=80):
@@ -584,7 +584,7 @@ def resolve_download(path, root=None):
     return full, None
 
 
-# Whole subtrees a delete must never touch, even for an admin -- a misclick
+# Whole subtrees a delete must never touch, even for an admin, because a misclick
 # here is not recoverable the way an accidental download is.
 _DELETE_DENY_PREFIXES = ("/etc", "/boot", "/sys", "/proc", "/dev", "/bin", "/sbin",
                           "/lib", "/lib64", "/usr", "/var/lib/postgresql")

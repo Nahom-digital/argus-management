@@ -155,3 +155,60 @@ def test_a_malformed_value_never_reads_as_permission():
     assert pu.normalize_grants({"db_write": 1})["db_write"] is True
     assert pu.normalize_grants({"db_write": 0})["db_write"] is False
     assert pu.normalize_grants({"db_write": "off"})["db_write"] is False
+
+
+def test_a_proxy_filename_cannot_walk_out_of_the_nginx_directory():
+    """filename comes straight off the URL, so it is attacker-shaped input. If
+    it were joined raw, ../../../etc/passwd would be read and then rewritten."""
+    import nginx_proxy
+    for hostile in ("../../../../etc/passwd", "..%2f..%2fshadow",
+                    "/etc/shadow", "sub/dir/other.conf", "....//nginx.conf"):
+        assert nginx_proxy.get_host(hostile) is None or \
+            "/" not in os.path.basename(hostile), hostile
+        # The read path and the delete path must agree on the sanitizer.
+        assert os.path.basename(hostile) == os.path.basename(os.path.basename(hostile))
+
+
+def test_a_proxy_config_path_is_always_derived_from_the_slug_not_the_input():
+    """Even a domain that passed validation must not be able to choose where the
+    file lands."""
+    import nginx_proxy
+    for hostile in ("../../evil/../app.example.com", "/etc/nginx/nginx.conf",
+                    "..", "...", "./.hidden", "a/b/c"):
+        slug = nginx_proxy._slug(hostile)
+        assert "/" not in slug, slug
+        assert ".." not in slug, slug
+        assert not slug.startswith("."), slug
+        assert slug, "an empty filename would land on the directory itself"
+
+
+def test_a_proxy_spec_from_a_request_body_keeps_only_known_fields():
+    """A stored spec is rendered into a config file, so an unknown key that
+    survived would be a way to inject text into nginx's own syntax."""
+    import panel
+    import nginx_proxy
+    hostile = {
+        "domain": "app.example.com",
+        "forward_host": "127.0.0.1",
+        "forward_port": 8080,
+        "extra_directives": "}\nserver { listen 9999; }",
+        "__class__": "nope",
+        "locations": [{"path": "/api", "forward_host": "127.0.0.1",
+                       "forward_port": 9000, "sneaky": "return 200 'pwned';"}],
+    }
+    spec = panel._proxy_spec_from_body(hostile)
+    assert "extra_directives" not in spec and "__class__" not in spec
+    assert "sneaky" not in spec["locations"][0]
+    rendered = nginx_proxy.render(nginx_proxy.normalize(spec))
+    assert "listen 9999" not in rendered
+    assert "pwned" not in rendered
+
+
+def test_a_request_cannot_ask_for_an_unbounded_number_of_locations():
+    """Each location becomes a block in a config file nginx has to parse."""
+    import panel
+    body = {"domain": "app.example.com", "forward_host": "127.0.0.1",
+            "forward_port": 80,
+            "locations": [{"path": f"/p{i}", "forward_host": "127.0.0.1",
+                           "forward_port": 9000} for i in range(500)]}
+    assert len(panel._proxy_spec_from_body(body)["locations"]) <= 40

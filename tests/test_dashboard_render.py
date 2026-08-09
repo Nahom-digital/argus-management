@@ -110,3 +110,71 @@ def test_no_em_dash_reaches_the_rendered_page(client):
     page = _page_as(client, "admin")
     for bad in ("—", "–", "&mdash;", "&ndash;"):
         assert bad not in page, f"{bad!r} found in the rendered dashboard"
+
+
+# ---------------------------------------------------------------- proxy form
+def test_the_proxy_form_offers_every_incoming_scheme(client):
+    page = _page_as(client, "admin")
+    for value in ("http", "https", "tcp", "udp"):
+        assert f'name="px-listen" value="{value}"' in page, value
+
+
+def test_the_proxy_form_carries_every_flag_the_renderer_knows(client):
+    """The form and nginx_proxy have to agree on the field names, or a toggle
+    silently does nothing. Reading the list from the module makes drift a
+    failure rather than a surprise."""
+    import nginx_proxy
+    page = _page_as(client, "admin")
+    for flag in nginx_proxy.TLS_FLAGS + nginx_proxy.BEHAVIOUR_FLAGS:
+        assert f'data-px="{flag}"' in page, flag
+
+
+def test_the_proxy_form_has_a_certificate_picker_and_a_manual_path(client):
+    page = _page_as(client, "admin")
+    for el in ("px-cert-pick", "px-cert-path", "px-key-pick", "px-key-path"):
+        assert f'id="{el}"' in page, el
+
+
+def test_the_proxy_form_has_somewhere_to_put_custom_locations(client):
+    page = _page_as(client, "admin")
+    assert 'id="px-locations"' in page
+    assert 'id="px-add-location"' in page
+
+
+def test_firewall_settings_are_absent_without_the_grant(client, conn):
+    pu.delete_user(conn, STAFF)
+    pu.create_user(conn, STAFF, PASSWORD, {"net_proxy": True}, "admin")
+    panel._forget_user_epoch(STAFF)
+    try:
+        page = _page_as(client, STAFF)
+        assert 'data-cfgsub="proxy"' in page, "the proxy page itself should be there"
+        assert 'id="px-fw-in"' not in page, \
+            "firewall settings must not render without firewall_manage"
+    finally:
+        pu.delete_user(conn, STAFF)
+
+
+def test_firewall_settings_appear_with_the_grant(client, conn):
+    pu.delete_user(conn, STAFF)
+    pu.create_user(conn, STAFF, PASSWORD,
+                   {"net_proxy": True, "firewall_manage": True}, "admin")
+    panel._forget_user_epoch(STAFF)
+    try:
+        page = _page_as(client, STAFF)
+        for el in ("px-fw-in", "px-fw-out", "px-fw-blocks", "px-fw-port"):
+            assert f'id="{el}"' in page, el
+    finally:
+        pu.delete_user(conn, STAFF)
+
+
+def test_the_proxy_page_is_absent_without_net_proxy(client, conn):
+    pu.delete_user(conn, STAFF)
+    pu.create_user(conn, STAFF, PASSWORD, {"firewall_manage": True}, "admin")
+    panel._forget_user_epoch(STAFF)
+    try:
+        page = _page_as(client, STAFF)
+        assert 'data-cfgsub="proxy"' not in page
+        assert 'id="px-fw-in"' not in page, \
+            "the firewall card lives inside the proxy page, so it goes with it"
+    finally:
+        pu.delete_user(conn, STAFF)

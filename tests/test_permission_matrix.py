@@ -152,3 +152,58 @@ def test_signed_out_requests_are_not_merely_unpermitted(client):
     client.cookies.clear()
     r = client.get("/api/system/processes")
     assert r.status_code in (401, 403)
+
+
+# The matrix above uses one probe per grant, which proves the grant is wired to
+# the right check. These two lists go the other way: every route in the proxy and
+# firewall groups, so a new endpoint added without a check is caught even though
+# its grant already has a probe.
+PROXY_ROUTES = [
+    ("GET", "/api/config/proxy/hosts"),
+    ("GET", "/api/config/proxy/certificates"),
+    ("POST", "/api/config/proxy/hosts"),
+    ("PUT", "/api/config/proxy/hosts/pytest-nothing.conf"),
+    ("DELETE", "/api/config/proxy/hosts/pytest-nothing.conf"),
+]
+FIREWALL_ROUTES = [
+    ("GET", "/api/config/firewall"),
+    ("POST", "/api/config/firewall/rule"),
+    ("DELETE", "/api/config/firewall/rule"),
+    ("POST", "/api/config/firewall/block"),
+]
+
+
+def test_every_proxy_route_is_gated_on_net_proxy(client, conn):
+    _staff_with(conn, {"firewall_manage": True})
+    try:
+        _sign_in_as(client, STAFF)
+        for method, url in PROXY_ROUTES:
+            assert _call(client, method, url).status_code == 403, \
+                f"{method} {url} is reachable without net_proxy"
+    finally:
+        pu.delete_user(conn, STAFF)
+
+
+def test_every_firewall_route_is_gated_on_firewall_manage(client, conn):
+    _staff_with(conn, {"net_proxy": True})
+    try:
+        _sign_in_as(client, STAFF)
+        for method, url in FIREWALL_ROUTES:
+            assert _call(client, method, url).status_code == 403, \
+                f"{method} {url} is reachable without firewall_manage"
+    finally:
+        pu.delete_user(conn, STAFF)
+
+
+def test_the_proxy_and_firewall_routes_listed_here_actually_exist():
+    """A typo in a URL above would make both tests pass for the wrong reason:
+    a route that does not exist answers 404, never 403."""
+    known = set()
+    for route in panel.app.routes:
+        for method in getattr(route, "methods", ()) or ():
+            known.add((method, getattr(route, "path", "")))
+    for method, url in PROXY_ROUTES + FIREWALL_ROUTES:
+        path = url.split("?")[0]
+        if path.endswith("pytest-nothing.conf"):
+            path = path.rsplit("/", 1)[0] + "/{filename}"
+        assert (method, path) in known, f"{method} {path} is not a real route"

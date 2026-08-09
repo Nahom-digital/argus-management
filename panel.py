@@ -839,27 +839,218 @@ def _config_sub_database(perms: dict):
     <div id="db-table-view"><div class="empty-state">Pick a table to browse it.</div></div>
   </div>"""
 
-def _config_sub_proxy():
+def _px_toggle(field, label, help_text, on=False):
+    """A behaviour switch. These read as physical on/off because they change
+    how traffic is handled, not what the host is."""
+    return f"""
+        <label class="px-toggle-row">
+          <span class="grant-copy">
+            <span class="grant-label">{label}</span>
+            <span class="grant-help">{help_text}</span>
+          </span>
+          <span class="px-switch">
+            <input type="checkbox" data-px="{field}"{" checked" if on else ""}>
+            <span class="px-switch-track"><span class="px-switch-knob"></span></span>
+          </span>
+        </label>"""
+
+def _px_check(field, label, help_text):
+    return f"""
+        <label class="px-check-row">
+          <input type="checkbox" data-px="{field}">
+          <span class="grant-copy">
+            <span class="grant-label">{label}</span>
+            <span class="grant-help">{help_text}</span>
+          </span>
+        </label>"""
+
+def _config_sub_proxy(perms):
+    listen_segs = "".join(
+        f'<label class="grant-seg"><input type="radio" name="px-listen" '
+        f'value="{value}"{" checked" if value == "https" else ""}>{label}</label>'
+        for value, label in (("http", "HTTP"), ("https", "HTTPS"),
+                             ("tcp", "TCP"), ("udp", "UDP")))
+    forward_segs = "".join(
+        f'<label class="grant-seg"><input type="radio" name="px-forward-scheme" '
+        f'value="{value}"{" checked" if value == "http" else ""}>{label}</label>'
+        for value, label in (("http", "HTTP"), ("https", "HTTPS")))
+
+    firewall_card = ""
+    if perms.get("firewall_manage"):
+        firewall_card = f"""
+    <div class="cfg-card cfg-card-wide" style="margin-top:18px;">
+      <div class="device-title">Firewall settings</div>
+      <div class="settings-subtitle" style="margin:6px 0 4px;">
+        Which ports this server accepts and which it may reach out on. A proxy
+        host opens its own inbound port here automatically.
+      </div>
+      <div id="px-fw-status" class="px-fw-status"></div>
+      <div class="px-fw-add">
+        <select class="field-input px-fw-dir" id="px-fw-direction" aria-label="Direction">
+          <option value="in">Inbound</option>
+          <option value="out">Outbound</option>
+        </select>
+        <select class="field-input px-fw-proto" id="px-fw-protocol" aria-label="Protocol">
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
+        </select>
+        <input class="field-input px-fw-port" id="px-fw-port" type="number" min="1" max="65535"
+               placeholder="Port" inputmode="numeric" autocomplete="off">
+        <input class="field-input px-fw-note" id="px-fw-note" type="text"
+               placeholder="What is it for" maxlength="120" autocomplete="off">
+        <button class="save-btn" id="px-fw-add" onclick="addFirewallRule()">Add rule</button>
+      </div>
+      <div class="save-feedback" id="px-fw-feedback"></div>
+      <div class="px-fw-cols">
+        <div>
+          <div class="px-fw-legend">Inbound</div>
+          <div id="px-fw-in"><div class="empty-state">Loading&hellip;</div></div>
+        </div>
+        <div>
+          <div class="px-fw-legend">Outbound</div>
+          <div id="px-fw-out"><div class="empty-state">Loading&hellip;</div></div>
+        </div>
+      </div>
+      <div class="px-fw-legend" style="margin-top:20px;">Blocked addresses</div>
+      <div id="px-fw-blocks"><div class="empty-state">Loading&hellip;</div></div>
+    </div>"""
+
     return f"""
   <div class="config-sub" data-cfgsub="proxy" hidden>
     {_CONFIG_BACK}
     <div class="mgmt-h2">Proxy</div>
-    <div class="cfg-card">
-      <div class="device-title">Reverse proxy hosts</div>
-      <div class="settings-subtitle" style="margin:6px 0 14px;">Detected and managed nginx server blocks.</div>
-      <div id="proxy-list"><div class="empty-state">Loading&hellip;</div></div>
+
+    <div class="cfg-card cfg-card-wide">
+      <div class="px-card-head">
+        <div>
+          <div class="device-title">Reverse proxy hosts</div>
+          <div class="settings-subtitle" style="margin-top:6px;">Every server block nginx loads. Hosts added here can be edited; hand-written ones are left alone.</div>
+        </div>
+        <button class="save-btn" id="px-new" onclick="openProxyForm(null)">Add proxy host</button>
+      </div>
+      <div id="proxy-list" style="margin-top:16px;"><div class="empty-state">Loading&hellip;</div></div>
     </div>
-    <div class="cfg-card" style="margin-top:18px;">
-      <div class="device-title">Add a proxy host</div>
-      <div class="field-group"><label class="field-label" for="px-domain">Domain</label>
-        <input class="field-input" id="px-domain" type="text" placeholder="example.com" spellcheck="false" autocomplete="off"></div>
-      <div class="field-group"><label class="field-label" for="px-target">Target</label>
-        <div class="field-hint">Where nginx forwards requests, for example 127.0.0.1:8080</div>
-        <input class="field-input" id="px-target" type="text" placeholder="127.0.0.1:8080" spellcheck="false" autocomplete="off"></div>
-      <div class="field-group"><label class="perm-check"><input type="checkbox" id="px-ws" checked>Support WebSockets</label></div>
-      <button class="save-btn" id="px-create" onclick="createProxyHost()">Add Host</button>
-      <div class="save-feedback" id="px-feedback"></div>
+
+    <div class="cfg-card cfg-card-wide" id="px-form-card" style="margin-top:18px;" hidden>
+      <div class="px-card-head">
+        <div class="device-title" id="px-form-title">Add a proxy host</div>
+        <button class="db-action-btn" onclick="closeProxyForm()">Cancel</button>
+      </div>
+
+      <div class="grant-group" style="margin-top:16px;">
+        <div class="grant-legend">Incoming</div>
+        <div class="px-row px-row-domain">
+          <div class="px-field">
+            <label class="field-label" for="px-listen-group">Scheme</label>
+            <div class="grant-seg-group" id="px-listen-group">{listen_segs}</div>
+          </div>
+          <div class="px-field px-field-grow">
+            <label class="field-label" for="px-domain">Domain name</label>
+            <input class="field-input" id="px-domain" type="text" placeholder="app.example.com"
+                   spellcheck="false" autocomplete="off">
+          </div>
+        </div>
+        <div class="px-row" id="px-listen-port-row" hidden>
+          <div class="px-field">
+            <label class="field-label" for="px-listen-port">Listen port</label>
+            <div class="field-hint">The port on this server that TCP or UDP clients connect to.</div>
+            <input class="field-input" id="px-listen-port" type="number" min="1" max="65535"
+                   placeholder="15432" inputmode="numeric" autocomplete="off">
+          </div>
+        </div>
+        <div class="px-stream-note" id="px-stream-note" hidden></div>
+      </div>
+
+      <div class="grant-group">
+        <div class="grant-legend">Forward to</div>
+        <div class="px-row">
+          <div class="px-field" id="px-forward-scheme-field">
+            <label class="field-label" for="px-forward-scheme-group">Scheme</label>
+            <div class="grant-seg-group" id="px-forward-scheme-group">{forward_segs}</div>
+          </div>
+          <div class="px-field px-field-grow">
+            <label class="field-label" for="px-forward-host">Hostname or IP</label>
+            <input class="field-input" id="px-forward-host" type="text" placeholder="127.0.0.1"
+                   spellcheck="false" autocomplete="off">
+          </div>
+          <div class="px-field px-field-port">
+            <label class="field-label" for="px-forward-port">Port</label>
+            <input class="field-input" id="px-forward-port" type="number" min="1" max="65535"
+                   placeholder="8080" inputmode="numeric" autocomplete="off">
+          </div>
+        </div>
+      </div>
+
+      <div class="grant-group" id="px-tls-group" hidden>
+        <div class="grant-legend">Certificate</div>
+        <div class="px-row">
+          <div class="px-field px-field-grow">
+            <label class="field-label" for="px-cert-pick">Certificate found on this server</label>
+            <select class="field-input" id="px-cert-pick" onchange="proxyPickCert('cert')">
+              <option value="">Choose a certificate&hellip;</option>
+            </select>
+          </div>
+        </div>
+        <div class="px-row">
+          <div class="px-field px-field-grow">
+            <label class="field-label" for="px-cert-path">Or a certificate path not in that list</label>
+            <input class="field-input" id="px-cert-path" type="text" spellcheck="false"
+                   placeholder="/etc/letsencrypt/live/example.com/fullchain.pem" autocomplete="off"
+                   oninput="proxyTypedCert('cert')">
+          </div>
+        </div>
+        <div class="px-row">
+          <div class="px-field px-field-grow">
+            <label class="field-label" for="px-key-pick">Matching private key</label>
+            <select class="field-input" id="px-key-pick" onchange="proxyPickCert('key')">
+              <option value="">Choose a key&hellip;</option>
+            </select>
+          </div>
+        </div>
+        <div class="px-row">
+          <div class="px-field px-field-grow">
+            <label class="field-label" for="px-key-path">Or a key path not in that list</label>
+            <input class="field-input" id="px-key-path" type="text" spellcheck="false"
+                   placeholder="/etc/letsencrypt/live/example.com/privkey.pem" autocomplete="off"
+                   oninput="proxyTypedCert('key')">
+          </div>
+        </div>
+        <div class="px-check-grid">
+          {_px_check("force_ssl", "Force SSL", "Send anyone arriving on HTTP to HTTPS instead.")}
+          {_px_check("http2", "HTTP/2 support", "Fewer round trips for browsers that speak it.")}
+          {_px_check("hsts", "HSTS enabled", "Tells browsers never to use plain HTTP for this name again.")}
+          {_px_check("hsts_subdomains", "HSTS subdomains", "Extends that promise to every name under it. Only with HSTS on.")}
+        </div>
+      </div>
+
+      <div class="grant-group" id="px-behaviour-group">
+        <div class="grant-legend">Behaviour</div>
+        {_px_toggle("cache_assets", "Cache assets",
+                    "Let browsers keep images, fonts, CSS and JS for 30 days.")}
+        {_px_toggle("block_exploits", "Block common exploits",
+                    "Reject requests carrying the usual injection and traversal probes.")}
+        {_px_toggle("websockets", "Websockets support",
+                    "Pass the upgrade through so live connections stay open.", on=True)}
+      </div>
+
+      <div class="grant-group" id="px-locations-group">
+        <div class="grant-legend">Custom locations</div>
+        <div class="settings-subtitle" style="margin:0 0 12px;">
+          Optional. Send a path under this domain somewhere else, for example
+          /api to a different port. Leave empty to forward everything to one place.
+        </div>
+        <div id="px-locations"></div>
+        <button class="db-action-btn" id="px-add-location" onclick="addProxyLocation()">
+          <svg class="ic"><use href="#ic-plus"/></svg> Add a location
+        </button>
+      </div>
+
+      <div class="px-form-actions">
+        <button class="save-btn" id="px-save" onclick="saveProxyHost()">Save host</button>
+        <div class="save-feedback" id="px-feedback"></div>
+      </div>
     </div>
+{firewall_card}
   </div>"""
 
 _CONFIG_SUB_BUILDERS = {
@@ -868,7 +1059,7 @@ _CONFIG_SUB_BUILDERS = {
     "server": lambda perms: _config_sub_server(),
     "service": lambda perms: _config_sub_service(),
     "database": lambda perms: _config_sub_database(perms),
-    "proxy": lambda perms: _config_sub_proxy(),
+    "proxy": lambda perms: _config_sub_proxy(perms),
 }
 
 def _config_pane_html(perms: dict) -> str:
@@ -2260,7 +2451,45 @@ async def api_db_add_column(request: Request, name: str):
               ip=_client_ip(request), target=f"{name}.{col_name}", detail=col_type)
     return {"status": "ok"}
 
-# ---- Config: Proxy (nginx reverse proxy hosts, admin only) ----
+# ---- Config: Proxy (nginx reverse proxy hosts) ----
+def _proxy_spec_from_body(body):
+    """Only the fields the renderer knows about, so a caller cannot smuggle
+    extra keys into a stored spec."""
+    spec = {
+        "domain": body.get("domain"),
+        "listen_scheme": body.get("listen_scheme"),
+        "listen_port": body.get("listen_port"),
+        "forward_scheme": body.get("forward_scheme"),
+        "forward_host": body.get("forward_host"),
+        "forward_port": body.get("forward_port"),
+        "cert_path": body.get("cert_path"),
+        "cert_key_path": body.get("cert_key_path"),
+        "locations": [],
+    }
+    for flag in nginx_proxy.TLS_FLAGS + nginx_proxy.BEHAVIOUR_FLAGS:
+        spec[flag] = bool(body.get(flag))
+    for loc in (body.get("locations") or [])[:40]:
+        if not isinstance(loc, dict):
+            continue
+        entry = {
+            "path": loc.get("path"),
+            "forward_scheme": loc.get("forward_scheme"),
+            "forward_host": loc.get("forward_host"),
+            "forward_port": loc.get("forward_port"),
+        }
+        for flag in nginx_proxy.BEHAVIOUR_FLAGS:
+            entry[flag] = bool(loc.get(flag))
+        spec["locations"].append(entry)
+    return spec
+
+def _proxy_port_for_firewall(spec):
+    """The port the outside world connects to, which is the one the firewall
+    has to let in. For http and https that is the standard port."""
+    scheme = spec.get("listen_scheme")
+    if scheme in ("tcp", "udp"):
+        return int(spec.get("listen_port") or 0)
+    return 443 if scheme == "https" else 80
+
 @app.get("/api/config/proxy/hosts")
 async def api_proxy_list(request: Request):
     if not _authed(request):
@@ -2269,7 +2498,18 @@ async def api_proxy_list(request: Request):
     if denied:
         return denied
     return {"installed": nginx_proxy.nginx_installed(),
+            "stream_supported": nginx_proxy.stream_supported(),
+            "stream_problem": nginx_proxy.stream_problem(),
             "hosts": await DB.run(nginx_proxy.list_hosts)}
+
+@app.get("/api/config/proxy/certificates")
+async def api_proxy_certificates(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("net_proxy"))
+    if denied:
+        return denied
+    return {"certificates": await DB.run(nginx_proxy.list_certificates)}
 
 @app.post("/api/config/proxy/hosts")
 async def api_proxy_create(request: Request):
@@ -2278,19 +2518,42 @@ async def api_proxy_create(request: Request):
     perms, denied = await _require(request, _grant("net_proxy"))
     if denied:
         return denied
-    body = await _json_body(request)
-    domain = (body.get("domain") or "").strip()
-    target = (body.get("target") or "").strip()
-    websockets = bool(body.get("websockets"))
+    spec = _proxy_spec_from_body(await _json_body(request))
     try:
-        await DB.run(nginx_proxy.create_host, domain, target, websockets)
+        result = await DB.run(nginx_proxy.create_host, spec)
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+    stored = result["spec"]
+    opened = await _open_proxy_port(request, stored)
     write_log("ACTION", "SYSTEM", "Created proxy host", actor=_admin_name(request),
-              ip=_client_ip(request), target=domain, detail=f"-> {target}")
-    return {"status": "ok"}
+              ip=_client_ip(request), target=stored["domain"],
+              detail=f"{stored['listen_scheme']} to {stored['forward_scheme']}://"
+                     f"{stored['forward_host']}:{stored['forward_port']}")
+    return {"status": "ok", "file": result["file"], "firewall": opened}
+
+@app.put("/api/config/proxy/hosts/{filename}")
+async def api_proxy_update(request: Request, filename: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("net_proxy"))
+    if denied:
+        return denied
+    spec = _proxy_spec_from_body(await _json_body(request))
+    try:
+        result = await DB.run(nginx_proxy.update_host, filename, spec)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except RuntimeError as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    stored = result["spec"]
+    opened = await _open_proxy_port(request, stored)
+    write_log("ACTION", "SYSTEM", "Edited proxy host", actor=_admin_name(request),
+              ip=_client_ip(request), target=stored["domain"],
+              detail=f"{stored['listen_scheme']} to {stored['forward_scheme']}://"
+                     f"{stored['forward_host']}:{stored['forward_port']}")
+    return {"status": "ok", "file": result["file"], "firewall": opened}
 
 @app.delete("/api/config/proxy/hosts/{filename}")
 async def api_proxy_delete(request: Request, filename: str):
@@ -2308,6 +2571,30 @@ async def api_proxy_delete(request: Request, filename: str):
     write_log("ACTION", "SYSTEM", "Removed proxy host", actor=_admin_name(request),
               ip=_client_ip(request), target=filename)
     return {"status": "ok"}
+
+async def _open_proxy_port(request, spec):
+    """A proxy host nobody can reach is not a working proxy host, so the port
+    goes on the allow list as the host is saved. A firewall that will not take
+    the rule must not undo the host that was already written."""
+    port = _proxy_port_for_firewall(spec)
+    if not port:
+        return {"port": 0, "opened": False}
+    actor = _admin_name(request)
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            return firewall.allow_proxy_port(conn, port, spec["domain"],
+                                             created_by=actor)
+        finally:
+            DB.release_connection(conn)
+
+    try:
+        applied, detail = await DB.run(work)
+    except Exception as e:
+        return {"port": port, "opened": False, "error": str(e)}
+    return {"port": port, "opened": True, "enforced": bool(applied),
+            "detail": detail}
 
 # ---- structured panel logs ----
 @app.get("/api/logs")
@@ -2821,7 +3108,7 @@ async def terminal_ws(websocket: WebSocket):
         mt = None
     if mt is not None and not is_admin and mt.owner != username:
         # A restricted user cannot attach to someone else's terminal by
-        # guessing/reusing a session id -- start a fresh one instead.
+        # guessing/reusing a session id, so start a fresh one instead.
         sid = secrets.token_hex(8)
         mt = None
     if mt is None:

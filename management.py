@@ -21,6 +21,7 @@
 import os
 import re
 import sys
+import glob
 import json
 import time
 import stat
@@ -30,6 +31,7 @@ import socket
 import getpass
 import hashlib
 import secrets
+import tempfile
 import subprocess
 
 # Standard library only, so importing these before the dependency bootstrap is safe.
@@ -472,7 +474,7 @@ def install_nginx():
         return True
     mgr = detect_package_manager()
     if not mgr:
-        warn("no supported package manager found -- install nginx manually if you want the proxy manager")
+        warn("no supported package manager found, install nginx manually if you want the proxy manager")
         return False
     packages = NGINX_PACKAGES[mgr]
     step(f"installing nginx with {mgr}: {' '.join(packages)}")
@@ -497,6 +499,108 @@ def install_nginx():
     run(sudo_prefix() + ["systemctl", "start", "nginx"], timeout=60)
     ok("nginx installed")
     return True
+
+STREAM_MODULE_PACKAGES = {
+    "apt-get": ["libnginx-mod-stream"],
+    "dnf": ["nginx-mod-stream"], "yum": ["nginx-mod-stream"],
+}
+STREAM_DIR = "/etc/nginx/stream.d"
+STREAM_INCLUDE = f"stream {{\n    include {STREAM_DIR}/*.conf;\n}}\n"
+
+def _nginx_has_stream():
+    """Whether nginx would understand a stream {} block right now."""
+    rc, out, errout = run(["nginx", "-V"], timeout=30)
+    build = (out or "") + (errout or "")
+    if "--with-stream=dynamic" in build:
+        for name in glob.glob("/etc/nginx/modules-enabled/*.conf"):
+            try:
+                with open(name) as fh:
+                    body = fh.read()
+            except OSError:
+                continue
+            if "load_module" in body and "stream_module" in body:
+                return True
+        return False
+    return "--with-stream" in build
+
+def ensure_nginx_stream():
+    """Make TCP and UDP proxy hosts possible.
+
+    Two separate things are needed and neither is the default on Debian: the
+    stream module has to be loaded, and nginx.conf needs a stream {} block that
+    includes somewhere for the panel to write. Without both, a TCP host is an
+    unknown directive and nginx refuses to start, so the panel refuses to write
+    one until this has run. Never fatal: HTTP and HTTPS hosts work regardless.
+    """
+    if not nginx_installed():
+        return False
+    mgr = detect_package_manager()
+    if not _nginx_has_stream():
+        packages = STREAM_MODULE_PACKAGES.get(mgr)
+        if not packages:
+            info("nginx has no stream module, so TCP and UDP proxy hosts stay unavailable")
+            return False
+        step(f"installing the nginx stream module: {' '.join(packages)}")
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+        if mgr == "apt-get":
+            run(sudo_prefix() + ["apt-get", "update", "-qq"], timeout=900, env=env)
+            rc, _, stderr = run(sudo_prefix() + ["apt-get", "install", "-y"] + packages,
+                                timeout=1800, env=env)
+        else:
+            rc, _, stderr = run(sudo_prefix() + [mgr, "install", "-y"] + packages, timeout=1800)
+        if rc != 0 or not _nginx_has_stream():
+            warn("the nginx stream module could not be installed, so TCP and UDP "
+                 "proxy hosts stay unavailable")
+            return False
+        ok("nginx stream module installed")
+
+    if not os.path.isdir(STREAM_DIR):
+        rc, _, _ = run(sudo_prefix() + ["mkdir", "-p", STREAM_DIR], timeout=30)
+        if rc != 0:
+            warn(f"could not create {STREAM_DIR}, so TCP and UDP hosts stay unavailable")
+            return False
+
+    conf = "/etc/nginx/nginx.conf"
+    try:
+        with open(conf) as fh:
+            current = fh.read()
+    except OSError as e:
+        warn(f"could not read {conf}: {e}")
+        return False
+    if STREAM_DIR in current:
+        ok("nginx is ready for TCP and UDP proxy hosts")
+        return True
+
+    step(f"adding a stream block to {conf} so {STREAM_DIR} is loaded")
+    backup = conf + ".argus-backup"
+    run(sudo_prefix() + ["cp", conf, backup], timeout=30)
+    updated = current.rstrip("\n") + "\n\n# added by argus-management, for TCP and UDP proxy hosts\n" + STREAM_INCLUDE
+    if not _write_root_file(conf, updated):
+        warn(f"could not write {conf}, so TCP and UDP hosts stay unavailable")
+        return False
+    rc, _, stderr = run(sudo_prefix() + ["nginx", "-t"], timeout=60)
+    if rc != 0:
+        warn(f"nginx rejected the stream block, putting {conf} back: {stderr.strip()[:200]}")
+        run(sudo_prefix() + ["cp", backup, conf], timeout=30)
+        return False
+    run(sudo_prefix() + ["systemctl", "reload", "nginx"], timeout=60)
+    ok("nginx is ready for TCP and UDP proxy hosts")
+    return True
+
+def _write_root_file(path, text):
+    """Write a file that belongs to root. Goes through a temporary file so a
+    failed copy leaves the original untouched rather than half written."""
+    fd, tmp = tempfile.mkstemp(prefix="argus-nginx-")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        rc, _, _ = run(sudo_prefix() + ["cp", tmp, path], timeout=30)
+        return rc == 0
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 def install_postgres():
     """Install a PostgreSQL server with whatever package manager is present."""
@@ -1887,6 +1991,12 @@ def upgrade_mode():
     else:
         ok("dependencies already satisfied")
 
+    # A new revision may also need more of the host than the last one did. This
+    # is idempotent, so running it on every upgrade costs nothing when it is
+    # already in place.
+    if nginx_installed():
+        ensure_nginx_stream()
+
     cfg = load_config()
     if os.path.exists(CONFIG_PATH):
         working, reason = verify_app_connection(cfg)
@@ -2089,7 +2199,8 @@ def wizard():
             warn("a port must be a number")
     if not ensure_postgres(cfg["db_host"], cfg["db_port"]):
         sys.exit(1)
-    install_nginx()  # best-effort -- only the Proxy page in Config needs it
+    if install_nginx():   # best-effort, only the Proxy page in Config needs it
+        ensure_nginx_stream()
 
     # --- 3. a privileged connection ---------------------------------------- #
     channel = obtain_admin_channel(cfg)

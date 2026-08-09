@@ -100,3 +100,60 @@ def test_semantic_colour_tokens_exist_in_both_themes():
     for token in ("--danger", "--success", "--warn", "--info"):
         assert token in _block(text, ":root"), token
         assert token in _block(text, '[data-theme="dark"]'), token
+
+
+def test_the_hidden_attribute_beats_any_display_rule():
+    """The user-agent rule for [hidden] is display:none at the lowest layer, so
+    an author rule like .px-row { display: flex } wins and the element stays on
+    screen. Two elements were already showing when they should not have been.
+    """
+    text = _strip_comments(_sheet())
+    m = re.search(r"\[hidden\]\s*\{([^}]*)\}", text)
+    assert m, "dash.css must state a [hidden] rule of its own"
+    assert "display" in m.group(1) and "none" in m.group(1)
+    assert "!important" in m.group(1), \
+        "without !important a later component rule takes the element back"
+
+
+def test_everything_the_markup_ships_hidden_stays_hidden():
+    """Walks the real markup rather than a list kept by hand, so a new hidden
+    element inherits the guarantee."""
+    panel_py = os.path.join(ROOT, "panel.py")
+    with open(panel_py, encoding="utf-8") as f:
+        markup = f.read()
+    text = _strip_comments(_sheet())
+    hidden_ids = set(re.findall(r'id="([\w-]+)"[^>]*\bhidden\b', markup))
+    assert hidden_ids, "the scanner found nothing, so it is not scanning"
+    # The blanket rule is what makes this hold, so assert it is reachable for
+    # every one of them rather than re-checking each component's display.
+    assert re.search(r"\[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important", text)
+
+
+def test_the_switch_animates_on_the_compositor():
+    """A toggle that animates left/width repaints on every frame. transform is
+    the only property here that the compositor can take on its own."""
+    text = _strip_comments(_sheet())
+    m = re.search(r"\.px-switch-knob\s*\{([^}]*)\}", text)
+    assert m, ".px-switch-knob not found"
+    body = m.group(1)
+    assert "transition: transform" in body, body
+    m2 = re.search(r"\.px-switch input:checked ~ \.px-switch-track "
+                   r"\.px-switch-knob\s*\{([^}]*)\}", text)
+    assert m2 and "transform" in m2.group(1), "the on state must move by transform"
+
+
+def test_motion_in_the_proxy_form_has_a_reduced_motion_path():
+    text = _strip_comments(_sheet())
+    assert "prefers-reduced-motion" in text
+    blocks = re.findall(r"@media\s*\(prefers-reduced-motion: reduce\)\s*\{(.*?)\n\}",
+                        text, re.S)
+    assert any("px-switch" in b for b in blocks), \
+        "the switch animates, so it needs a reduced-motion alternative"
+
+
+def test_the_segmented_control_shows_its_selection_without_javascript():
+    """The grant form adds an .on class in JS. Any other segmented group (the
+    proxy scheme picker) would render with no selection visible at all."""
+    text = _strip_comments(_sheet())
+    assert re.search(r"\.grant-seg:has\(input:checked\)", text), \
+        "selection must be driven by the radio, not only by a JS class"

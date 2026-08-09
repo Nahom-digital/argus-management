@@ -935,29 +935,315 @@ async function dbAddColumn(){
   }catch(e){ appToast('Network error','err'); }
 }
 
-/* ================= PROXY ================= */
+/* ================= PROXY =================
+   A server block has a lot of knobs, so the form is generated from one
+   place and read back from the same place. PX_EDITING carries which file
+   is being edited (null means a new host), which is the only difference
+   between the create and the edit path. */
+let PX_EDITING=null, PX_CERTS=[], PX_STREAM_OK=true, PX_STREAM_WHY='', PX_LOC_SEQ=0;
+
 async function loadProxyHosts(){
-  const el=$('proxy-list'); if(!el) return; el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
+  const el=$('proxy-list'); if(!el) return;
+  el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
+  loadFirewall();
   try{
     const d=await getJSON('/api/config/proxy/hosts'); if(!d) return;
-    if(!d.installed){ el.innerHTML='<div class="empty-state">nginx is not installed on this server.</div>'; return; }
+    if(!d.installed){
+      el.innerHTML='<div class="empty-state">nginx is not installed on this server.</div>';
+      const nb=$('px-new'); if(nb) nb.disabled=true;
+      return;
+    }
+    PX_STREAM_OK=d.stream_supported!==false;
+    PX_STREAM_WHY=d.stream_problem||'';
     const hosts=d.hosts||[];
-    if(!hosts.length){ el.innerHTML='<div class="empty-state">No proxy hosts detected.</div>'; return; }
-    el.innerHTML=hosts.map(h=>`<div class="proxy-host">
-      <div class="proxy-host-info"><div class="proxy-host-domain">${esc(h.domain||h.file)}</div><div class="proxy-host-target">&rarr; ${esc(h.target||'unknown target')}${h.websockets?' &middot; websockets':''}</div></div>
+    if(!hosts.length){
+      el.innerHTML='<div class="empty-state">No proxy hosts yet. Add one to route a domain at something running on this server.</div>';
+      return;
+    }
+    el.innerHTML=hosts.map(h=>{
+      const s=h.spec||null;
+      const meta=[];
+      if(s){
+        meta.push(s.listen_scheme.toUpperCase()+' in');
+        if(s.force_ssl) meta.push('force SSL');
+        if(s.hsts) meta.push('HSTS');
+        if(s.http2) meta.push('HTTP/2');
+        if(s.cache_assets) meta.push('cached');
+        if(s.block_exploits) meta.push('exploit guard');
+        if(s.websockets) meta.push('websockets');
+        if(s.locations&&s.locations.length) meta.push(s.locations.length+' custom location'+(s.locations.length>1?'s':''));
+      }else if(h.websockets){ meta.push('websockets'); }
+      return `<div class="proxy-host">
+      <div class="proxy-host-info">
+        <div class="proxy-host-domain">${esc(h.domain||h.file)}</div>
+        <div class="proxy-host-target">&rarr; ${esc(h.target||'unknown target')}</div>
+        ${meta.length?`<div class="proxy-host-meta">${meta.map(m=>`<span>${esc(m)}</span>`).join('')}</div>`:''}
+      </div>
       <span class="proxy-host-badge ${h.managed?'managed':''}">${h.managed?'managed here':'detected'}</span>
-      ${h.managed?`<button class="db-action-btn" style="color:var(--danger);" onclick="deleteProxyHost('${escAttr(h.file)}')"><svg class="ic"><use href="#ic-trash-2"/></svg></button>`:''}
-    </div>`).join('');
+      <div class="proxy-host-actions">
+        ${h.managed?`<button class="db-action-btn" title="Edit this host" onclick="editProxyHost('${escAttr(h.file)}')"><svg class="ic"><use href="#ic-pencil"/></svg></button>
+        <button class="db-action-btn" title="Remove this host" style="color:var(--danger);" onclick="deleteProxyHost('${escAttr(h.file)}')"><svg class="ic"><use href="#ic-trash-2"/></svg></button>`
+        :`<span class="proxy-host-readonly" title="This server block was written by hand. Editing or deleting it here would overwrite somebody's work, so it is left alone.">Read-only</span>`}
+      </div>
+    </div>`;}).join('');
+    PX_HOSTS=hosts;
   }catch(e){ el.innerHTML='<div class="empty-state">Failed to load.</div>'; }
 }
-async function createProxyHost(){
-  const fb=$('px-feedback'), btn=$('px-create'); fb.textContent=''; fb.className='save-feedback'; btn.disabled=true;
-  const body={domain:$('px-domain').value.trim(), target:$('px-target').value.trim(), websockets:$('px-ws').checked};
+let PX_HOSTS=[];
+
+function pxRadio(name){
+  const el=document.querySelector(`input[name="${name}"]:checked`);
+  return el?el.value:'';
+}
+function pxSetRadio(name, value){
+  const el=document.querySelector(`input[name="${name}"][value="${value}"]`);
+  if(el){ el.checked=true; }
+}
+function pxFlag(field){ const el=document.querySelector(`[data-px="${field}"]`); return el?el.checked:false; }
+function pxSetFlag(field, on){ const el=document.querySelector(`[data-px="${field}"]`); if(el) el.checked=!!on; }
+
+/* The form shows only what the chosen scheme actually has. A stream host has
+   no certificate, no caching and no locations, so those groups go away rather
+   than sitting there inert. */
+function pxSyncScheme(){
+  const listen=pxRadio('px-listen');
+  const stream=(listen==='tcp'||listen==='udp');
+  const show=(id,on)=>{ const el=$(id); if(el) el.hidden=!on; };
+  show('px-tls-group', listen==='https');
+  show('px-listen-port-row', stream);
+  show('px-behaviour-group', !stream);
+  show('px-locations-group', !stream);
+  const fs=$('px-forward-scheme-field'); if(fs) fs.hidden=stream;
+  const note=$('px-stream-note');
+  if(note){
+    if(stream&&!PX_STREAM_OK){
+      note.textContent=PX_STREAM_WHY||'TCP and UDP forwarding is unavailable on this server.';
+      note.hidden=false;
+    }else if(stream){
+      note.textContent='TCP and UDP hosts forward raw connections, so certificates and caching do not apply.';
+      note.hidden=false;
+    }else{ note.hidden=true; }
+  }
+  pxSyncHsts();
+}
+function pxSyncHsts(){
+  const hsts=document.querySelector('[data-px="hsts"]');
+  const sub=document.querySelector('[data-px="hsts_subdomains"]');
+  if(!hsts||!sub) return;
+  sub.disabled=!hsts.checked;
+  if(!hsts.checked) sub.checked=false;
+}
+
+async function pxLoadCerts(){
+  const pick=$('px-cert-pick'), keyPick=$('px-key-pick');
+  if(!pick||!keyPick) return;
+  if(!PX_CERTS.length){
+    try{
+      const d=await getJSON('/api/config/proxy/certificates');
+      PX_CERTS=(d&&d.certificates)||[];
+    }catch(e){ PX_CERTS=[]; }
+  }
+  pxFillCertSelects();
+  pxSyncCertSelects();
+}
+/* Exactly one of the two controls holds the path: the dropdown when the file is
+   one this server found, the text field when it is not. Showing the same long
+   path in both is noise, and it leaves no way to tell which one would win. */
+function pxSyncCertSelects(){
+  const match=(selId, pathId)=>{
+    const sel=$(selId), path=$(pathId);
+    if(!sel||!path) return;
+    if(path.value&&Array.from(sel.options).some(o=>o.value===path.value)){
+      sel.value=path.value; path.value='';
+    }else{ sel.value=''; }
+  };
+  match('px-cert-pick','px-cert-path');
+  match('px-key-pick','px-key-path');
+}
+function pxCertValue(which){
+  const typed=($(which==='key'?'px-key-path':'px-cert-path')?.value||'').trim();
+  return typed||($(which==='key'?'px-key-pick':'px-cert-pick')?.value||'');
+}
+function pxFillCertSelects(){
+  const fill=(el, want, label)=>{
+    if(!el) return;
+    const rows=PX_CERTS.filter(c=>c.is_key===want);
+    el.innerHTML=`<option value="">${label}</option>`+
+      rows.map(c=>`<option value="${escAttr(c.path)}">${esc(c.path)}</option>`).join('');
+    if(!rows.length) el.innerHTML=`<option value="">Nothing found on this server, type a path below</option>`;
+  };
+  fill($('px-cert-pick'), false, 'Choose a certificate…');
+  fill($('px-key-pick'), true, 'Choose a key…');
+}
+function proxyPickCert(which){
+  const path=$(which==='key'?'px-key-path':'px-cert-path');
+  if(path) path.value='';
+}
+function proxyTypedCert(which){
+  const sel=$(which==='key'?'px-key-pick':'px-cert-pick');
+  if(sel) sel.value='';
+}
+
+function pxLocationHtml(values){
+  const v=values||{};
+  const id=++PX_LOC_SEQ;
+  const sw=(field,label,help,on)=>`
+        <label class="px-toggle-row">
+          <span class="grant-copy">
+            <span class="grant-label">${label}</span>
+            <span class="grant-help">${help}</span>
+          </span>
+          <span class="px-switch">
+            <input type="checkbox" data-loc="${field}"${on?' checked':''}>
+            <span class="px-switch-track"><span class="px-switch-knob"></span></span>
+          </span>
+        </label>`;
+  return `<div class="px-location" data-px-location="${id}">
+    <div class="px-location-head">
+      <div class="px-location-title">Location</div>
+      <button class="db-action-btn" style="color:var(--danger);" onclick="removeProxyLocation(this)">Remove</button>
+    </div>
+    <div class="px-row">
+      <div class="px-field px-field-grow">
+        <label class="field-label">Path</label>
+        <input class="field-input" data-loc="path" type="text" placeholder="/api"
+               spellcheck="false" autocomplete="off" value="${escAttr(v.path||'')}">
+      </div>
+    </div>
+    <div class="px-row">
+      <div class="px-field">
+        <label class="field-label">Scheme</label>
+        <select class="field-input" data-loc="forward_scheme">
+          <option value="http"${(v.forward_scheme||'http')==='http'?' selected':''}>HTTP</option>
+          <option value="https"${v.forward_scheme==='https'?' selected':''}>HTTPS</option>
+        </select>
+      </div>
+      <div class="px-field px-field-grow">
+        <label class="field-label">Hostname or IP</label>
+        <input class="field-input" data-loc="forward_host" type="text" placeholder="127.0.0.1"
+               spellcheck="false" autocomplete="off" value="${escAttr(v.forward_host||'')}">
+      </div>
+      <div class="px-field px-field-port">
+        <label class="field-label">Port</label>
+        <input class="field-input" data-loc="forward_port" type="number" min="1" max="65535"
+               placeholder="9000" inputmode="numeric" autocomplete="off" value="${escAttr(v.forward_port||'')}">
+      </div>
+    </div>
+    <div class="px-location-toggles">
+      ${sw('cache_assets','Cache assets','Browsers may keep static files from this path.',v.cache_assets)}
+      ${sw('block_exploits','Block common exploits','Reject the usual injection and traversal probes.',v.block_exploits)}
+      ${sw('websockets','Websockets support','Pass the upgrade through on this path.',v.websockets!==false&&!!v.websockets)}
+    </div>
+  </div>`;
+}
+function addProxyLocation(values){
+  const wrap=$('px-locations'); if(!wrap) return;
+  wrap.insertAdjacentHTML('beforeend', pxLocationHtml(values));
+}
+function removeProxyLocation(btn){
+  const row=btn.closest('[data-px-location]'); if(row) row.remove();
+}
+function pxReadLocations(){
+  return Array.from(document.querySelectorAll('#px-locations [data-px-location]')).map(row=>{
+    const get=f=>row.querySelector(`[data-loc="${f}"]`);
+    return {
+      path:(get('path')?.value||'').trim(),
+      forward_scheme:get('forward_scheme')?.value||'http',
+      forward_host:(get('forward_host')?.value||'').trim(),
+      forward_port:parseInt(get('forward_port')?.value||'0',10)||0,
+      cache_assets:!!get('cache_assets')?.checked,
+      block_exploits:!!get('block_exploits')?.checked,
+      websockets:!!get('websockets')?.checked,
+    };
+  });
+}
+
+async function openProxyForm(spec, filename){
+  const card=$('px-form-card'); if(!card) return;
+  PX_EDITING=filename||null;
+  const title=$('px-form-title');
+  if(title) title.textContent=PX_EDITING?'Edit proxy host':'Add a proxy host';
+  const save=$('px-save'); if(save) save.textContent=PX_EDITING?'Save changes':'Add host';
+  const fb=$('px-feedback'); if(fb){ fb.textContent=''; fb.className='save-feedback'; }
+
+  const s=spec||{listen_scheme:'https',forward_scheme:'http',websockets:true,locations:[]};
+  pxSetRadio('px-listen', s.listen_scheme||'https');
+  pxSetRadio('px-forward-scheme', s.forward_scheme||'http');
+  $('px-domain').value=s.domain||'';
+  $('px-listen-port').value=s.listen_port&&(s.listen_scheme==='tcp'||s.listen_scheme==='udp')?s.listen_port:'';
+  $('px-forward-host').value=s.forward_host||'';
+  $('px-forward-port').value=s.forward_port||'';
+  $('px-cert-path').value=s.cert_path||'';
+  $('px-key-path').value=s.cert_key_path||'';
+  ['force_ssl','hsts','hsts_subdomains','http2','cache_assets','block_exploits','websockets']
+    .forEach(f=>pxSetFlag(f, s[f]));
+  const wrap=$('px-locations'); if(wrap) wrap.innerHTML='';
+  (s.locations||[]).forEach(loc=>addProxyLocation(loc));
+
+  pxSyncScheme();
+  card.hidden=false;
+  card.scrollIntoView({behavior:'smooth', block:'start'});
+  /* Awaited after the card is on screen, so a slow certificate scan does not
+     hold the form back. It only moves a saved path into the dropdown. */
+  await pxLoadCerts();
+}
+function closeProxyForm(){
+  const card=$('px-form-card'); if(card) card.hidden=true;
+  PX_EDITING=null;
+}
+function editProxyHost(filename){
+  const host=PX_HOSTS.find(h=>h.file===filename);
+  if(!host){ appToast('That host is no longer in the list','err'); return; }
+  if(!host.managed){ appToast('This host was written by hand, so it is read-only here','err'); return; }
+  if(!host.spec){
+    appToast('This host has no saved settings to edit. Remove it and add it again.','err');
+    return;
+  }
+  openProxyForm(host.spec, filename);
+}
+
+function pxReadForm(){
+  const listen=pxRadio('px-listen');
+  const stream=(listen==='tcp'||listen==='udp');
+  const body={
+    domain:$('px-domain').value.trim(),
+    listen_scheme:listen,
+    listen_port:stream?(parseInt($('px-listen-port').value||'0',10)||0):0,
+    forward_scheme:stream?'http':pxRadio('px-forward-scheme'),
+    forward_host:$('px-forward-host').value.trim(),
+    forward_port:parseInt($('px-forward-port').value||'0',10)||0,
+    cert_path:listen==='https'?pxCertValue('cert'):'',
+    cert_key_path:listen==='https'?pxCertValue('key'):'',
+    locations:stream?[]:pxReadLocations(),
+  };
+  ['force_ssl','hsts','hsts_subdomains','http2'].forEach(f=>{ body[f]=listen==='https'&&pxFlag(f); });
+  ['cache_assets','block_exploits','websockets'].forEach(f=>{ body[f]=!stream&&pxFlag(f); });
+  return body;
+}
+
+async function saveProxyHost(){
+  const fb=$('px-feedback'), btn=$('px-save');
+  fb.textContent=''; fb.className='save-feedback'; btn.disabled=true;
+  const body=pxReadForm();
+  const editing=PX_EDITING;
+  const url=editing?'/api/config/proxy/hosts/'+encodeURIComponent(editing):'/api/config/proxy/hosts';
   try{
-    const r=await api('/api/config/proxy/hosts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r=await api(url,{method:editing?'PUT':'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();
-    if(!r.ok){ fb.textContent=d.error||'Could not create the host.'; fb.classList.add('err'); }
-    else{ fb.textContent='Host created.'; fb.classList.add('ok'); $('px-domain').value=''; $('px-target').value=''; loadProxyHosts(); }
+    if(!r.ok){ fb.textContent=d.error||'Could not save the host.'; fb.classList.add('err'); }
+    else{
+      let msg=editing?'Changes saved and nginx reloaded.':'Host created and nginx reloaded.';
+      if(d.firewall&&d.firewall.port&&d.firewall.opened&&!d.firewall.enforced){
+        msg+=' Port '+d.firewall.port+' is on the allow list, but the firewall did not apply it.';
+      }else if(d.firewall&&d.firewall.port&&d.firewall.opened){
+        msg+=' Port '+d.firewall.port+' opened.';
+      }
+      fb.textContent=msg; fb.classList.add('ok');
+      closeProxyForm();
+      appToast(editing?'Proxy host updated':'Proxy host added','ok');
+      loadProxyHosts();
+    }
   }catch(e){ fb.textContent='Network error'; fb.classList.add('err'); }
   btn.disabled=false;
 }
@@ -968,6 +1254,108 @@ async function deleteProxyHost(filename){
     const d=await r.json();
     if(!r.ok){ appToast(d.error||'Delete failed','err'); return; }
     appToast('Host removed','ok'); loadProxyHosts();
+  }catch(e){ appToast('Network error','err'); }
+}
+
+/* ================= FIREWALL SETTINGS ================= */
+async function loadFirewall(){
+  if(!$('px-fw-in')) return;   /* the card is absent without the grant */
+  try{
+    const d=await getJSON('/api/config/firewall'); if(!d) return;
+    const st=d.status||{};
+    const backend=st.backend?st.backend:'none';
+    const bits=[`Backend: ${backend==='none'?'no firewall tool found, rules are recorded only':esc(backend)}`,
+                `SSH auto-block: ${d.ssh_limit} failures within ${d.ssh_window_minutes} minutes`];
+    $('px-fw-status').innerHTML=bits.map(b=>`<span>${b}</span>`).join('');
+
+    const rules=d.rules||[];
+    const draw=(dir, el)=>{
+      const rows=rules.filter(r=>r.direction===dir);
+      if(!rows.length){ el.innerHTML=`<div class="empty-state">No ${dir==='in'?'inbound':'outbound'} rules.</div>`; return; }
+      el.innerHTML=rows.map(r=>`<div class="px-fw-rule">
+        <div class="px-fw-rule-info">
+          <div class="px-fw-rule-port">${r.port}/${esc(r.protocol)}</div>
+          ${r.note?`<div class="px-fw-rule-note" title="${escAttr(r.note)}">${esc(r.note)}</div>`:''}
+        </div>
+        ${r.auto?'<span class="px-fw-auto">auto</span>':''}
+        <span class="px-switch" title="${r.enabled?'Allowed':'Closed'}">
+          <input type="checkbox"${r.enabled?' checked':''}
+                 onchange="toggleFirewallRule(${r.port},'${escAttr(r.protocol)}','${escAttr(r.direction)}',this)">
+          <span class="px-switch-track"><span class="px-switch-knob"></span></span>
+        </span>
+        <button class="db-action-btn" style="color:var(--danger);" title="Delete this rule"
+                onclick="deleteFirewallRule(${r.port},'${escAttr(r.protocol)}','${escAttr(r.direction)}')">
+          <svg class="ic"><use href="#ic-trash-2"/></svg></button>
+      </div>`).join('');
+    };
+    draw('in', $('px-fw-in'));
+    draw('out', $('px-fw-out'));
+
+    const blocks=d.blocks||[];
+    $('px-fw-blocks').innerHTML=blocks.length?blocks.map(b=>`<div class="px-fw-block">
+      <div style="flex:1;min-width:0;">
+        <div class="px-fw-block-ip">${esc(b.ip)}</div>
+        <div class="px-fw-block-why">${esc(b.reason||'no reason recorded')}${b.source?' &middot; '+esc(b.source):''}</div>
+      </div>
+      <button class="db-action-btn" onclick="unblockFirewallIp('${escAttr(b.ip)}')">Unblock</button>
+    </div>`).join(''):'<div class="empty-state">Nothing is blocked.</div>';
+  }catch(e){
+    $('px-fw-in').innerHTML='<div class="empty-state">Failed to load.</div>';
+  }
+}
+async function addFirewallRule(){
+  const fb=$('px-fw-feedback'), btn=$('px-fw-add');
+  fb.textContent=''; fb.className='save-feedback';
+  const port=parseInt($('px-fw-port').value||'0',10);
+  if(!port){ fb.textContent='Enter a port number.'; fb.classList.add('err'); return; }
+  btn.disabled=true;
+  const body={port, protocol:$('px-fw-protocol').value, direction:$('px-fw-direction').value,
+              enabled:true, note:$('px-fw-note').value.trim()};
+  try{
+    const r=await api('/api/config/firewall/rule',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!r.ok){ fb.textContent=d.error||'Could not add the rule.'; fb.classList.add('err'); }
+    else{
+      fb.textContent=d.enforced?'Rule added and applied.':'Rule recorded. '+(d.detail||'The firewall did not apply it.');
+      fb.classList.add(d.enforced?'ok':'err');
+      $('px-fw-port').value=''; $('px-fw-note').value='';
+      loadFirewall();
+    }
+  }catch(e){ fb.textContent='Network error'; fb.classList.add('err'); }
+  btn.disabled=false;
+}
+async function toggleFirewallRule(port, protocol, direction, el){
+  const enabled=el.checked;
+  try{
+    const r=await api('/api/config/firewall/rule',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({port, protocol, direction, enabled})});
+    const d=await r.json();
+    if(!r.ok){ appToast(d.error||'Could not change the rule','err'); el.checked=!enabled; return; }
+    appToast(enabled?`Port ${port} allowed`:`Port ${port} closed`,'ok');
+  }catch(e){ appToast('Network error','err'); el.checked=!enabled; }
+}
+async function deleteFirewallRule(port, protocol, direction){
+  if(!(await uiConfirm(`Delete the ${direction==='in'?'inbound':'outbound'} rule for ${port}/${protocol}?`,
+      'The port goes back to whatever the firewall default is.'))) return;
+  try{
+    const r=await api('/api/config/firewall/rule',{method:'DELETE',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({port, protocol, direction})});
+    const d=await r.json();
+    if(!r.ok){ appToast(d.error||'Delete failed','err'); return; }
+    appToast('Rule deleted','ok'); loadFirewall();
+  }catch(e){ appToast('Network error','err'); }
+}
+async function unblockFirewallIp(ip){
+  if(!(await uiConfirm(`Unblock ${ip}?`,'It will be able to reach this server again.'))) return;
+  try{
+    const r=await api('/api/system/ssh-unblock',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+    const d=await r.json();
+    if(!r.ok){ appToast(d.error||'Could not unblock','err'); return; }
+    appToast('Unblocked','ok'); loadFirewall();
   }catch(e){ appToast('Network error','err'); }
 }
 
@@ -1329,6 +1717,13 @@ window.addEventListener('orientationchange',()=>{ if(CURRENT==='terminal') setTi
   applyTheme(localStorage.getItem('theme')==='dark');
   document.querySelectorAll('[data-nav]').forEach(b=>b.addEventListener('click',()=>switchSection(b.dataset.nav)));
   const ss=$('svc-search'); if(ss) ss.addEventListener('input',renderServices);
+  /* The proxy form reshapes itself around the chosen scheme, and HSTS
+     subdomains only mean anything with HSTS on. Bound once here rather than
+     inline so the markup stays readable. */
+  document.querySelectorAll('input[name="px-listen"]')
+    .forEach(r=>r.addEventListener('change', pxSyncScheme));
+  const hstsBox=document.querySelector('[data-px="hsts"]');
+  if(hstsBox) hstsBox.addEventListener('change', pxSyncHsts);
   applyMetricPermissions();
   switchSection('server');
 })();

@@ -20,7 +20,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 BANNED_CHARS = {"—": "em dash", "–": "en dash", "―": "horizontal bar"}
 BANNED_ENTITIES = re.compile(r"&(?:mdash|ndash|#8212|#8211|#x2014|#x2013);")
-SPACED_HYPHEN = re.compile(r"(?<=[A-Za-z,;:)\]}])\s-\s(?=[A-Za-z\[{(])")
+# One spaced hyphen or several: "a -- b" is the same em dash worn as a disguise,
+# and it reads exactly as machine-written as the character it stands in for.
+SPACED_HYPHEN = re.compile(r"(?<=[A-Za-z,;:)\]}])\s-{1,3}\s(?=[A-Za-z\[{(])")
 
 # These two files must contain the characters they police in order to test for
 # them at all, so they are exempt.
@@ -93,8 +95,12 @@ def test_the_scanner_actually_catches_things():
     assert BANNED_ENTITIES.search("a &mdash; b")
     assert SPACED_HYPHEN.search("Required - issuing new codes retires them.")
     assert SPACED_HYPHEN.search("check() - always call _authed() first")
+    assert SPACED_HYPHEN.search("not installed -- install it manually")
+    assert SPACED_HYPHEN.search("no setuid --- refuse to run as root")
     assert not SPACED_HYPHEN.search("offset = (page - 1) * rows")
     assert not SPACED_HYPHEN.search("a-b, well-known, key-only")
+    assert not SPACED_HYPHEN.search("run with --upgrade to pull new code")
+    assert not SPACED_HYPHEN.search("pass -y to apt-get")
 
 
 def test_python_tokenizing_separates_prose_from_arithmetic():
