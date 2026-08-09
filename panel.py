@@ -26,6 +26,7 @@ import os
 import re
 import time
 import json
+import html
 import hmac
 import base64
 import hashlib
@@ -43,6 +44,7 @@ import uvicorn
 
 import DB
 import System
+import recovery
 
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_DIR = os.path.join(_PROJECT_DIR, "static_mgmt")
@@ -80,11 +82,38 @@ def _load_jwt_secret() -> str:
 
 _JWT_SECRET = _load_jwt_secret()
 
+# --- session invalidation epoch --------------------------------------------- #
+# Sessions are stateless signed tokens, so there is no server-side record to
+# delete when a password changes. Instead every token records the auth epoch it
+# was minted under; bumping the stored epoch retires every token in circulation
+# at once. That is what makes "reset the password" actually evict an intruder.
+_EPOCH_CACHE = {"value": None, "read_at": 0.0}
+_EPOCH_TTL = 15.0          # seconds; bounds the per-request settings lookup
+
+def _auth_epoch() -> int:
+    now = time.time()
+    if _EPOCH_CACHE["value"] is None or now - _EPOCH_CACHE["read_at"] > _EPOCH_TTL:
+        try:
+            _EPOCH_CACHE["value"] = int(DB.get_setting("auth_epoch", "0") or 0)
+        except Exception:
+            # A database blip must not sign everybody out mid-session.
+            if _EPOCH_CACHE["value"] is None:
+                _EPOCH_CACHE["value"] = 0
+        _EPOCH_CACHE["read_at"] = now
+    return _EPOCH_CACHE["value"]
+
+def _bump_auth_epoch() -> int:
+    nxt = _auth_epoch() + 1
+    DB.set_setting("auth_epoch", nxt)
+    _EPOCH_CACHE["value"], _EPOCH_CACHE["read_at"] = nxt, time.time()
+    return nxt
+
 def _create_session_token(username: str = "admin", sid: str = None) -> str:
     if sid is None:
         sid = secrets.token_hex(16)
     payload = json.dumps({"exp": int(time.time()) + 86400,
-                          "username": username, "sid": sid}).encode()
+                          "username": username, "sid": sid,
+                          "ae": _auth_epoch()}).encode()
     sig = hmac.new(_JWT_SECRET.encode(), payload, hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(payload).decode() + "." + sig
 
@@ -97,7 +126,12 @@ def _get_token_data(token: str):
         if not hmac.compare_digest(sig, expected):
             return None
         data = json.loads(payload)
-        return data if data.get("exp", 0) > int(time.time()) else None
+        if data.get("exp", 0) <= int(time.time()):
+            return None
+        # Tokens minted before the current epoch were revoked by a password change.
+        if int(data.get("ae", 0)) != _auth_epoch():
+            return None
+        return data
     except Exception:
         return None
 
@@ -667,6 +701,37 @@ _PANES = """
     </div>
     <div id="sec-content"><div class="empty-state">Loading security logs&hellip;</div></div>
   </div></div>
+
+  <!-- ACCOUNT — reached from the username in the top bar rather than the nav,
+       because it is a rare errand, not one of the four places you work. -->
+  <div class="pane" data-pane="account"><div class="pane-scroll">
+    <div class="cfg-card">
+      <div class="device-title">Password</div>
+      <div class="settings-subtitle" style="margin:6px 0 18px;">Changing it signs out every other browser currently using this account.</div>
+      <div class="field-group"><label class="field-label" for="acct-cur">Current password</label>
+        <input class="field-input" id="acct-cur" type="password" autocomplete="current-password"></div>
+      <div class="field-group"><label class="field-label" for="acct-new">New password</label>
+        <div class="field-hint">At least 8 characters, and not only digits.</div>
+        <input class="field-input" id="acct-new" type="password" autocomplete="new-password"></div>
+      <div class="field-group"><label class="field-label" for="acct-new2">Confirm new password</label>
+        <input class="field-input" id="acct-new2" type="password" autocomplete="new-password"></div>
+      <button class="save-btn" id="acct-save" onclick="changePassword()">Change Password</button>
+      <div class="save-feedback" id="acct-feedback"></div>
+    </div>
+
+    <div class="cfg-card" style="margin-top:18px;">
+      <div class="device-title">Recovery codes</div>
+      <div class="settings-subtitle" style="margin:6px 0 16px;">Single-use codes that reset this password from the login page when you cannot sign in.
+        <svg class="ic" style="color:var(--danger)"><use href="#ic-triangle-alert"/></svg> Anyone holding a code can take over the panel.</div>
+      <div class="cfg-running" id="acct-codes-state">Checking&hellip;</div>
+      <div class="field-group" style="margin-top:16px;"><label class="field-label" for="acct-regen-pw">Current password</label>
+        <div class="field-hint">Required &mdash; issuing new codes retires every existing one.</div>
+        <input class="field-input" id="acct-regen-pw" type="password" autocomplete="current-password"></div>
+      <button class="save-btn" id="acct-regen" onclick="regenerateRecoveryCodes()">Generate New Codes</button>
+      <div class="save-feedback" id="acct-regen-feedback"></div>
+      <div id="acct-codes-out" hidden></div>
+    </div>
+  </div></div>
 </div>
 
 <div id="srv-detail-overlay" onclick="if(event.target===this)closeServerDetail()">
@@ -690,9 +755,15 @@ def _topbar(mobile: bool, user: str):
     tabs = "".join(
         f'<button class="tab-btn" data-nav="{k}"><svg class="ic"><use href="#{ic}"/></svg>{label}</button>'
         for k, label, ic in _NAV)
+    safe_user = html.escape(user or "", quote=True)
     right = (
         '<button class="theme-btn" onclick="toggleTheme()" title="Toggle dark mode"><svg class="ic"><use href="#ic-moon" id="theme-ic"/></svg></button>'
-        f'<span class="muted" style="font-size:12px;color:var(--gray-500);">{user}</span>'
+        # The username was inert text; it is now the way into account settings,
+        # which is where people already look for it.
+        f'<button class="db-action-btn acct-btn" data-nav="account" onclick="switchSection(\'account\')" '
+        f'title="Account settings for {safe_user}" aria-label="Account settings for {safe_user}">'
+        f'<svg class="ic"><use href="#ic-lock-keyhole"/></svg>'
+        f'<span class="acct-name">{safe_user}</span></button>'
         f'<a href="{MGMT_BASE}/logout" class="db-action-btn"><svg class="ic"><use href="#ic-log-out"/></svg>Logout</a>'
     )
     return (
@@ -721,7 +792,7 @@ def _is_mobile(request: Request) -> bool:
 
 # Login page — warm palette via the shared stylesheet, same /api/login flow.
 # __BASE__ is substituted with MGMT_BASE by _login_html().
-_LOGIN_HTML = """<!DOCTYPE html><html lang="en"><head>
+_LOGIN_HTML = r"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Management</title><link rel="stylesheet" href="__BASE__/static/dash.css">
 <style>
@@ -744,24 +815,116 @@ _LOGIN_HTML = """<!DOCTYPE html><html lang="en"><head>
     border-radius:10px; font-size:14px; font-family:var(--display); font-weight:700; cursor:pointer; }
   [data-theme="dark"] .btn2 { color:#20160c; } .btn2:disabled { opacity:.55; cursor:not-allowed; }
   .err { margin-top:16px; font-size:12px; color:var(--danger); text-align:center; min-height:16px; }
+  .okmsg { margin-top:16px; font-size:12.5px; line-height:1.55; color:var(--success); text-align:center; }
+  /* The two views live in one card: signing in and recovering are the same
+     task at different levels of trouble, so the card stays put and its
+     contents change rather than throwing up a second surface. */
+  [hidden] { display:none !important; }
+  .view { animation:viewin .18s cubic-bezier(.22,1,.36,1) both; }
+  @keyframes viewin { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:none; } }
+  @media (prefers-reduced-motion:reduce) { .view { animation:none; } }
+  .viewhead { font-family:var(--display); font-size:15px; font-weight:700; color:var(--black);
+    text-align:center; margin-bottom:7px; }
+  .note { font-size:11.5px; line-height:1.6; color:var(--gray-500); text-align:center; margin:0 0 22px; }
+  .alt { margin-top:17px; text-align:center; }
+  .linkbtn { background:none; border:none; padding:5px 7px; font-family:inherit; font-size:12px;
+    color:var(--gray-500); cursor:pointer; border-radius:7px; text-decoration:underline;
+    text-underline-offset:3px; text-decoration-color:var(--gray-300);
+    transition:color .15s, text-decoration-color .15s; }
+  .linkbtn:hover { color:var(--accent); text-decoration-color:var(--accent); }
+  .linkbtn:focus-visible { outline:none; box-shadow:0 0 0 3px var(--ring); color:var(--accent); }
+  .fi.code { letter-spacing:.2em; text-align:center; font-size:15px; }
+  .fi.code::placeholder { letter-spacing:.12em; color:var(--gray-300); }
 </style></head><body class="login">
 <div class="box">
   <div class="crest"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="10" width="18" height="12" rx="2"/><path d="M7 10V7a5 5 0 0 1 10 0v3"/><circle cx="12" cy="16" r="1"/></svg></div>
   <div class="brand">Management</div><div class="sub">Authorized access only</div>
-  <form id="lf">
-    <div class="fg"><label class="fl" for="u">Username</label><input class="fi" id="u" type="text" autofocus autocomplete="username" spellcheck="false"></div>
-    <div class="fg"><label class="fl" for="p">Password</label><input class="fi" id="p" type="password" autocomplete="current-password"></div>
-    <button class="btn2" type="submit" id="sbtn">Sign in</button><div class="err" id="err"></div>
-  </form>
+
+  <div class="view" id="signin-view">
+    <form id="lf">
+      <div class="fg"><label class="fl" for="u">Username</label><input class="fi" id="u" type="text" autofocus autocomplete="username" spellcheck="false"></div>
+      <div class="fg"><label class="fl" for="p">Password</label><input class="fi" id="p" type="password" autocomplete="current-password"></div>
+      <button class="btn2" type="submit" id="sbtn">Sign in</button>
+      <div class="err" id="err" role="alert" aria-live="polite"></div>
+    </form>
+    <div class="alt"><button class="linkbtn" type="button" id="to-recover">Forgot your password?</button></div>
+  </div>
+
+  <div class="view" id="recover-view" hidden>
+    <div class="viewhead">Recover account</div>
+    <p class="note">Enter one of the single-use codes from your <code>.recovery</code> file. Each code works once.</p>
+    <form id="rf">
+      <div class="fg"><label class="fl" for="ru">Username</label><input class="fi" id="ru" type="text" autocomplete="username" spellcheck="false"></div>
+      <div class="fg"><label class="fl" for="rc">Recovery code</label>
+        <input class="fi code" id="rc" type="text" inputmode="numeric" autocomplete="one-time-code"
+               placeholder="0000 0000 0000" maxlength="14" spellcheck="false"></div>
+      <div class="fg"><label class="fl" for="rp">New password</label><input class="fi" id="rp" type="password" autocomplete="new-password"></div>
+      <div class="fg"><label class="fl" for="rp2">Confirm new password</label><input class="fi" id="rp2" type="password" autocomplete="new-password"></div>
+      <button class="btn2" type="submit" id="rbtn">Reset password</button>
+      <div class="err" id="rerr" role="alert" aria-live="polite"></div>
+      <div class="okmsg" id="rok" hidden></div>
+    </form>
+    <div class="alt"><button class="linkbtn" type="button" id="to-signin">Back to sign in</button></div>
+  </div>
 </div>
 <script>
   if(localStorage.getItem('theme')==='dark') document.documentElement.setAttribute('data-theme','dark');
-  document.getElementById('lf').addEventListener('submit', async function(e){
-    e.preventDefault(); const b=document.getElementById('sbtn'), er=document.getElementById('err'); b.disabled=true; er.textContent='';
+  const $=function(id){ return document.getElementById(id); };
+
+  /* --- view swapping ---------------------------------------------------- */
+  function showView(which){
+    const signin=which==='signin';
+    $('signin-view').hidden=!signin; $('recover-view').hidden=signin;
+    /* re-trigger the entrance so the swap reads as a change, not a jump */
+    const v=signin?$('signin-view'):$('recover-view');
+    v.classList.remove('view'); void v.offsetWidth; v.classList.add('view');
+    (signin?$('u'):$('ru')).focus();
+  }
+  $('to-recover').addEventListener('click', function(){
+    $('ru').value=$('u').value.trim(); showView('recover');
+  });
+  $('to-signin').addEventListener('click', function(){ showView('signin'); });
+  document.addEventListener('keydown', function(e){
+    if(e.key==='Escape' && !$('recover-view').hidden) showView('signin');
+  });
+
+  /* --- recovery code field: digits only, grouped in fours ---------------- */
+  $('rc').addEventListener('input', function(){
+    const digits=this.value.replace(/\D/g,'').slice(0,12);
+    this.value=digits.replace(/(.{4})(?=.)/g,'$1 ');
+  });
+
+  /* --- sign in ----------------------------------------------------------- */
+  $('lf').addEventListener('submit', async function(e){
+    e.preventDefault(); const b=$('sbtn'), er=$('err'); b.disabled=true; er.textContent='';
     try{ const res=await fetch('__BASE__/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({username:document.getElementById('u').value.trim(),password:document.getElementById('p').value})});
+      body:JSON.stringify({username:$('u').value.trim(),password:$('p').value})});
       const d=await res.json(); if(d.status==='ok'){ location.href='__BASE__/'; } else { er.textContent=d.error||'Invalid username or password.'; b.disabled=false; }
     }catch(_){ er.textContent='Network error — please try again.'; b.disabled=false; }
+  });
+
+  /* --- recover ----------------------------------------------------------- */
+  $('rf').addEventListener('submit', async function(e){
+    e.preventDefault();
+    const b=$('rbtn'), er=$('rerr'), okEl=$('rok');
+    er.textContent=''; okEl.hidden=true;
+    const user=$('ru').value.trim(), code=$('rc').value.replace(/\D/g,''), pw=$('rp').value;
+    if(code.length!==12){ er.textContent='A recovery code is 12 digits.'; $('rc').focus(); return; }
+    if(pw!==$('rp2').value){ er.textContent='The two passwords do not match.'; $('rp2').focus(); return; }
+    b.disabled=true; b.textContent='Resetting…';
+    try{
+      const res=await fetch('__BASE__/api/recover',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:user,code:code,new_password:pw})});
+      const d=await res.json();
+      if(d.status==='ok'){
+        okEl.textContent='Password reset. '+d.remaining+' recovery code'+(d.remaining===1?'':'s')+' left. Signing you in…';
+        okEl.hidden=false; $('rf').querySelectorAll('input').forEach(function(i){ i.disabled=true; });
+        setTimeout(function(){ $('u').value=user; showView('signin'); $('p').focus(); }, 2200);
+      } else {
+        er.textContent=d.error||'Could not reset the password.';
+        b.disabled=false; b.textContent='Reset password';
+      }
+    }catch(_){ er.textContent='Network error — please try again.'; b.disabled=false; b.textContent='Reset password'; }
   });
 </script></body></html>"""
 
@@ -869,6 +1032,229 @@ async def logout(request: Request):
     resp = RedirectResponse(url=f"{MGMT_BASE}/login", status_code=302)
     resp.delete_cookie("session", path=_COOKIE_PATH)
     return resp
+
+# ===========================================================================
+# Account: change your own password, and single-use recovery codes
+# ===========================================================================
+async def _json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+def _set_admin_password(username: str, password: str) -> int:
+    conn = DB.get_connection()          # autocommit
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE admin SET password_hash = %s WHERE username = %s",
+                    (recovery.hash_password(password), username))
+        changed = cur.rowcount
+        cur.close()
+        return changed
+    finally:
+        DB.release_connection(conn)
+
+@app.get("/api/account/recovery-status")
+async def api_recovery_status(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    username = _admin_name(request)
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            recovery.ensure_table(conn)
+            unused, total = recovery.remaining(conn, username)
+            return unused, total, recovery.generated_at(conn, username)
+        finally:
+            DB.release_connection(conn)
+
+    try:
+        unused, total, made = await DB.run(work)
+    except Exception as e:
+        logging.error(f"recovery-status failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not read recovery codes."})
+    return JSONResponse({"username": username, "unused": unused, "total": total,
+                         "generated_at": made.isoformat() if made else None})
+
+@app.post("/api/account/password")
+async def api_account_password(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    username, ip = _admin_name(request), _client_ip(request)
+    body = await _json_body(request)
+    current = body.get("current_password") or ""
+    new = body.get("new_password") or ""
+
+    if not await DB.run(DB.verify_admin, username, current):
+        write_log("WARN", "AUTH", "Password change refused", actor=username, ip=ip,
+                  detail="current password did not match", status="denied")
+        return JSONResponse(status_code=403,
+                            content={"error": "Your current password is not correct."})
+
+    problem = recovery.password_problem(new, username)
+    if problem:
+        return JSONResponse(status_code=400, content={"error": problem})
+    if new == current:
+        return JSONResponse(status_code=400,
+                            content={"error": "The new password must be different from the current one."})
+
+    try:
+        if not await DB.run(_set_admin_password, username, new):
+            return JSONResponse(status_code=500, content={"error": "Could not update the password."})
+        await DB.run(_bump_auth_epoch)
+    except Exception as e:
+        logging.error(f"password change failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not update the password."})
+
+    write_log("ACTION", "AUTH", "Password changed", actor=username, ip=ip,
+              detail="every other session was signed out")
+    # The epoch bump just invalidated this browser's cookie too — hand it a new
+    # one so the person who made the change is not signed out by their own action.
+    resp = JSONResponse({"status": "ok"})
+    resp.set_cookie("session", _create_session_token(username), httponly=True,
+                    max_age=86400, samesite="lax", secure=_is_https(request),
+                    path=_COOKIE_PATH)
+    return resp
+
+@app.post("/api/account/recovery-codes")
+async def api_account_recovery_codes(request: Request):
+    """Mint a new set. Re-authenticates first: this is a credential-issuing action."""
+    if not _authed(request):
+        return _need_auth()
+    username, ip = _admin_name(request), _client_ip(request)
+    body = await _json_body(request)
+
+    if not await DB.run(DB.verify_admin, username, body.get("current_password") or ""):
+        write_log("WARN", "SECURITY", "Recovery code regeneration refused", actor=username,
+                  ip=ip, detail="current password did not match", status="denied")
+        return JSONResponse(status_code=403,
+                            content={"error": "Your current password is not correct."})
+
+    codes = recovery.generate_codes()
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            recovery.ensure_table(conn)
+            recovery.replace_codes(conn, username, codes)
+        finally:
+            DB.release_connection(conn)
+
+    try:
+        await DB.run(work)
+    except Exception as e:
+        logging.error(f"recovery code regeneration failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not store the new codes."})
+
+    path, file_error = None, None
+    try:
+        path = recovery.write_recovery_file(_PROJECT_DIR, username, codes)
+    except OSError as e:
+        file_error = str(e)
+        logging.warning(f".recovery file not written: {e}")
+
+    write_log("ACTION", "SECURITY", "Recovery codes regenerated", actor=username, ip=ip,
+              detail=f"{len(codes)} new codes; all previous codes invalidated")
+    return JSONResponse({"status": "ok", "path": path, "file_error": file_error,
+                         "codes": [recovery.format_code(c) for c in codes]})
+
+# --- unauthenticated recovery ----------------------------------------------- #
+# The only route that changes a password without a session, so it is throttled
+# per-IP and globally. The code space is 10^12 with five live codes, so guessing
+# is already hopeless; this exists to make a sustained attempt loud and cheap to
+# survive rather than to be the only thing standing in the way.
+_RECOVER_WINDOW = 900          # 15 minutes
+_RECOVER_MAX_PER_IP = 5
+_RECOVER_MAX_GLOBAL = 20
+_recover_fails = {}            # ip -> [monotonic timestamps]
+
+def _recover_prune(now):
+    for addr in list(_recover_fails):
+        kept = [t for t in _recover_fails[addr] if now - t < _RECOVER_WINDOW]
+        if kept:
+            _recover_fails[addr] = kept
+        else:
+            _recover_fails.pop(addr, None)
+
+def _recover_blocked(ip: str) -> bool:
+    now = time.time()
+    _recover_prune(now)
+    if len(_recover_fails.get(ip, ())) >= _RECOVER_MAX_PER_IP:
+        return True
+    return sum(len(v) for v in _recover_fails.values()) >= _RECOVER_MAX_GLOBAL
+
+def _recover_note_fail(ip: str):
+    _recover_fails.setdefault(ip, []).append(time.time())
+
+@app.post("/api/recover")
+async def api_recover(request: Request):
+    ip = _client_ip(request)
+    ua = request.headers.get("user-agent", "")
+    body = await _json_body(request)
+    username = (body.get("username") or "").strip()
+    code = recovery.normalize_code(body.get("code") or "")
+    new = body.get("new_password") or ""
+
+    if _recover_blocked(ip):
+        write_log("WARN", "SECURITY", "Account recovery rate-limited",
+                  actor=username or "?", ip=ip, detail=f"ua={ua[:120]}", status="denied")
+        return JSONResponse(status_code=429,
+                            content={"error": "Too many attempts. Wait 15 minutes and try again."})
+
+    problem = recovery.password_problem(new, username)
+    if problem:
+        return JSONResponse(status_code=400, content={"error": problem})
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            recovery.ensure_table(conn)
+            if not _admin_exists_conn(conn, username):
+                recovery.burn_time()        # same cost as a wrong code
+                return False, 0
+            if not recovery.consume_code(conn, username, code, ip):
+                return False, 0
+            cur = conn.cursor()
+            cur.execute("UPDATE admin SET password_hash = %s WHERE username = %s",
+                        (recovery.hash_password(new), username))
+            cur.close()
+            unused, _total = recovery.remaining(conn, username)
+            return True, unused
+        finally:
+            DB.release_connection(conn)
+
+    try:
+        accepted, left = await DB.run(work)
+    except Exception as e:
+        logging.error(f"recovery failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Recovery is unavailable right now."})
+
+    if not accepted:
+        _recover_note_fail(ip)
+        write_log("WARN", "SECURITY", "Recovery code rejected", actor=username or "?",
+                  ip=ip, detail=f"ua={ua[:120]}", status="denied")
+        # One message for every failure mode: no account enumeration.
+        return JSONResponse(status_code=403,
+                            content={"error": "That username and recovery code do not match."})
+
+    try:
+        await DB.run(_bump_auth_epoch)      # evict anyone already signed in
+    except Exception as e:
+        logging.error(f"epoch bump after recovery failed: {e}")
+
+    write_log("ACTION", "SECURITY", "Password reset with a recovery code", actor=username,
+              ip=ip, detail=f"{left} code(s) remaining; all sessions signed out")
+    return JSONResponse({"status": "ok", "remaining": left})
+
+def _admin_exists_conn(conn, username: str) -> bool:
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT 1 FROM admin WHERE username = %s", (username,))
+        return cur.fetchone() is not None
+    finally:
+        cur.close()
 
 # ---- dashboard ----
 @app.get("/", response_class=HTMLResponse)

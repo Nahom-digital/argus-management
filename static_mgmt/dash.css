@@ -1015,3 +1015,28 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
   body.mgmt-desktop .mobile-tabbar { display: grid; }
 }
 .mobile-tabbar { position: sticky; bottom: 0; }
+
+/* ── Account pane ────────────────────────────────────────────────────────── */
+/* The username in the top bar is a control now, so it needs the button's own
+   selected state; switchSection() already toggles .active on [data-nav]. */
+.acct-btn.active { background: var(--accent); color: #fbf2e2; border-color: transparent; }
+[data-theme="dark"] .acct-btn.active { color: #20160c; }
+.acct-name { max-width: 15ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 560px) { .acct-name { display: none; } }
+
+/* One-time reveal of freshly minted recovery codes. Tinted rather than
+   bordered-and-shouty: it is important, not alarming. */
+.codes-box {
+  margin-top: 16px; padding: 16px 18px;
+  border: 1px solid var(--accent); border-radius: 10px; background: var(--accent-soft);
+}
+.codes-title { font-size: 12.5px; font-weight: 700; color: var(--black); margin-bottom: 5px; }
+.codes-note { font-size: 11.5px; line-height: 1.6; color: var(--gray-700); margin-bottom: 13px; }
+.codes-list { list-style: none; margin: 0 0 14px; padding: 0; display: grid; gap: 7px; }
+.codes-list li { display: flex; align-items: baseline; gap: 11px; }
+.codes-list .n { font-size: 11px; color: var(--gray-500); min-width: 13px; }
+.codes-list .c { font-family: var(--mono); font-size: 14.5px; letter-spacing: .09em; color: var(--black); }
+@media (prefers-reduced-motion: no-preference) {
+  .codes-box { animation: codesin .2s cubic-bezier(.22, 1, .36, 1) both; }
+  @keyframes codesin { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+}

@@ -60,6 +60,104 @@ function switchSection(name){
   if(name==='services') loadServices();
   if(name==='terminal') setTimeout(initTerminal,30);
   if(name==='logs') loadSecurityLogs();
+  if(name==='account') loadAccount();
+}
+
+/* ================= ACCOUNT ================= */
+async function loadAccount(){
+  const el=$('acct-codes-state'); if(!el) return;
+  ['acct-cur','acct-new','acct-new2','acct-regen-pw'].forEach(function(id){ const i=$(id); if(i) i.value=''; });
+  const out=$('acct-codes-out'); if(out){ out.hidden=true; out.innerHTML=''; }
+  el.textContent='Checking…';
+  try{
+    const r=await api('/api/account/recovery-status'); if(!r) return;
+    const d=await r.json();
+    if(!r.ok){ el.textContent=d.error||'Could not read recovery codes.'; return; }
+    if(!d.total){
+      el.innerHTML='<b style="color:var(--danger)">No recovery codes yet.</b> '+
+        'Generate a set so a forgotten password is not a lockout.';
+    } else if(!d.unused){
+      el.innerHTML='<b style="color:var(--danger)">All '+d.total+' codes used.</b> Generate a new set.';
+    } else {
+      const low=d.unused<=1;
+      el.innerHTML='<b style="color:'+(low?'var(--danger)':'#27ae60')+'">'+d.unused+' of '+d.total+
+        '</b> code'+(d.unused===1?'':'s')+' unused'+
+        (d.generated_at?' <span style="color:var(--gray-500);">(issued '+esc(d.generated_at.slice(0,10))+')</span>':'');
+    }
+  }catch(e){ el.textContent='Could not reach the server.'; }
+}
+
+async function changePassword(){
+  const fb=$('acct-feedback'), btn=$('acct-save');
+  const cur=$('acct-cur').value, pw=$('acct-new').value, pw2=$('acct-new2').value;
+  fb.textContent=''; fb.className='save-feedback';
+  if(!cur){ fb.textContent='Enter your current password.'; fb.classList.add('err'); $('acct-cur').focus(); return; }
+  if(pw!==pw2){ fb.textContent='The two new passwords do not match.'; fb.classList.add('err'); $('acct-new2').focus(); return; }
+  btn.disabled=true; fb.textContent='Saving…'; fb.classList.add('info');
+  try{
+    const r=await api('/api/account/password',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({current_password:cur,new_password:pw})});
+    if(!r){ return; }
+    const d=await r.json();
+    fb.className='save-feedback';
+    if(!r.ok){ fb.textContent=d.error||'Could not change the password.'; fb.classList.add('err'); }
+    else{
+      fb.textContent='Password changed. Other sessions have been signed out.';
+      fb.classList.add('ok');
+      ['acct-cur','acct-new','acct-new2'].forEach(function(id){ $(id).value=''; });
+      appToast('Password changed','ok');
+    }
+  }catch(e){ fb.className='save-feedback err'; fb.textContent='Request failed: '+e; }
+  btn.disabled=false;
+}
+
+async function regenerateRecoveryCodes(){
+  const fb=$('acct-regen-feedback'), btn=$('acct-regen'), out=$('acct-codes-out');
+  const cur=$('acct-regen-pw').value;
+  fb.textContent=''; fb.className='save-feedback';
+  if(!cur){ fb.textContent='Enter your current password.'; fb.classList.add('err'); $('acct-regen-pw').focus(); return; }
+  if(!(await uiConfirm('Generate new recovery codes?',
+       'Every existing code stops working immediately. The new codes are shown once and written to the .recovery file.'))) return;
+  btn.disabled=true; fb.textContent='Generating…'; fb.classList.add('info'); out.hidden=true;
+  try{
+    const r=await api('/api/account/recovery-codes',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({current_password:cur})});
+    if(!r){ return; }
+    const d=await r.json();
+    fb.className='save-feedback';
+    if(!r.ok){ fb.textContent=d.error||'Could not generate new codes.'; fb.classList.add('err'); }
+    else{
+      $('acct-regen-pw').value='';
+      fb.textContent=d.file_error?('Codes created, but .recovery could not be written: '+d.file_error)
+                                 :('Codes created and written to '+(d.path||'.recovery')+'.');
+      fb.classList.add(d.file_error?'err':'ok');
+      renderRecoveryCodes(d.codes);
+      loadAccount();
+      appToast('New recovery codes issued','ok');
+    }
+  }catch(e){ fb.className='save-feedback err'; fb.textContent='Request failed: '+e; }
+  btn.disabled=false;
+}
+
+/* Shown exactly once — the server keeps only hashes, so this is the last
+   chance to copy them out of the browser. */
+function renderRecoveryCodes(codes){
+  const out=$('acct-codes-out'); if(!out||!codes||!codes.length) return;
+  const items=codes.map(function(c,i){
+    return '<li><span class="n">'+(i+1)+'.</span><span class="c">'+esc(c)+'</span></li>';
+  }).join('');
+  out.innerHTML=
+    '<div class="codes-box">'+
+      '<div class="codes-title">Your new recovery codes</div>'+
+      '<div class="codes-note">Shown once. Each resets the password one time from the login page. '+
+        'Store them somewhere safe and offline.</div>'+
+      '<ol class="codes-list">'+items+'</ol>'+
+      '<button class="db-action-btn" id="acct-copy-codes"><svg class="ic"><use href="#ic-copy"/></svg>Copy all</button>'+
+    '</div>';
+  out.hidden=false;
+  const btn=$('acct-copy-codes');
+  if(btn) btn.addEventListener('click', function(){ copyVal(codes.join('\n'),'Recovery codes'); });
+  out.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 
 /* ================= SERVER ================= */

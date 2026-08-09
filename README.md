@@ -48,8 +48,10 @@ wizard over an existing install is safe — every step is idempotent.
 ```bash
 python3 management.py             # setup wizard, then run
 python3 management.py --service   # install + start the systemd service, then exit
+python3 management.py --upgrade   # git pull the latest code, then restart the service
 python3 management.py --serve     # run in the foreground from deploy.json
 python3 management.py --status    # config / dependency / database / service report
+python3 management.py --recovery-codes   # mint new single-use recovery codes
 python3 management.py --setup     # force the wizard even without a TTY
 python3 management.py --help
 ```
@@ -66,11 +68,43 @@ systemctl restart argus-management
 journalctl -u argus-management -f
 ```
 
+## Signing in, and getting back in
+
+The panel password is stored only as a PBKDF2-SHA256 hash, so **it cannot be
+looked up** — not in `deploy.json`, not in `.env`. (`DB_PASSWORD` in `.env` is the
+*PostgreSQL* password, which is a different thing.) There are two supported ways
+to change it.
+
+**You know the current password.** Sign in, click your username in the top bar,
+and use the Account pane. Changing the password signs out every other browser
+using the account.
+
+**You don't.** The wizard writes five single-use recovery codes to `.recovery`
+(mode 0600, git-ignored) — twelve digits each, and the only plaintext copy that
+exists; the database keeps salted hashes. On the login page, **"Forgot your
+password?"** asks for your username, one code, and a new password. A code stops
+working the moment it is used, and a successful reset signs out every existing
+session.
+
+```bash
+python3 management.py --recovery-codes   # mint a fresh set (retires the old ones)
+```
+
+You can also regenerate them from the Account pane, which shows the new codes
+once. `--status` reports how many are left. If you run out, `--recovery-codes` is
+the way back.
+
+Guard rails on the recovery endpoint: a wrong username and a wrong code return
+the same message and take the same time (no account enumeration), attempts are
+throttled per-IP and globally, and every attempt — accepted or not — lands in
+`management_log` under `SECURITY`.
+
 ## Files
 
 | file | what it is |
 |------|------------|
 | `management.py` | deployment front door: dependency bootstrap, DB provisioning, setup wizard, service installer |
+| `recovery.py`   | password hashing + single-use recovery codes, shared by the CLI and the panel |
 | `panel.py`      | the FastAPI panel itself (routes, UI, websocket terminal) |
 | `DB.py`         | PostgreSQL pool, admin auth, settings, security/activity logs |
 | `System.py`     | host telemetry, PTY terminal, process/connection helpers |
@@ -84,6 +118,7 @@ The wizard creates exactly what the panel runs on:
 | table | purpose |
 |-------|---------|
 | `admin` | panel login accounts (PBKDF2-SHA256) |
+| `admin_recovery_code` | single-use account recovery codes (salted PBKDF2 hashes) |
 | `system_settings` | key/value runtime configuration |
 | `management_log` | the panel's own structured event + audit log |
 | `admin_action` | append-only administrator audit trail |

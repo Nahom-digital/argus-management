@@ -1,5 +1,6 @@
 # secrets & host-specific runtime — never commit these
 .env
+.recovery
 .session_secret
 .wallet_secret
 deploy.json

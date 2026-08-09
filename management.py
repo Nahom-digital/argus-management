@@ -32,6 +32,9 @@ import hashlib
 import secrets
 import subprocess
 
+# Standard library only, so importing it before the dependency bootstrap is safe.
+import recovery
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "deploy.json")
 ENV_PATH = os.path.join(HERE, ".env")
@@ -1018,6 +1021,7 @@ SCHEMA = (
                password_hash TEXT NOT NULL
            )""",
     )),
+    ("account recovery codes", recovery.SCHEMA),
     ("system settings", (
         """CREATE TABLE IF NOT EXISTS system_settings (
                key        VARCHAR(40) PRIMARY KEY,
@@ -1160,9 +1164,10 @@ SCHEMA_UPGRADES = (
     "ALTER TABLE IF EXISTS http_access_log ADD COLUMN IF NOT EXISTS response_size INTEGER",
 )
 
-SCHEMA_TABLES = ("admin", "system_settings", "management_log", "admin_action",
-                 "ssh_log", "web_login_log", "web_fp_block", "web_login_block",
-                 "web_session_log", "http_access_log")
+SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",
+                 "management_log", "admin_action", "ssh_log", "web_login_log",
+                 "web_fp_block", "web_login_block", "web_session_log",
+                 "http_access_log")
 
 
 def app_connection(cfg):
@@ -1355,7 +1360,7 @@ def ensure_app_login(cfg, channel):
 # --------------------------------------------------------------------------- #
 def _hash_pw(password):
     """Must stay byte-identical to DB._hash_pw or logins will not verify."""
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), b"botcontrol", 260000).hex()
+    return recovery.hash_password(password)
 
 def existing_admins(cfg):
     try:
@@ -1385,11 +1390,9 @@ def setup_admin_account(cfg):
     username = ask_identifier("Admin username", "admin")
     while True:
         password = ask_secret("Admin password")
-        if len(password) < 8:
-            warn("please use at least 8 characters")
-            continue
-        if password.lower() in ("password", "admin123", "12345678"):
-            warn("that password is far too common — pick another")
+        problem = recovery.password_problem(password, username)
+        if problem:
+            warn(problem.lower().rstrip("."))
             continue
         if ask_secret("Repeat the admin password") != password:
             warn("the passwords did not match — try again")
@@ -1421,7 +1424,37 @@ def setup_admin_account(cfg):
     ok(f"admin account '{username}' is ready")
     if removed:
         ok("removed the insecure default 'admin'/'admin' account")
+
+    issue_recovery_codes(cfg, username)
     return True
+
+
+def issue_recovery_codes(cfg, username, announce=True):
+    """Mint a fresh set of single-use codes and write them to .recovery."""
+    try:
+        conn = app_connection(cfg)
+        try:
+            recovery.ensure_table(conn)
+            codes = recovery.generate_codes()
+            recovery.replace_codes(conn, username, codes)
+        finally:
+            conn.close()
+        path = recovery.write_recovery_file(HERE, username, codes)
+    except Exception as e:
+        err(f"could not create recovery codes: {_short_pg_error(e)}")
+        return None
+
+    if announce:
+        head("Account recovery codes")
+        info("if you ever forget the password, these get you back in — one use each")
+        for i, code in enumerate(codes, 1):
+            print(f"    {_c(str(i) + '.', '2;37')}  {_c(recovery.format_code(code), '1;37')}")
+        print()
+        ok(f"saved to {path} (owner-only, 0600)")
+        info(f"only the hashes are stored in the database — {recovery.RECOVERY_FILENAME}")
+        info("is the sole plaintext copy, so keep it somewhere safe and offline")
+        warn("anyone holding a code can take over the panel")
+    return codes
 
 
 # --------------------------------------------------------------------------- #
@@ -1913,6 +1946,23 @@ def show_status():
             admins = existing_admins(cfg)
             if admins:
                 ok(f"admin account(s): {', '.join(u for u, _ in admins)}")
+                try:
+                    conn = app_connection(cfg)
+                    try:
+                        for username, _ in admins:
+                            unused, total = recovery.remaining(conn, username)
+                            if total == 0:
+                                warn(f"'{username}' has no recovery codes — "
+                                     "run:  python3 management.py --recovery-codes")
+                            elif unused == 0:
+                                warn(f"'{username}' has used all {total} recovery codes")
+                            else:
+                                ok(f"recovery codes for '{username}': "
+                                   f"{unused} of {total} unused")
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
             else:
                 warn("no admin account configured")
         else:
@@ -1931,8 +1981,46 @@ def show_status():
     print()
 
 
+def recovery_codes_mode():
+    """`--recovery-codes`: mint a fresh set, retiring whatever came before."""
+    banner()
+    if not os.path.exists(CONFIG_PATH):
+        err("no deploy.json yet — run the setup wizard first")
+        info("  python3 management.py")
+        return 1
+    cfg = load_config()
+    if _missing_dependencies():
+        ensure_python_deps()
+
+    working, reason = verify_app_connection(cfg)
+    if not working:
+        err(f"database connection failed: {reason}")
+        return 1
+
+    admins = existing_admins(cfg)
+    if not admins:
+        err("there is no panel admin account yet — run the wizard first")
+        return 1
+
+    if len(admins) == 1:
+        username = admins[0][0]
+    else:
+        info("accounts: " + ", ".join(u for u, _ in admins))
+        username = ask("Which account", admins[0][0])
+        if username not in [u for u, _ in admins]:
+            err(f"no such account: {username}")
+            return 1
+
+    warn(f"this retires every existing recovery code for '{username}'")
+    if not ask_yes("Generate a new set now?", True):
+        info("nothing changed")
+        return 0
+
+    return 0 if issue_recovery_codes(cfg, username) else 1
+
+
 # --------------------------------------------------------------------------- #
-# 12. The wizard
+# 13. The wizard
 # --------------------------------------------------------------------------- #
 def wizard():
     banner()
@@ -2036,6 +2124,8 @@ USAGE = """
     python3 management.py --upgrade   git pull the latest code, then restart the service
     python3 management.py --serve     run in the foreground from deploy.json
     python3 management.py --status    show configuration / database / service status
+    python3 management.py --recovery-codes
+                                      mint a new set of single-use recovery codes
     python3 management.py --setup     force the wizard even without a TTY
     python3 management.py --help      this message
 """
@@ -2049,6 +2139,8 @@ def main():
     if "--status" in args:
         show_status()
         return
+    if "--recovery-codes" in args:
+        sys.exit(recovery_codes_mode())
     if "--upgrade" in args:
         sys.exit(upgrade_mode())
     if "--service" in args:
