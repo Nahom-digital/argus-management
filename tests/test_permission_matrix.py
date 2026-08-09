@@ -29,6 +29,7 @@ PROBES = {
     "svc_restart":   ("POST", "/api/services/nonexistent-svc/restart"),
     "svc_stop":      ("POST", "/api/services/nonexistent-svc/stop"),
     "logs_access":   ("GET", "/api/system/log-counts"),
+    "firewall_manage": ("GET", "/api/config/firewall"),
 }
 
 # Grants with no endpoint of their own: terminal is a websocket, disk_scope is a

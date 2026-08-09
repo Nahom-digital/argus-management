@@ -55,6 +55,16 @@ def _prose_spans(rel, text):
             if "calc(" not in l]
 
 
+SQL_TELL = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|WHERE|FROM|GROUP BY|HAVING|"
+                      r"CREATE TABLE|ALTER TABLE|JOIN|ORDER BY)\b")
+
+
+def _looks_like_sql(chunk):
+    """A SQL string is code that happens to live in a string literal, so its
+    arithmetic ("now() - make_interval(...)") is not prose punctuation."""
+    return bool(SQL_TELL.search(chunk))
+
+
 @pytest.mark.parametrize("rel", _files())
 def test_file_has_no_dash_punctuation(rel):
     with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as f:
@@ -68,7 +78,7 @@ def test_file_has_no_dash_punctuation(rel):
     for line_no, chunk in _prose_spans(rel, text):
         if BANNED_ENTITIES.search(chunk):
             problems.append(f"L{line_no} dash entity: {chunk.strip()[:90]}")
-        if SPACED_HYPHEN.search(chunk):
+        if SPACED_HYPHEN.search(chunk) and not _looks_like_sql(chunk):
             problems.append(f"L{line_no} spaced hyphen: {chunk.strip()[:90]}")
 
     assert not problems, f"{rel} contains dash punctuation:\n  " + "\n  ".join(problems)

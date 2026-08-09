@@ -584,7 +584,24 @@ async function generateSshKey(){
     const r=await api('/api/config/ssh/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:$('ssh-password').value||''})});
     const d=await r.json();
     if(!r.ok){ fb.textContent=d.error||'Generation failed'; fb.classList.add('err'); }
-    else{ fb.textContent='Key generated.'; fb.classList.add('ok'); appToast('SSH key generated','ok'); }
+    else{
+      // "Key generated" used to be printed whether or not the key had been
+      // installed or would authenticate. Report what actually happened.
+      const lines=[];
+      if(d.verified){
+        lines.push('Key generated and confirmed working: '+(d.verify_detail||''));
+        fb.classList.add('ok');
+        appToast('SSH key generated and verified','ok');
+      }else{
+        lines.push('Key generated, but signing in with it did not succeed.');
+        if(d.verify_detail) lines.push('SSH said: '+d.verify_detail);
+        fb.classList.add('err');
+        appToast('SSH key generated but not verified','err');
+      }
+      (d.problems||[]).forEach(p=>lines.push(p));
+      if((d.steps||[]).length) lines.push('Done: '+d.steps.join('; ')+'.');
+      fb.innerHTML=lines.map(l=>esc(l)).join('<br>');
+    }
   }catch(e){ fb.textContent='Network error'; fb.classList.add('err'); }
   btn.disabled=false; loadSshKeyStatus();
 }

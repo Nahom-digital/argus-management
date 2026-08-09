@@ -36,6 +36,7 @@ import subprocess
 import recovery
 import ssh_vault
 import panel_users
+import firewall
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "deploy.json")
@@ -1195,6 +1196,7 @@ SCHEMA = (
     )),
     ("SSH access settings", ssh_vault.SCHEMA),
     ("panel staff accounts", panel_users.SCHEMA),
+    ("firewall blocks and port rules", firewall.SCHEMA),
 )
 
 # Columns added to tables that may predate this version of the schema. Each is
@@ -1213,7 +1215,8 @@ SCHEMA_UPGRADES = (
 SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",
                  "management_log", "admin_action", "ssh_log", "web_login_log",
                  "web_fp_block", "web_login_block", "web_session_log",
-                 "http_access_log", "ssh", "panel_user")
+                 "http_access_log", "ssh", "panel_user",
+                 "fw_block", "fw_rule")
 
 
 def app_connection(cfg):

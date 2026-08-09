@@ -48,6 +48,7 @@ import recovery
 import panel_users
 import ssh_vault
 import vault
+import firewall
 import nginx_proxy
 from psycopg2 import sql as pg_sql
 
@@ -471,6 +472,30 @@ _SESSION_RE    = re.compile(r"session (?P<state>opened|closed) for user (?P<user
 _FINGERPRINT_RE = re.compile(r"(?P<ip>[\d.a-fA-F:]+).*?key (?P<type>[\w-]+) (?P<fp>SHA256:\S+)")
 _TIMEOUT_RE    = re.compile(r"Timeout before authentication.*?from (?P<ip>[\d.a-fA-F:]+)")
 
+def _autoblock_ssh_offenders():
+    """Block addresses that have failed SSH too many times, right after fresh
+    events land. Runs on the log-reading path rather than on a timer, so it has
+    no background loop to keep alive, and it never raises: failing to block is
+    not a reason to fail the log view the operator is looking at."""
+    try:
+        conn = DB.get_connection()
+        try:
+            newly = firewall.enforce_ssh_autoblock(conn)
+        finally:
+            DB.release_connection(conn)
+        for entry in newly:
+            write_log(
+                "WARN", "SECURITY", "Auto-blocked SSH attacker", actor="system",
+                target=entry["ip"],
+                detail=(f"{entry['failures']} failed attempts within "
+                        f"{firewall.SSH_FAIL_WINDOW_MINUTES} minutes; "
+                        f"firewall: {entry['detail'] or 'applied'}"),
+                status="ok" if entry["applied"] else "failed",
+            )
+    except Exception as e:
+        logging.error(f"SSH auto-block failed: {e}")
+
+
 def _parse_ssh_journal(since: str = None, limit: int = 500) -> dict:
     cmd = ["journalctl", "-u", "ssh", "--no-pager", "-o", "short-iso", "--reverse"]
     if since:
@@ -525,6 +550,7 @@ def _parse_ssh_journal(since: str = None, limit: int = 500) -> dict:
             ev.update(event="TIMEOUT", ip=m.group("ip")); events.append(ev)
     try:
         DB.persist_ssh_events(events)
+        _autoblock_ssh_offenders()
         stored = DB.get_persisted_ssh(limit=max(limit * 4, 4000))
         seen, merged = set(), []
         for e in events + stored:
@@ -1784,14 +1810,19 @@ async def api_ssh_status(request: Request):
 
 def _ssh_generate(password):
     ssh_vault.ensure_sshd_running()
-    public_key, private_key, fingerprint = ssh_vault.generate_keypair()
+    public_key, private_key, fingerprint, report = ssh_vault.generate_keypair()
     conn = DB.get_connection()
     try:
         allow = ssh_vault.password_login_allowed()
         ssh_vault.save_record(conn, public_key, private_key, password, fingerprint, allow)
     finally:
         DB.release_connection(conn)
-    return {"public_key": public_key, "fingerprint": fingerprint}
+    # The report travels to the browser. Generating a key that was never
+    # installed or never tried used to look identical to one that works.
+    return {"public_key": public_key, "fingerprint": fingerprint,
+            "installed": report["installed"], "verified": report["verified"],
+            "verify_detail": report["verify_detail"],
+            "steps": report["steps"], "problems": report["problems"]}
 
 @app.post("/api/config/ssh/generate")
 async def api_ssh_generate(request: Request):
@@ -2481,26 +2512,159 @@ async def api_ssh_block(request: Request):
         return denied
     body = await request.json()
     ip = (body.get("ip") or "").strip()
-    if not ip or not re.match(r"^[0-9a-fA-F:.]+$", ip):
+    if not firewall.valid_ip(ip):
         return JSONResponse(status_code=400, content={"error": "valid ip required"})
-    enforced, detail = False, ""
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            return firewall.block_ip(conn, ip, reason=(body.get("reason") or "Blocked from the SSH log"),
+                                      source="manual", created_by=_admin_name(request))
+        finally:
+            DB.release_connection(conn)
+
     try:
-        check = subprocess.run(["iptables", "-C", "INPUT", "-s", ip, "-j", "DROP"], capture_output=True)
-        if check.returncode != 0:
-            add = subprocess.run(["iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], capture_output=True, text=True)
-            enforced = add.returncode == 0
-            detail = (add.stderr or "").strip()
-        else:
-            enforced, detail = True, "rule already present"
-    except FileNotFoundError:
-        detail = "iptables not available on this host"
-    except Exception as e:
-        detail = str(e)
+        enforced, detail = await DB.run(work)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     write_log("ACTION" if enforced else "WARN", "SECURITY", "Block SSH IP (firewall)",
               actor=_admin_name(request), ip=_client_ip(request), target=ip,
               detail=detail, status="ok" if enforced else "failed")
     return {"status": "blocked" if enforced else "recorded", "ip": ip,
             "firewall_enforced": enforced, "detail": detail}
+
+@app.post("/api/system/ssh-unblock")
+async def api_ssh_unblock(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    ip = (body.get("ip") or "").strip()
+    if not firewall.valid_ip(ip):
+        return JSONResponse(status_code=400, content={"error": "valid ip required"})
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            return firewall.unblock_ip(conn, ip)
+        finally:
+            DB.release_connection(conn)
+
+    ok, detail = await DB.run(work)
+    write_log("ACTION", "SECURITY", "Unblock IP (firewall)", actor=_admin_name(request),
+              ip=_client_ip(request), target=ip, detail=detail)
+    return {"status": "ok", "removed": ok, "detail": detail}
+
+# ---- Firewall settings ----
+def _firewall_state():
+    conn = DB.get_connection()
+    try:
+        return {"status": firewall.status(),
+                "blocks": firewall.list_blocks(conn),
+                "rules": firewall.list_rules(conn),
+                "ssh_limit": firewall.SSH_FAIL_LIMIT,
+                "ssh_window_minutes": firewall.SSH_FAIL_WINDOW_MINUTES,
+                "offenders": firewall.ssh_offenders(conn)}
+    finally:
+        DB.release_connection(conn)
+
+@app.get("/api/config/firewall")
+async def api_firewall_get(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("firewall_manage"))
+    if denied:
+        return denied
+    return await DB.run(_firewall_state)
+
+@app.post("/api/config/firewall/rule")
+async def api_firewall_rule(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("firewall_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    try:
+        port = int(body.get("port"))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "Enter a port number."})
+    protocol = (body.get("protocol") or "tcp").lower()
+    direction = (body.get("direction") or "in").lower()
+    enabled = bool(body.get("enabled", True))
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            return firewall.set_rule(conn, port, protocol, direction, enabled,
+                                      note=(body.get("note") or ""),
+                                      created_by=_admin_name(request))
+        finally:
+            DB.release_connection(conn)
+
+    try:
+        ok, detail = await DB.run(work)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    write_log("ACTION" if ok else "WARN", "SECURITY",
+              f"Firewall {'allow' if enabled else 'remove'} {port}/{protocol} {direction}",
+              actor=_admin_name(request), ip=_client_ip(request),
+              detail=detail, status="ok" if ok else "failed")
+    return {"status": "ok", "applied": ok, "detail": detail}
+
+@app.delete("/api/config/firewall/rule")
+async def api_firewall_rule_delete(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("firewall_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    try:
+        port = int(body.get("port"))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "Enter a port number."})
+    protocol = (body.get("protocol") or "tcp").lower()
+    direction = (body.get("direction") or "in").lower()
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            return firewall.delete_rule(conn, port, protocol, direction)
+        finally:
+            DB.release_connection(conn)
+
+    await DB.run(work)
+    write_log("ACTION", "SECURITY", f"Firewall rule removed {port}/{protocol} {direction}",
+              actor=_admin_name(request), ip=_client_ip(request))
+    return {"status": "ok"}
+
+@app.post("/api/config/firewall/block")
+async def api_firewall_block(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("firewall_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    ip = (body.get("ip") or "").strip()
+    if not firewall.valid_ip(ip):
+        return JSONResponse(status_code=400, content={"error": "Enter an IP address."})
+
+    def work():
+        conn = DB.get_connection()
+        try:
+            return firewall.block_ip(conn, ip, reason=(body.get("reason") or "Blocked by hand"),
+                                      source="manual", created_by=_admin_name(request))
+        finally:
+            DB.release_connection(conn)
+
+    ok, detail = await DB.run(work)
+    write_log("ACTION" if ok else "WARN", "SECURITY", "Firewall block", actor=_admin_name(request),
+              ip=_client_ip(request), target=ip, detail=detail, status="ok" if ok else "failed")
+    return {"status": "ok", "applied": ok, "detail": detail}
 
 @app.get("/api/system/ssh-status")
 async def api_ssh_status(request: Request):

@@ -10,7 +10,7 @@ def test_registry_covers_all_seven_groups():
     groups = {g.group for g in pu.PERMISSIONS}
     assert groups == {"terminal", "disk", "database", "network",
                       "compute", "services", "logs"}
-    assert len(pu.PERMISSIONS) == 14
+    assert len(pu.PERMISSIONS) == 15
 
 
 def test_group_order_lists_every_group_once():

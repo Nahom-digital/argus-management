@@ -71,6 +71,10 @@ PERMISSIONS = (
 
     Grant("logs_access", "bool", None, False, "logs",
           "Logs section", "Open the Logs tab and everything that reads from it."),
+
+    Grant("firewall_manage", "bool", None, False, "network",
+          "Firewall settings",
+          "Allow or close ports, and block addresses."),
 )
 
 GRANT_KEYS = frozenset(g.key for g in PERMISSIONS)
