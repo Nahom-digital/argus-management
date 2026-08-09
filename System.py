@@ -1,4 +1,4 @@
-# System.py — Server management engine for the MainApp dashboard.
+# System.py, Server management engine for the MainApp dashboard.
 #
 # Supplies the "Server" section of the Main.py control panel:
 #   * static device / OS information (hostname, kernel, CPU model, RAM, boot time…)
@@ -20,7 +20,7 @@ import logging
 from datetime import datetime
 
 # --- Server launch defaults ---------------------------------------------------
-# nginx owns :80 and reverse-proxies to us, so the app binds loopback only —
+# nginx owns :80 and reverse-proxies to us, so the app binds loopback only:
 # nothing but nginx can reach it, and the origin port is never exposed.
 # The LIVE values live in system_settings (server_host / server_port) and are
 # editable from the dashboard Configuration tab, so these literals are only the
@@ -31,7 +31,7 @@ DEFAULT_PORT = 55
 PUBLIC_HOST = "207.180.29.181"
 
 # Fallback port used only if binding the configured port fails at startup (e.g.
-# port 80 without root on a dev box) — keeps the dashboard reachable regardless.
+# port 80 without root on a dev box), keeps the dashboard reachable regardless.
 FALLBACK_PORT = 4041
 
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -214,7 +214,7 @@ def run_command(cmd, timeout=30):
     output. A `cd` to a directory is resolved in-process so the working directory
     persists across calls, like a real interactive shell.
 
-    Runs with the privileges of the Main.py process — launch the server as root
+    Runs with the privileges of the Main.py process, launch the server as root
     (the production box) for true root-terminal access. Admin-gated in Main.py.
     """
     global _term_cwd
@@ -277,11 +277,32 @@ class PtySession:
 
     SHELL = ["bash", "-il"]  # interactive login shell -> reads profile, shows prompt
 
-    def __init__(self, cwd=None, env=None):
+    def __init__(self, cwd=None, env=None, run_as=None):
         self.cwd = cwd or _PROJECT_DIR
         self.env = env
+        self.run_as = run_as  # OS username to drop into, or None to stay as this process's user
         self.pid = None
         self.fd = None
+
+    def _drop_privileges(self):
+        """Runs in the forked child, still as root: switch to self.run_as before
+        exec so a restricted panel user's terminal cannot touch anything the
+        target OS account can't. Any failure here must never fall through to
+        an exec as root, so every error path is a hard exit, not a return."""
+        import pwd
+        try:
+            pw = pwd.getpwnam(self.run_as)
+        except KeyError:
+            os._exit(126)
+        try:
+            os.setgid(pw.pw_gid)
+            os.initgroups(self.run_as, pw.pw_gid)
+            os.setuid(pw.pw_uid)
+        except OSError:
+            os._exit(126)
+        if os.getuid() == 0:
+            os._exit(126)  # setuid silently no-op'd somehow -- refuse to run as root
+        return pw.pw_dir
 
     def spawn(self, rows=24, cols=80):
         import pty
@@ -289,10 +310,17 @@ class PtySession:
         if pid == 0:
             # Child: this process becomes the shell. pty.fork() already made the
             # slave our controlling tty and wired std{in,out,err} to it.
+            home = None
+            if self.run_as:
+                home = self._drop_privileges()
+            chdir_target = home or self.cwd
             try:
-                os.chdir(self.cwd)
+                os.chdir(chdir_target)
             except Exception:
-                pass
+                try:
+                    os.chdir(_PROJECT_DIR if not self.run_as else "/")
+                except Exception:
+                    pass
             env = dict(os.environ)
             env.update({
                 "TERM": "xterm-256color",
@@ -303,12 +331,14 @@ class PtySession:
                         + os.path.join(_PROJECT_DIR, "vendor", "bin") + os.pathsep
                         + env.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
             })
+            if self.run_as:
+                env.update({"HOME": home or "/", "USER": self.run_as, "LOGNAME": self.run_as})
             if self.env:
                 env.update(self.env)
             try:
                 os.execvpe(self.SHELL[0], self.SHELL, env)
             except Exception:
-                # execvpe failed (no bash?) — fall back to plain sh, then bail.
+                # execvpe failed (no bash?), fall back to plain sh, then bail.
                 try:
                     os.execvpe("sh", ["sh", "-i"], env)
                 except Exception:
@@ -396,7 +426,7 @@ class PtySession:
 # =====================================================================
 def top_processes(by="cpu", limit=25):
     """Top processes by CPU or memory. CPU needs two samples, so we prime the
-    per-process counters, briefly sleep, then read — hence offloaded to a worker
+    per-process counters, briefly sleep, then read, hence offloaded to a worker
     thread by Main.py so the event loop never stalls."""
     import psutil
     procs = list(psutil.process_iter(["pid", "name", "username", "memory_percent", "cmdline"]))
@@ -505,6 +535,7 @@ def list_dir(path=None):
                 "is_dir": is_dir,
                 "size_h": "" if is_dir else _human_bytes(size),
                 "downloadable": (not is_dir) and (not _download_blocked(full)),
+                "deletable": (not is_dir) and (not _delete_blocked(full)),
             })
         except Exception:
             continue
@@ -524,10 +555,49 @@ def resolve_download(path):
     return full, None
 
 
+# Whole subtrees a delete must never touch, even for an admin -- a misclick
+# here is not recoverable the way an accidental download is.
+_DELETE_DENY_PREFIXES = ("/etc", "/boot", "/sys", "/proc", "/dev", "/bin", "/sbin",
+                          "/lib", "/lib64", "/usr", "/var/lib/postgresql")
+_DELETE_DENY_EXACT = {"/", "/root", "/home"}
+
+def _delete_blocked(path):
+    if path in _DELETE_DENY_EXACT:
+        return True
+    for prefix in _DELETE_DENY_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return _download_blocked(path)  # never delete secrets, keys, or source either
+
+
+def resolve_delete(path):
+    """Validate a delete request. Directories are refused outright -- this is
+    a file browser, not rm -rf. Returns (abspath, None) or (None, reason)."""
+    full = os.path.realpath(os.path.expanduser(path or ""))
+    if not os.path.exists(full):
+        return None, "not_found"
+    if os.path.isdir(full):
+        return None, "is_directory"
+    if _delete_blocked(full):
+        return None, "blocked"
+    return full, None
+
+
+def delete_file(path):
+    full, reason = resolve_delete(path)
+    if reason:
+        return False, reason
+    try:
+        os.remove(full)
+        return True, None
+    except OSError as e:
+        return False, str(e)
+
+
 # --- Server launch configuration ---------------------------------------------
 def get_server_config():
     """Return the (host, port) Main.py should bind, read from system_settings
-    with the bootstrap defaults as a fallback. Never raises — a DB hiccup just
+    with the bootstrap defaults as a fallback. Never raises, a DB hiccup just
     yields the defaults so the server can still start."""
     host, port = DEFAULT_HOST, DEFAULT_PORT
     try:

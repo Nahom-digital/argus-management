@@ -1,6 +1,6 @@
 # Argus Management Panel
 
-A self-contained FastAPI **server management panel** — live telemetry, an in-browser
+A self-contained FastAPI **server management panel**, live telemetry, an in-browser
 terminal, process/connection views, systemd service control, and a security/activity
 log. It ships as **one easy-to-deploy app**: clone it, run one command, answer a few
 questions, and it's live.
@@ -22,26 +22,28 @@ The wizard does all of it for you:
    retries with `--user`, then `--break-system-packages`, then distro packages, and
    finally builds a private `.venv` and restarts itself inside it. One of those always
    works.
-2. **Makes sure PostgreSQL is installed and running** — installing it with apt / dnf /
-   yum / pacman / zypper / apk / brew and starting the service if it isn't.
+2. **Makes sure PostgreSQL is installed and running**, installing it with apt / dnf /
+   yum / pacman / zypper / apk / brew and starting the service if it isn't. It also
+   installs nginx the same way, best-effort, only the Proxy card in Config needs it,
+   so a failed install there never stops the rest of setup.
 3. **Finds a privileged way into the server**, even when the configured role does not
    exist yet: direct TCP, the local unix socket, and `sudo -u postgres psql` (the
    standard bootstrap path on Debian-likes, which psycopg2 cannot reach on its own).
    Only if all of those fail does it ask you for a superuser login.
 4. **Lists every database on the server** so you can pick one. If there are none it
-   says so plainly and offers to create one — asking for the database name, the
+   says so plainly and offers to create one, asking for the database name, the
    database user, and a password (leave it blank and a strong one is generated).
 5. **Creates the tables this panel needs**, then verifies all of them landed.
-6. **Creates your panel administrator account** — the username and password you sign
+6. **Creates your panel administrator account**, the username and password you sign
    in with. Any leftover insecure `admin`/`admin` account is removed.
 7. **Asks which host and port to bind**, warning you if the port is already taken.
 8. **Offers to install itself as a systemd service.** Say yes and it installs, starts,
-   verifies the port is live, tells you the port, and exits — the panel keeps running
+   verifies the port is live, tells you the port, and exits, the panel keeps running
    and comes back on boot. Say no and it runs in the foreground, warning you that
    closing the terminal stops the panel.
 
 Answers are saved to `deploy.json` (non-secret) and `.env` (mode 0600). Re-running the
-wizard over an existing install is safe — every step is idempotent.
+wizard over an existing install is safe, every step is idempotent.
 
 ## Commands
 
@@ -71,7 +73,7 @@ journalctl -u argus-management -f
 ## Signing in, and getting back in
 
 The panel password is stored only as a PBKDF2-SHA256 hash, so **it cannot be
-looked up** — not in `deploy.json`, not in `.env`. (`DB_PASSWORD` in `.env` is the
+looked up**, not in `deploy.json`, not in `.env`. (`DB_PASSWORD` in `.env` is the
 *PostgreSQL* password, which is a different thing.) There are two supported ways
 to change it.
 
@@ -80,7 +82,7 @@ and use the Account pane. Changing the password signs out every other browser
 using the account.
 
 **You don't.** The wizard writes five single-use recovery codes to `.recovery`
-(mode 0600, git-ignored) — twelve digits each, and the only plaintext copy that
+(mode 0600, git-ignored), twelve digits each, and the only plaintext copy that
 exists; the database keeps salted hashes. On the login page, **"Forgot your
 password?"** asks for your username, one code, and a new password. A code stops
 working the moment it is used, and a successful reset signs out every existing
@@ -96,8 +98,42 @@ the way back.
 
 Guard rails on the recovery endpoint: a wrong username and a wrong code return
 the same message and take the same time (no account enumeration), attempts are
-throttled per-IP and globally, and every attempt — accepted or not — lands in
+throttled per-IP and globally, and every attempt, accepted or not, lands in
 `management_log` under `SECURITY`.
+
+## Config
+
+The Config tab is where the panel administers itself. The admin sees all five
+cards; a staff account only ever sees the ones its grants unlock.
+
+- **User Management.** Create staff accounts with their own login and a
+  narrower set of grants than the admin: terminal access (none, a restricted
+  account of their own, or root), read-only database access, log access, and
+  disk-browser access. A "restricted" terminal grant provisions a real,
+  unprivileged OS account (`useradd`, no password, no SSH key) that the panel
+  drops privileges into before spawning that user's shell, so their terminal
+  can never reach anything the admin's can.
+- **Server Configuration.** The host/port this panel binds to, and SSH access
+  to the box: generate an ed25519 keypair (the public half is added to root's
+  `authorized_keys`, the private half stays on disk and a copy is kept
+  encrypted in Postgres so it can be re-downloaded from here), a reference
+  password field (stored encrypted, informational only, it does not change
+  any real account password), and a password-login-vs-key-only toggle for
+  `sshd`.
+- **Service.** The systemd service list and controls that used to be their
+  own tab.
+- **Database.** A row-level viewer and editor over this panel's own tables
+  only, never anything else that might live in the same Postgres database.
+  Admin gets full read/write plus add-column; a staff account with database
+  access gets read-only.
+- **Proxy.** Detects the nginx server blocks already on the box and lets you
+  add or remove reverse-proxy hosts (domain, target, optional WebSocket
+  support) for ones this panel created. TLS/Let's Encrypt is out of scope
+  here, deliberately, that stays whatever you already use.
+
+Every Config action is re-checked server-side by role, not just hidden in the
+UI, so a staff account can't reach anything past its grants by calling the
+API directly.
 
 ## Files
 
@@ -107,7 +143,11 @@ throttled per-IP and globally, and every attempt — accepted or not — lands i
 | `recovery.py`   | password hashing + single-use recovery codes, shared by the CLI and the panel |
 | `panel.py`      | the FastAPI panel itself (routes, UI, websocket terminal) |
 | `DB.py`         | PostgreSQL pool, admin auth, settings, security/activity logs |
-| `System.py`     | host telemetry, PTY terminal, process/connection helpers |
+| `System.py`     | host telemetry, PTY terminal, process/connection helpers, file browser |
+| `vault.py`      | symmetric encryption for the few secrets that must be read back, not just verified |
+| `ssh_vault.py`  | SSH keypair generation and encrypted storage for the Server Configuration card |
+| `panel_users.py`| staff accounts and their permission grants |
+| `nginx_proxy.py`| detects and manages nginx reverse-proxy hosts for the Proxy card |
 | `static_mgmt/`  | CSS design system + panel JS + icon sprite |
 | `vendor/`       | bundled fonts, xterm.js, icons (no external CDN needed) |
 
@@ -127,13 +167,17 @@ The wizard creates exactly what the panel runs on:
 | `web_fp_block` / `web_login_block` | brute-force blocks by device and by IP |
 | `web_session_log` | issued panel sessions |
 | `http_access_log` | HTTP request/response log |
+| `ssh` | encrypted SSH keypair and reference password for Server Configuration |
+| `panel_user` | staff accounts and their permission grants |
 
-Picking an existing database only adds these tables; nothing already there is touched.
+Picking an existing database only adds these tables; nothing already there is touched,
+and the Database card only ever shows this list, never other tables that might already
+live in the same Postgres database.
 
 ## Configuration
 
 Non-secret runtime choices live in **`deploy.json`**; the DB password lives in **`.env`**
-(mode 0600). Both are git-ignored — see `deploy.example.json` and `.env.example`.
+(mode 0600). Both are git-ignored, see `deploy.example.json` and `.env.example`.
 Environment variables (`DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`,
 `MGMT_BASE`) override both.
 

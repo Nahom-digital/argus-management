@@ -1,8 +1,11 @@
-# secrets & host-specific runtime — never commit these
+# secrets and host-specific runtime, never commit these
 .env
 .recovery
 .session_secret
 .wallet_secret
+.vault_key
+id_ed25519
+id_ed25519.pub
 deploy.json
 
 # python

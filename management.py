@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# management.py — the one-command front door for the Argus Management panel.
+# management.py, the one-command front door for the Argus Management panel.
 #
 #   python3 management.py             interactive setup wizard, then run
 #   python3 management.py --service   install + start the systemd service, then exit
@@ -32,8 +32,10 @@ import hashlib
 import secrets
 import subprocess
 
-# Standard library only, so importing it before the dependency bootstrap is safe.
+# Standard library only, so importing these before the dependency bootstrap is safe.
 import recovery
+import ssh_vault
+import panel_users
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "deploy.json")
@@ -43,7 +45,7 @@ SERVICE_NAME = "argus-management"
 UNIT_PATH = f"/etc/systemd/system/{SERVICE_NAME}.service"
 
 CONNECT_TIMEOUT = 5          # seconds for a single PostgreSQL connection attempt
-SEP = "\x1f"                 # ASCII unit separator — psql field delimiter
+SEP = "\x1f"                 # ASCII unit separator, psql field delimiter
 
 DEFAULTS = {
     "db_host": "127.0.0.1",
@@ -67,7 +69,7 @@ def _c(text, code):
 
 def banner():
     print()
-    print(_c("  ARGUS · Management panel — deployment setup", "1;36"))
+    print(_c("  ARGUS · Management panel, deployment setup", "1;36"))
     print(_c("  " + "─" * 46, "2;36"))
 
 def head(text):
@@ -199,6 +201,7 @@ DEPENDENCIES = (
     ("starlette",  ("starlette",),       ("python3-starlette",)),
     ("uvicorn",    ("uvicorn",),         ("python3-uvicorn",)),
     ("websockets", ("websockets",),      ("python3-websockets",)),  # in-browser terminal
+    ("cryptography", ("cryptography",),  ("python3-cryptography",)),  # SSH vault encryption
 )
 
 def _importable(module):
@@ -227,7 +230,7 @@ def _ensure_pip():
     rc, _, _ = run([sys.executable, "-m", "pip", "--version"], timeout=60)
     if rc == 0:
         return True
-    step("pip is missing — bootstrapping it with ensurepip")
+    step("pip is missing, bootstrapping it with ensurepip")
     run([sys.executable, "-m", "ensurepip", "--upgrade"], timeout=300)
     rc, _, _ = run([sys.executable, "-m", "pip", "--version"], timeout=60)
     if rc == 0:
@@ -288,7 +291,7 @@ def _create_venv():
     if rc != 0:
         # Debian ships `venv` without ensurepip until python3-venv is installed.
         if "ensurepip" in stderr or "python3-venv" in stderr or rc == 1:
-            info("virtualenv support is missing — installing it from the distro")
+            info("virtualenv support is missing, installing it from the distro")
             ver = f"python{sys.version_info.major}.{sys.version_info.minor}-venv"
             _apt_install([ver]) or _apt_install(["python3-venv"])
             shutil.rmtree(VENV_DIR, ignore_errors=True)
@@ -321,14 +324,14 @@ def ensure_python_deps():
         return
 
     # If a venv already exists and the system interpreter is short of packages,
-    # the venv is almost certainly where they live — go there first.
+    # the venv is almost certainly where they live, go there first.
     venv_py = _venv_python()
     if venv_py and not _running_inside_venv() and os.environ.get("ARGUS_BOOTSTRAPPED") != "1":
         _reexec(venv_py)
 
     names = ", ".join(m[0] for m in missing)
     step(f"missing: {names}")
-    step("installing them now — no manual pip step required")
+    step("installing them now, no manual pip step required")
 
     if _ensure_pip():
         specs = [spec for dep in missing for spec in dep[1][:1]]
@@ -341,7 +344,7 @@ def ensure_python_deps():
             if rc != 0:
                 reason = "externally-managed environment" if "externally-managed" in stderr \
                     else (stderr.strip().splitlines() or [""])[-1][:120]
-                info(f"{label} did not work ({reason}) — trying the next approach")
+                info(f"{label} did not work ({reason}), trying the next approach")
     else:
         warn("pip is unavailable in this interpreter")
 
@@ -365,7 +368,7 @@ def ensure_python_deps():
                 + ", ".join(m[0] for m in missing))
             info("install them manually, then re-run:  python3 management.py")
             sys.exit(1)
-        step("the system refuses to install packages — using a private virtualenv instead")
+        step("the system refuses to install packages, using a private virtualenv instead")
         py = _create_venv()
         if not py:
             err("could not build a virtualenv; cannot continue")
@@ -382,7 +385,7 @@ def ensure_python_deps():
 
 
 def python_for_service():
-    """The interpreter systemd should launch — the venv's, when we built one."""
+    """The interpreter systemd should launch, the venv's, when we built one."""
     return _venv_python() or sys.executable
 
 
@@ -453,11 +456,52 @@ PG_PACKAGES = {
     "brew":    ["postgresql"],
 }
 
+NGINX_PACKAGES = {
+    "apt-get": ["nginx"], "dnf": ["nginx"], "yum": ["nginx"],
+    "pacman":  ["nginx"], "zypper": ["nginx"], "apk": ["nginx"], "brew": ["nginx"],
+}
+
+def nginx_installed():
+    return shutil.which("nginx") is not None
+
+def install_nginx():
+    """Install nginx, needed for the panel's reverse proxy manager. Never
+    fatal: the panel works without it, that feature is just unavailable."""
+    if nginx_installed():
+        return True
+    mgr = detect_package_manager()
+    if not mgr:
+        warn("no supported package manager found -- install nginx manually if you want the proxy manager")
+        return False
+    packages = NGINX_PACKAGES[mgr]
+    step(f"installing nginx with {mgr}: {' '.join(packages)}")
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    if mgr == "brew":
+        rc, _, stderr = run(["brew", "install"] + packages, timeout=1800)
+    elif mgr == "apt-get":
+        run(sudo_prefix() + ["apt-get", "update", "-qq"], timeout=900, env=env)
+        rc, _, stderr = run(sudo_prefix() + ["apt-get", "install", "-y"] + packages, timeout=1800, env=env)
+    elif mgr in ("dnf", "yum"):
+        rc, _, stderr = run(sudo_prefix() + [mgr, "install", "-y"] + packages, timeout=1800)
+    elif mgr == "pacman":
+        rc, _, stderr = run(sudo_prefix() + ["pacman", "-Sy", "--noconfirm"] + packages, timeout=1800)
+    elif mgr == "zypper":
+        rc, _, stderr = run(sudo_prefix() + ["zypper", "--non-interactive", "install"] + packages, timeout=1800)
+    else:
+        rc, _, stderr = run(sudo_prefix() + ["apk", "add"] + packages, timeout=1800)
+    if rc != 0:
+        warn(f"nginx install failed: {stderr.strip()[:300]} -- the proxy manager will stay unavailable")
+        return False
+    run(sudo_prefix() + ["systemctl", "enable", "nginx"], timeout=60)
+    run(sudo_prefix() + ["systemctl", "start", "nginx"], timeout=60)
+    ok("nginx installed")
+    return True
+
 def install_postgres():
     """Install a PostgreSQL server with whatever package manager is present."""
     mgr = detect_package_manager()
     if not mgr:
-        err("no supported package manager found — install PostgreSQL manually")
+        err("no supported package manager found, install PostgreSQL manually")
         return False
     packages = PG_PACKAGES[mgr]
     step(f"installing PostgreSQL with {mgr}: {' '.join(packages)}")
@@ -499,7 +543,7 @@ def initialize_cluster():
     try:
         already_initialised = bool(os.listdir(data_dir))
     except OSError:
-        already_initialised = False          # missing dir — initdb will create it
+        already_initialised = False          # missing dir, initdb will create it
     if not already_initialised:
         run(sudo_prefix() + ["-u", "postgres", initdb, "-D", data_dir], timeout=900)
 
@@ -549,7 +593,7 @@ def ensure_postgres(host, port):
 
     if host not in ("127.0.0.1", "localhost", "::1") and not host.startswith("/"):
         err(f"cannot reach PostgreSQL at {host}:{port}")
-        info("that is a remote host — start it there, or point the wizard somewhere else")
+        info("that is a remote host, start it there, or point the wizard somewhere else")
         return False
 
     server_installed = bool(find_pg_binary("postgres") or find_pg_binary("initdb")
@@ -557,7 +601,7 @@ def ensure_postgres(host, port):
     if not server_installed:
         warn("PostgreSQL is not installed on this machine")
         if not ask_yes("Install PostgreSQL now?", True):
-            err("PostgreSQL is required — cannot continue")
+            err("PostgreSQL is required, cannot continue")
             return False
         if not can_escalate():
             err("installing packages needs root (install sudo, or re-run as root)")
@@ -567,7 +611,7 @@ def ensure_postgres(host, port):
             return False
         initialize_cluster()
     else:
-        warn("PostgreSQL is installed but not accepting connections — starting it")
+        warn("PostgreSQL is installed but not accepting connections, starting it")
 
     if not can_escalate():
         err("starting the database needs root (install sudo, or re-run as root)")
@@ -586,14 +630,14 @@ def ensure_postgres(host, port):
 # 3. A privileged way into the server
 # --------------------------------------------------------------------------- #
 # The old wizard gave up the moment psycopg2 could not authenticate with the
-# credentials typed at the prompt — which is exactly the state a fresh server is
+# credentials typed at the prompt, which is exactly the state a fresh server is
 # in, because the role does not exist yet. Instead we try every channel a real
 # operator would try, in order, and keep the first that works.
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,62}$")
 
 def valid_ident(name):
-    """Accept only plain identifiers — keeps names out of SQL injection range."""
+    """Accept only plain identifiers, keeps names out of SQL injection range."""
     return bool(name) and bool(_IDENT_RE.match(name))
 
 def qident(name):
@@ -663,7 +707,7 @@ class Psycopg2Channel(SQLChannel):
 
 
 class PsqlChannel(SQLChannel):
-    """Shell out to psql — the route that works when TCP auth does not.
+    """Shell out to psql, the route that works when TCP auth does not.
 
     On Debian-likes the postgres superuser is reachable only as the `postgres`
     OS user over the local socket (peer authentication), so `sudo -u postgres
@@ -722,7 +766,7 @@ def _candidate_channels(cfg):
     os_user = getpass.getuser()
     psql = find_psql()
 
-    # Only probe a local socket directory that genuinely has a server on it —
+    # Only probe a local socket directory that genuinely has a server on it,
     # otherwise every extra candidate costs a full connect timeout.
     hosts = [host]
     sock_dir = socket_dir_has_server(port)
@@ -740,7 +784,7 @@ def _candidate_channels(cfg):
     # 1. exactly what the operator configured
     if user:
         add(Psycopg2Channel(host, port, user, password))
-    # 2. the superuser over the local socket — trust/peer auth on a fresh cluster
+    # 2. the superuser over the local socket, trust/peer auth on a fresh cluster
     for h in hosts:
         for u in (user, "postgres", os_user):
             if not u:
@@ -749,7 +793,7 @@ def _candidate_channels(cfg):
             if password:
                 add(Psycopg2Channel(h, port, u, password))
     # 3. psql as the postgres OS user (the Debian bootstrap path).
-    #    Only when sudo will not stop to ask for a password — discovery must
+    #    Only when sudo will not stop to ask for a password, discovery must
     #    never block. obtain_admin_channel() primes sudo and retries if needed.
     if psql:
         if sudo_is_cached():
@@ -776,7 +820,7 @@ def discover_admin_channel(cfg, quiet=False):
         channel, who = best
         if not quiet:
             ok(f"connected as {_c(who, '1;37')} via {channel.label}")
-            warn(f"'{who}' cannot create databases or roles — "
+            warn(f"'{who}' cannot create databases or roles, "
                  "you can still pick an existing database")
         return channel
     return None
@@ -792,7 +836,7 @@ def obtain_admin_channel(cfg):
     warn("none of the automatic connection methods worked")
     info("that usually means the server only accepts password logins")
     if have_sudo() and not sudo_is_cached() and sys.stdin.isatty():
-        info("trying again with sudo — you may be asked for your password")
+        info("trying again with sudo, you may be asked for your password")
         if prime_sudo("reach PostgreSQL as the 'postgres' system user"):
             channel = discover_admin_channel(cfg)
             if channel:
@@ -859,7 +903,7 @@ def ensure_role(channel, name, password):
 
 def create_database(channel, name, owner):
     if database_exists(channel, name):
-        warn(f"database '{name}' already exists — reusing it")
+        warn(f"database '{name}' already exists, reusing it")
     else:
         channel.execute(f"CREATE DATABASE {qident(name)} OWNER {qident(owner)}")
         ok(f"database '{name}' created")
@@ -877,11 +921,11 @@ def grant_database_access(channel, dbname, role):
         try:
             channel.execute(sql, db=db)
         except Exception:
-            pass        # best effort — the owner already has most of these
+            pass        # best effort, the owner already has most of these
 
 def generate_password(length=24):
     alphabet = ("abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-                "-_=+.:")     # no quotes, no '#' — safe in .env and in SQL literals
+                "-_=+.:")     # no quotes, no '#', safe in .env and in SQL literals
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 def ask_identifier(prompt, default=""):
@@ -904,7 +948,7 @@ def ask_new_password(subject):
             continue
         again = ask_secret("Repeat the password", allow_empty=True)
         if again != pw:
-            warn("the passwords did not match — try again")
+            warn("the passwords did not match, try again")
             continue
         return pw
 
@@ -992,7 +1036,7 @@ def use_existing_database_flow(channel, cfg, name):
             if channel.privileged:
                 ensure_role(channel, role, password)
             else:
-                warn("cannot change the password — not a privileged account")
+                warn("cannot change the password, not a privileged account")
     else:
         if not channel.privileged:
             err(f"role '{role}' does not exist and this account cannot create it")
@@ -1008,7 +1052,7 @@ def use_existing_database_flow(channel, cfg, name):
 
 
 # --------------------------------------------------------------------------- #
-# 5. Schema — the tables this panel actually runs on
+# 5. Schema, the tables this panel actually runs on
 # --------------------------------------------------------------------------- #
 # Mirrors what DB.py and panel.py expect at runtime. Everything is IF NOT EXISTS
 # so running the wizard again over a live database is safe.
@@ -1149,6 +1193,8 @@ SCHEMA = (
         "CREATE INDEX IF NOT EXISTS idx_hal_ip   ON http_access_log (ip)",
         "CREATE INDEX IF NOT EXISTS idx_hal_path ON http_access_log (path)",
     )),
+    ("SSH access settings", ssh_vault.SCHEMA),
+    ("panel staff accounts", panel_users.SCHEMA),
 )
 
 # Columns added to tables that may predate this version of the schema. Each is
@@ -1167,7 +1213,7 @@ SCHEMA_UPGRADES = (
 SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",
                  "management_log", "admin_action", "ssh_log", "web_login_log",
                  "web_fp_block", "web_login_block", "web_session_log",
-                 "http_access_log")
+                 "http_access_log", "ssh", "panel_user")
 
 
 def app_connection(cfg):
@@ -1266,7 +1312,7 @@ def verify_schema(cfg, channel=None):
 
 
 # --------------------------------------------------------------------------- #
-# 6. pg_hba repair — only when the panel's own login is refused
+# 6. pg_hba repair, only when the panel's own login is refused
 # --------------------------------------------------------------------------- #
 def repair_pg_hba(channel, cfg):
     """Prepend a rule allowing the panel's role to log in over loopback TCP.
@@ -1288,7 +1334,7 @@ def repair_pg_hba(channel, cfg):
 
     step(f"adding a login rule to {hba}")
     if not can_escalate():
-        warn("editing pg_hba.conf needs root — skipping")
+        warn("editing pg_hba.conf needs root, skipping")
         return False
     prime_sudo("edit pg_hba.conf")
 
@@ -1395,7 +1441,7 @@ def setup_admin_account(cfg):
             warn(problem.lower().rstrip("."))
             continue
         if ask_secret("Repeat the admin password") != password:
-            warn("the passwords did not match — try again")
+            warn("the passwords did not match, try again")
             continue
         break
 
@@ -1446,12 +1492,12 @@ def issue_recovery_codes(cfg, username, announce=True):
 
     if announce:
         head("Account recovery codes")
-        info("if you ever forget the password, these get you back in — one use each")
+        info("if you ever forget the password, these get you back in, one use each")
         for i, code in enumerate(codes, 1):
             print(f"    {_c(str(i) + '.', '2;37')}  {_c(recovery.format_code(code), '1;37')}")
         print()
         ok(f"saved to {path} (owner-only, 0600)")
-        info(f"only the hashes are stored in the database — {recovery.RECOVERY_FILENAME}")
+        info(f"only the hashes are stored in the database, {recovery.RECOVERY_FILENAME}")
         info("is the sole plaintext copy, so keep it somewhere safe and offline")
         warn("anyone holding a code can take over the panel")
     return codes
@@ -1502,7 +1548,7 @@ def save_config(cfg):
 
 def write_env(cfg):
     lines = [
-        "# Written by management.py — keep out of version control.",
+        "# Written by management.py, keep out of version control.",
         f"DB_NAME={cfg['db_name']}",
         f"DB_USER={cfg['db_user']}",
         f"DB_PASSWORD={cfg['db_password']}",
@@ -1549,7 +1595,7 @@ def choose_binding(cfg):
             warn(f"port {port} needs root; the service can use it but a "
                  "foreground run cannot")
         if not port_available(cfg["host"], port):
-            # Our own service holding the port is fine — we restart it later.
+            # Our own service holding the port is fine, we restart it later.
             if service_is_active():
                 info(f"port {port} is currently held by {SERVICE_NAME} "
                      "(it will be restarted)")
@@ -1563,10 +1609,10 @@ def choose_binding(cfg):
 
     # A sub-path is only correct when a reverse proxy mounts the panel under one.
     # Setting it for a plain local install makes the browser ask for
-    # "<base>/static/dash.css", which this app does not serve at the root — the
+    # "<base>/static/dash.css", which this app does not serve at the root, the
     # page then loads unstyled. Say so plainly instead of just showing a default.
     print()
-    info("URL base path — leave this EMPTY unless a reverse proxy mounts the")
+    info("URL base path, leave this EMPTY unless a reverse proxy mounts the")
     info("panel under a sub-path of a bigger site (e.g. example.com/management).")
     info("For a normal or local install, empty is what you want.")
     while True:
@@ -1583,7 +1629,7 @@ def choose_binding(cfg):
         if ask_yes(f"Keep the base path '{base}'?", False):
             cfg["base_path"] = base
             break
-        info("cleared — leaving the base path empty")
+        info("cleared, leaving the base path empty")
         cfg["base_path"] = ""
         break
     return cfg
@@ -1604,7 +1650,7 @@ def service_is_active():
 def build_unit(cfg):
     python = python_for_service()
     return f"""[Unit]
-Description=Argus Management — Server Management Panel (FastAPI)
+Description=Argus Management, Server Management Panel (FastAPI)
 Documentation=https://github.com/Nahom-digital/argus-management
 After=network-online.target postgresql.service
 Wants=network-online.target
@@ -1730,7 +1776,7 @@ def is_git_checkout():
 def restart_service(cfg):
     """Restart the systemd unit and confirm it comes back listening."""
     if not systemd_available() or not os.path.exists(UNIT_PATH):
-        warn(f"{SERVICE_NAME} is not installed as a service — nothing to restart")
+        warn(f"{SERVICE_NAME} is not installed as a service, nothing to restart")
         info("run it in the foreground with:  python3 management.py --serve")
         info("or install the service with:    python3 management.py --service")
         return False
@@ -1740,7 +1786,7 @@ def restart_service(cfg):
     try:
         with open(UNIT_PATH) as f:
             if f.read() != build_unit(cfg):
-                step("service definition changed — rewriting the unit")
+                step("service definition changed, rewriting the unit")
                 if write_unit(cfg):
                     run(sudo_prefix() + ["systemctl", "daemon-reload"], timeout=120)
     except OSError:
@@ -1753,7 +1799,7 @@ def restart_service(cfg):
         if any("password" in ln or "terminal is required" in ln for ln in lines):
             err("restarting the service needs root, and sudo could not ask for "
                 "your password here")
-            info("the code is already updated — finish it with:")
+            info("the code is already updated, finish it with:")
             print(_c(f"      sudo systemctl restart {SERVICE_NAME}", "1;37"))
         else:
             err(f"could not restart {SERVICE_NAME}: {(lines or [''])[-1][:200]}")
@@ -1777,7 +1823,7 @@ def upgrade_mode():
     head("Upgrading from GitHub")
 
     if not shutil.which("git"):
-        err("git is not installed — cannot pull updates")
+        err("git is not installed, cannot pull updates")
         return 1
     if not is_git_checkout():
         err(f"{HERE} is not a git checkout, so there is nothing to pull")
@@ -1814,7 +1860,7 @@ def upgrade_mode():
     incoming = [ln for ln in log.splitlines() if ln.strip()]
 
     if not incoming:
-        ok("already up to date — no new commits on origin")
+        ok("already up to date, no new commits on origin")
         updated = False
     else:
         print(f"  {_c(len(incoming), '1;37')} new commit(s) to apply:")
@@ -1850,9 +1896,9 @@ def upgrade_mode():
             else:
                 ok("database schema already up to date")
         else:
-            warn(f"skipping the schema check — database unreachable: {reason}")
+            warn(f"skipping the schema check, database unreachable: {reason}")
     else:
-        warn("no deploy.json yet — run the setup wizard before serving")
+        warn("no deploy.json yet, run the setup wizard before serving")
         return 1
 
     head("Restarting")
@@ -1918,7 +1964,7 @@ def show_status():
     if os.path.exists(CONFIG_PATH):
         ok(f"deploy.json: {CONFIG_PATH}")
     else:
-        warn("deploy.json does not exist — run the wizard first")
+        warn("deploy.json does not exist, run the wizard first")
     info(f"database:  {cfg['db_user']}@{cfg['db_host']}:{cfg['db_port']}/{cfg['db_name']}")
     info(f"binding:   {cfg['host']}:{cfg['port']}{cfg.get('base_path') or ''}")
     info(f"python:    {python_for_service()}")
@@ -1952,7 +1998,7 @@ def show_status():
                         for username, _ in admins:
                             unused, total = recovery.remaining(conn, username)
                             if total == 0:
-                                warn(f"'{username}' has no recovery codes — "
+                                warn(f"'{username}' has no recovery codes, "
                                      "run:  python3 management.py --recovery-codes")
                             elif unused == 0:
                                 warn(f"'{username}' has used all {total} recovery codes")
@@ -1972,7 +2018,7 @@ def show_status():
     if not systemd_available():
         info("systemd is not available on this host")
     elif not os.path.exists(UNIT_PATH):
-        info(f"{SERVICE_NAME} is not installed — "
+        info(f"{SERVICE_NAME} is not installed, "
              "run:  python3 management.py --service")
     else:
         rc, out, _ = run(["systemctl", "is-active", SERVICE_NAME], timeout=30)
@@ -1985,7 +2031,7 @@ def recovery_codes_mode():
     """`--recovery-codes`: mint a fresh set, retiring whatever came before."""
     banner()
     if not os.path.exists(CONFIG_PATH):
-        err("no deploy.json yet — run the setup wizard first")
+        err("no deploy.json yet, run the setup wizard first")
         info("  python3 management.py")
         return 1
     cfg = load_config()
@@ -1999,7 +2045,7 @@ def recovery_codes_mode():
 
     admins = existing_admins(cfg)
     if not admins:
-        err("there is no panel admin account yet — run the wizard first")
+        err("there is no panel admin account yet, run the wizard first")
         return 1
 
     if len(admins) == 1:
@@ -2040,6 +2086,7 @@ def wizard():
             warn("a port must be a number")
     if not ensure_postgres(cfg["db_host"], cfg["db_port"]):
         sys.exit(1)
+    install_nginx()  # best-effort -- only the Proxy page in Config needs it
 
     # --- 3. a privileged connection ---------------------------------------- #
     channel = obtain_admin_channel(cfg)
@@ -2059,7 +2106,7 @@ def wizard():
 
     # --- 6. tables ---------------------------------------------------------- #
     if not apply_schema(cfg, channel):
-        err("the schema is incomplete — the panel would not run correctly")
+        err("the schema is incomplete, the panel would not run correctly")
         sys.exit(1)
 
     # --- 7. the admin account ---------------------------------------------- #
@@ -2085,7 +2132,7 @@ def wizard():
             sys.exit(1)
 
     print()
-    warn("running in the FOREGROUND — this terminal now owns the panel")
+    warn("running in the FOREGROUND, this terminal now owns the panel")
     info("if you exit here (Ctrl+C) or close this terminal, the panel stops too")
     info("to run it as a background service instead, run:")
     print(_c("      python3 management.py --service", "1;37"))
@@ -2097,7 +2144,7 @@ def service_mode():
     """`--service`: install + start the service from an existing config, then exit."""
     banner()
     if not os.path.exists(CONFIG_PATH):
-        err("no deploy.json yet — run the setup wizard first")
+        err("no deploy.json yet, run the setup wizard first")
         info("  python3 management.py")
         sys.exit(1)
     cfg = load_config()
@@ -2117,7 +2164,7 @@ def service_mode():
 
 
 USAGE = """
-  Argus Management — deployment front door
+  Argus Management, deployment front door
 
     python3 management.py             run the setup wizard, then start the panel
     python3 management.py --service   install + start the systemd service, then exit

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Management.py — standalone Server Management panel (systemd service: management).
+# Management.py, standalone Server Management panel (systemd service: management).
 #
 # A self-contained FastAPI control panel that runs ALONGSIDE (and independently of)
 # Main.py, reusing the existing infrastructure of the MainApp box:
@@ -45,13 +45,18 @@ import uvicorn
 import DB
 import System
 import recovery
+import panel_users
+import ssh_vault
+import vault
+import nginx_proxy
+from psycopg2 import sql as pg_sql
 
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_DIR = os.path.join(_PROJECT_DIR, "static_mgmt")
 
 # Public path this panel is published under. MainApp owns the domain root
 # (webview, webhook, bot admin), so nginx routes only <MGMT_BASE>/… here and
-# strips the prefix before proxying — the routes below stay mounted at "/".
+# strips the prefix before proxying, the routes below stay mounted at "/".
 # Everything the browser is *told* to fetch (assets, API calls, redirects,
 # websocket) must carry the prefix back, which is what this constant is for.
 # Set MGMT_BASE="" to serve at the domain root again (must match nginx).
@@ -66,7 +71,7 @@ logging.basicConfig(level=logging.INFO,
 SERVER_RUNTIME = {"host": None, "port": None}
 
 # ---------------------------------------------------------------------------
-# Session token — the same scheme Main.py uses, signed with the SAME secret.
+# Session token, the same scheme Main.py uses, signed with the SAME secret.
 # ---------------------------------------------------------------------------
 def _load_jwt_secret() -> str:
     path = os.path.join(_PROJECT_DIR, ".session_secret")
@@ -179,7 +184,7 @@ def _ingress_allowed(ip: str) -> bool:
 def _hop_ip(request: Request) -> str:
     """Who actually connected to our public edge. nginx fronts this panel on
     loopback, so the socket peer is 127.0.0.1 and the real peer nginx saw is in
-    X-Real-IP — trustworthy only because it arrived over loopback."""
+    X-Real-IP, trustworthy only because it arrived over loopback."""
     peer = request.client.host if request.client else ""
     if _is_local_ip(peer):
         real = request.headers.get("x-real-ip", "").strip()
@@ -220,8 +225,8 @@ class _BasePathStrip:
     """Accept <MGMT_BASE>/… as well as /… .
 
     Every route below is registered at a bare path because nginx strips the
-    public prefix before proxying. Reached directly — no proxy, or a proxy that
-    forwards the prefix intact — the browser asks for "<MGMT_BASE>/login" and
+    public prefix before proxying. Reached directly, no proxy, or a proxy that
+    forwards the prefix intact, the browser asks for "<MGMT_BASE>/login" and
     "<MGMT_BASE>/static/dash.css", which 404 and leave the page unstyled. Taking
     a leading MGMT_BASE off the path here makes both shapes route identically,
     so the panel is no longer dependent on someone else rewriting URLs for it.
@@ -268,7 +273,7 @@ class _SecurityHeaders(BaseHTTPMiddleware):
         return response
 
 # ---------------------------------------------------------------------------
-# management_log — structured event/audit table owned by this panel.
+# management_log, structured event/audit table owned by this panel.
 # ---------------------------------------------------------------------------
 LOG_LEVELS = ("INFO", "WARN", "ERROR", "ACTION")
 LOG_CATEGORIES = ("AUTH", "SERVICE", "TERMINAL", "SYSTEM", "SECURITY")
@@ -544,7 +549,7 @@ def _get_current_ssh_sessions() -> list:
     return sessions
 
 # ---------------------------------------------------------------------------
-# Management bind config — kept in its OWN system_settings keys so it never
+# Management bind config, kept in its OWN system_settings keys so it never
 # clashes with Main.py's server_host/server_port.
 # ---------------------------------------------------------------------------
 def get_mgmt_config():
@@ -578,7 +583,7 @@ def set_mgmt_config(host, port):
     return host, port
 
 # ===========================================================================
-# Front-end — reuses Main.py's CSS design system + icon sprite from static_mgmt.
+# Front-end, reuses Main.py's CSS design system + icon sprite from static_mgmt.
 # ===========================================================================
 def _read_static(name: str) -> str:
     try:
@@ -590,8 +595,210 @@ def _read_static(name: str) -> str:
 
 _ICON_SPRITE = _read_static("sprite.html")
 
-_NAV = [("server", "Server", "ic-server"), ("services", "Services", "ic-sliders-horizontal"),
+_NAV = [("server", "Server", "ic-server"), ("config", "Config", "ic-settings"),
         ("terminal", "Terminal", "ic-monitor"), ("logs", "Logs", "ic-shield-alert")]
+
+def _visible_nav(perms: dict):
+    """Which top-level tabs this identity gets. The admin sees everything;
+    a staff account only sees what its grants unlock."""
+    role = perms.get("role")
+    is_admin = role == "admin"
+    out = []
+    for k, label, ic in _NAV:
+        if k == "terminal" and perms.get("terminal_access", "none") == "none":
+            continue
+        if k == "logs" and not (is_admin or perms.get("logs_access")):
+            continue
+        if k == "config" and not (is_admin or perms.get("database_access")):
+            continue
+        out.append((k, label, ic))
+    return out
+
+def _config_cards(perms: dict):
+    """Which Config sub-pages this identity may open."""
+    if perms.get("role") == "admin":
+        return ["users", "server", "service", "database", "proxy"]
+    if perms.get("database_access"):
+        return ["database"]
+    return []
+
+_CONFIG_CARD_META = {
+    "users":    ("User Management", "ic-users",
+                 "Create staff accounts and grant terminal, database, log and disk access."),
+    "server":   ("Server Configuration", "ic-server",
+                 "Where this panel listens, and SSH access to the box."),
+    "service":  ("Service", "ic-sliders-horizontal",
+                 "Start, stop and inspect systemd services."),
+    "database": ("Database", "ic-database",
+                 "Browse and edit the tables this panel uses."),
+    "proxy":    ("Proxy", "ic-globe",
+                 "Reverse proxy hosts served by nginx."),
+}
+
+_CONFIG_BACK = (
+    '<button class="db-action-btn config-back" onclick="configBack()">'
+    '<svg class="ic"><use href="#ic-chevron-left"/></svg>Back</button>'
+)
+
+def _config_sub_users():
+    return f"""
+  <div class="config-sub" data-cfgsub="users" hidden>
+    {_CONFIG_BACK}
+    <div class="mgmt-h2">User Management</div>
+    <div class="cfg-card">
+      <div class="device-title">Staff accounts</div>
+      <div class="settings-subtitle" style="margin:6px 0 14px;">Accounts you create for people who should not have the full admin login.</div>
+      <div id="user-list"><div class="empty-state">Loading&hellip;</div></div>
+    </div>
+    <div class="cfg-card" style="margin-top:18px;">
+      <div class="device-title">Add a user</div>
+      <div class="field-group"><label class="field-label" for="nu-username">Username</label>
+        <input class="field-input" id="nu-username" type="text" autocomplete="off" spellcheck="false"></div>
+      <div class="field-group"><label class="field-label" for="nu-password">Password</label>
+        <div class="field-hint">At least 8 characters, and not only digits.</div>
+        <input class="field-input" id="nu-password" type="password" autocomplete="new-password"></div>
+      <div class="field-group"><label class="field-label" for="nu-terminal">Terminal access</label>
+        <select class="field-input" id="nu-terminal">
+          <option value="none">No terminal access</option>
+          <option value="limited">Restricted (own system account)</option>
+          <option value="root">Root</option>
+        </select></div>
+      <div class="field-group perm-checks">
+        <label class="perm-check"><input type="checkbox" id="nu-db">Database (read only)</label>
+        <label class="perm-check"><input type="checkbox" id="nu-logs">Logs</label>
+        <label class="perm-check"><input type="checkbox" id="nu-disk">Disk files</label>
+      </div>
+      <button class="save-btn" id="nu-create" onclick="createPanelUser()">Create User</button>
+      <div class="save-feedback" id="nu-feedback"></div>
+    </div>
+  </div>"""
+
+def _config_sub_server():
+    return f"""
+  <div class="config-sub" data-cfgsub="server" hidden>
+    {_CONFIG_BACK}
+    <div class="mgmt-h2">Server Configuration</div>
+    <div class="cfg-card">
+      <div class="device-title">Management Launch Configuration</div>
+      <div class="settings-subtitle" style="margin:6px 0 18px;">Host and port this panel binds (HTTP). Applies on next restart of the <code>management</code> service.</div>
+      <div class="field-group"><label class="field-label" for="cfg-host">Host</label>
+        <div class="field-hint">Use <code>0.0.0.0</code> for every interface.</div>
+        <input class="field-input" id="cfg-host" type="text" placeholder="0.0.0.0" spellcheck="false" autocomplete="off">
+        <div class="host-chips" id="host-chips"></div></div>
+      <div class="field-group"><label class="field-label" for="cfg-port">Port</label>
+        <div class="field-hint">Standard HTTP is <code>80</code>.</div>
+        <input class="field-input" id="cfg-port" type="number" min="1" max="65535" placeholder="80" autocomplete="off"></div>
+      <button class="save-btn" id="cfg-save-btn" onclick="saveServerConfig()">Save Configuration</button>
+      <div class="save-feedback" id="cfg-feedback"></div>
+      <div class="cfg-running" id="cfg-running"></div>
+    </div>
+    <div class="cfg-card" style="margin-top:18px;">
+      <div class="device-title">SSH access</div>
+      <div class="settings-subtitle" style="margin:6px 0 16px;">The SSH daemon, a keypair for signing in as root, and whether password login is allowed at all.
+        <svg class="ic" style="color:var(--danger)"><use href="#ic-triangle-alert"/></svg> If SSH is your only way in, keep another route before disabling anything here.</div>
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+        <span class="cfg-running" id="ssh-state">Checking&hellip;</span>
+        <button class="save-btn" id="ssh-toggle-btn" onclick="toggleSsh()" disabled>&hellip;</button></div>
+      <div class="save-feedback" id="ssh-feedback"></div>
+
+      <div id="ssh-key-block" style="margin-top:18px;">
+        <div class="cfg-running" id="ssh-key-state">Checking for a key&hellip;</div>
+        <button class="save-btn" id="ssh-genkey-btn" onclick="generateSshKey()" hidden>Generate SSH key</button>
+        <div id="ssh-key-details" hidden>
+          <div class="field-group"><label class="field-label">Public key</label>
+            <textarea class="field-input" id="ssh-pubkey" rows="3" readonly spellcheck="false"></textarea></div>
+          <button class="db-action-btn" onclick="downloadSshPrivateKey()"><svg class="ic"><use href="#ic-download"/></svg>Download private key</button>
+          <div class="settings-subtitle" id="ssh-fingerprint" style="margin-top:8px;"></div>
+        </div>
+        <div class="save-feedback" id="ssh-key-feedback"></div>
+      </div>
+
+      <div class="field-group" style="margin-top:18px;"><label class="field-label" for="ssh-password">Root password (reference only)</label>
+        <div class="field-hint">Stored encrypted for your own records. Saving it here does not change any account's real password on this server.</div>
+        <input class="field-input" id="ssh-password" type="password" autocomplete="off"></div>
+      <button class="save-btn" id="ssh-password-save" onclick="saveSshPassword()">Save</button>
+      <div class="save-feedback" id="ssh-password-feedback"></div>
+
+      <div class="field-group" style="margin-top:18px;">
+        <label class="perm-check"><input type="checkbox" id="ssh-allow-password" onchange="toggleSshPasswordLogin()">Allow password login (uncheck for key-only)</label>
+      </div>
+      <div class="save-feedback" id="ssh-login-mode-feedback"></div>
+    </div>
+  </div>"""
+
+def _config_sub_service():
+    return f"""
+  <div class="config-sub" data-cfgsub="service" hidden>
+    {_CONFIG_BACK}
+    <div class="mgmt-h2">Systemd services</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">
+      <input id="svc-search" class="field-input" style="max-width:240px;" placeholder="filter services&hellip;">
+      <button class="db-action-btn" onclick="loadServices()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button></div>
+    <div id="svc-list"><div class="empty-state">Loading&hellip;</div></div>
+  </div>"""
+
+def _config_sub_database(perms: dict):
+    write = perms.get("role") == "admin"
+    hint = "" if write else '<span class="cfg-running">read only</span>'
+    return f"""
+  <div class="config-sub" data-cfgsub="database" hidden>
+    {_CONFIG_BACK}
+    <div class="mgmt-h2">Database</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap;">
+      <select class="field-input" id="db-table-sel" style="max-width:240px;" onchange="loadDbTable()"><option value="">Pick a table&hellip;</option></select>
+      <button class="db-action-btn" onclick="loadDbTables()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
+      {hint}
+    </div>
+    <div id="db-table-view"><div class="empty-state">Pick a table to browse it.</div></div>
+  </div>"""
+
+def _config_sub_proxy():
+    return f"""
+  <div class="config-sub" data-cfgsub="proxy" hidden>
+    {_CONFIG_BACK}
+    <div class="mgmt-h2">Proxy</div>
+    <div class="cfg-card">
+      <div class="device-title">Reverse proxy hosts</div>
+      <div class="settings-subtitle" style="margin:6px 0 14px;">Detected and managed nginx server blocks.</div>
+      <div id="proxy-list"><div class="empty-state">Loading&hellip;</div></div>
+    </div>
+    <div class="cfg-card" style="margin-top:18px;">
+      <div class="device-title">Add a proxy host</div>
+      <div class="field-group"><label class="field-label" for="px-domain">Domain</label>
+        <input class="field-input" id="px-domain" type="text" placeholder="example.com" spellcheck="false" autocomplete="off"></div>
+      <div class="field-group"><label class="field-label" for="px-target">Target</label>
+        <div class="field-hint">Where nginx forwards requests, for example 127.0.0.1:8080</div>
+        <input class="field-input" id="px-target" type="text" placeholder="127.0.0.1:8080" spellcheck="false" autocomplete="off"></div>
+      <div class="field-group"><label class="perm-check"><input type="checkbox" id="px-ws" checked>Support WebSockets</label></div>
+      <button class="save-btn" id="px-create" onclick="createProxyHost()">Add Host</button>
+      <div class="save-feedback" id="px-feedback"></div>
+    </div>
+  </div>"""
+
+_CONFIG_SUB_BUILDERS = {
+    "users": lambda perms: _config_sub_users(),
+    "server": lambda perms: _config_sub_server(),
+    "service": lambda perms: _config_sub_service(),
+    "database": lambda perms: _config_sub_database(perms),
+    "proxy": lambda perms: _config_sub_proxy(),
+}
+
+def _config_pane_html(perms: dict) -> str:
+    allowed = _config_cards(perms)
+    cards = "".join(
+        f'<button class="config-card" data-cfgnav="{key}" onclick="configOpen(\'{key}\')">'
+        f'<svg class="ic"><use href="#{_CONFIG_CARD_META[key][1]}"/></svg>'
+        f'<div class="config-card-title">{_CONFIG_CARD_META[key][0]}</div>'
+        f'<div class="config-card-desc">{_CONFIG_CARD_META[key][2]}</div>'
+        f'</button>'
+        for key in allowed
+    )
+    subs = "".join(_CONFIG_SUB_BUILDERS[key](perms) for key in allowed)
+    return f"""
+  <div class="pane" data-pane="config"><div class="pane-scroll">
+    <div id="config-menu" class="config-menu">{cards}</div>
+    {subs}
+  </div></div>"""
 
 def _crest():
     return ('<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
@@ -600,7 +807,7 @@ def _crest():
             '<line x1="6" x2="6.01" y1="18" y2="18"/></svg>')
 
 # The four panes are identical across shells (same IDs); only the chrome differs.
-_PANES = """
+_PANES_TEMPLATE = """
 <div class="mgmt-main">
   <!-- SERVER -->
   <div class="pane" data-pane="server"><div class="pane-scroll"><div class="server-inner">
@@ -633,39 +840,9 @@ _PANES = """
       <div class="device-title">Device &amp; OS</div>
       <div class="device-grid" id="device-grid"><div class="empty-state">Loading device info&hellip;</div></div>
     </div>
-    <div class="cfg-card" style="margin-top:18px;">
-      <div class="device-title">Management Launch Configuration</div>
-      <div class="settings-subtitle" style="margin:6px 0 18px;">Host &amp; port this panel binds (HTTP). Independent of Main.py. Applies on next restart of the <code>management</code> service.</div>
-      <div class="field-group"><label class="field-label" for="cfg-host">Host</label>
-        <div class="field-hint">Use <code>0.0.0.0</code> for every interface.</div>
-        <input class="field-input" id="cfg-host" type="text" placeholder="0.0.0.0" spellcheck="false" autocomplete="off">
-        <div class="host-chips" id="host-chips"></div></div>
-      <div class="field-group"><label class="field-label" for="cfg-port">Port</label>
-        <div class="field-hint">Standard HTTP is <code>80</code>.</div>
-        <input class="field-input" id="cfg-port" type="number" min="1" max="65535" placeholder="80" autocomplete="off"></div>
-      <button class="save-btn" id="cfg-save-btn" onclick="saveServerConfig()">Save Configuration</button>
-      <div class="save-feedback" id="cfg-feedback"></div>
-      <div class="cfg-running" id="cfg-running"></div>
-    </div>
-    <div class="cfg-card" style="margin-top:18px;">
-      <div class="device-title">SSH</div>
-      <div class="settings-subtitle" style="margin:6px 0 16px;">Turn the server's SSH daemon on or off.
-        <svg class="ic" style="color:var(--danger)"><use href="#ic-triangle-alert"/></svg> If SSH is your only way in, keep another route before disabling.</div>
-      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-        <span class="cfg-running" id="ssh-state">Checking&hellip;</span>
-        <button class="save-btn" id="ssh-toggle-btn" onclick="toggleSsh()" disabled>&hellip;</button></div>
-      <div class="save-feedback" id="ssh-feedback"></div>
-    </div>
   </div></div></div>
 
-  <!-- SERVICES -->
-  <div class="pane" data-pane="services"><div class="pane-scroll">
-    <div class="mgmt-h2">Systemd services</div>
-    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">
-      <input id="svc-search" class="field-input" style="max-width:240px;" placeholder="filter services&hellip;">
-      <button class="db-action-btn" onclick="loadServices()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button></div>
-    <div id="svc-list"><div class="empty-state">Loading&hellip;</div></div>
-  </div></div>
+  {config_pane}
 
   <!-- TERMINAL -->
   <div class="pane" data-pane="terminal"><div class="pane-scroll">
@@ -677,32 +854,48 @@ _PANES = """
   <!-- LOGS -->
   <div class="pane" data-pane="logs"><div class="pane-scroll">
     <div class="srv-grid" id="sec-ssh-cards" style="margin-bottom:18px;">
-      <div class="metric-card"><div class="metric-head"><span class="metric-title">SSH Total Events</span><span class="metric-now" id="sec-total">&mdash;</span></div><div class="metric-foot" id="sec-unique-ips">unique IPs: &mdash;</div></div>
-      <div class="metric-card"><div class="metric-head"><span class="metric-title">Successful Logins</span><span class="metric-now" style="color:#27ae60" id="sec-accepted">&mdash;</span></div><div class="metric-foot" id="sec-sessions">active sessions: &mdash;</div></div>
-      <div class="metric-card"><div class="metric-head"><span class="metric-title">Failed Attempts</span><span class="metric-now" style="color:#e74c3c" id="sec-failed">&mdash;</span></div><div class="metric-foot" id="sec-attackers">attacker IPs: &mdash;</div></div>
-      <div class="metric-card"><div class="metric-head"><span class="metric-title">Web Login Attempts</span><span class="metric-now" id="sec-web-total">&mdash;</span></div><div class="metric-foot" id="sec-web-fail">failed: &mdash;</div></div>
+      <div class="metric-card"><div class="metric-head"><span class="metric-title">SSH Total Events</span><span class="metric-now" id="sec-total">&hellip;</span></div><div class="metric-foot" id="sec-unique-ips">unique IPs: &hellip;</div></div>
+      <div class="metric-card"><div class="metric-head"><span class="metric-title">Successful Logins</span><span class="metric-now" style="color:#27ae60" id="sec-accepted">&hellip;</span></div><div class="metric-foot" id="sec-sessions">active sessions: &hellip;</div></div>
+      <div class="metric-card"><div class="metric-head"><span class="metric-title">Failed Attempts</span><span class="metric-now" style="color:#e74c3c" id="sec-failed">&hellip;</span></div><div class="metric-foot" id="sec-attackers">attacker IPs: &hellip;</div></div>
+      <div class="metric-card"><div class="metric-head"><span class="metric-title">Web Login Attempts</span><span class="metric-now" id="sec-web-total">&hellip;</span></div><div class="metric-foot" id="sec-web-fail">failed: &hellip;</div></div>
+    </div>
+    <div class="log-cat-tabs">
+      <button class="log-cat-tab" data-logcat="ssh" onclick="showLogCategory('ssh')">SSH Log</button>
+      <button class="log-cat-tab" data-logcat="web" onclick="showLogCategory('web')">Web Log</button>
+      <button class="log-cat-tab active" data-logcat="server" onclick="showLogCategory('server')">Server Activity</button>
+    </div>
+    <div class="sec-cat-group" data-logcat="ssh" hidden>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center;">
+        <button class="db-action-btn sec-section-btn" data-sec="ssh-sessions" onclick="showSecSection('ssh-sessions')">Active Sessions</button>
+        <button class="db-action-btn sec-section-btn" data-sec="ssh-events" onclick="showSecSection('ssh-events')">All Events</button>
+        <button class="db-action-btn sec-section-btn" data-sec="ssh-accepted" onclick="showSecSection('ssh-accepted')">Successful Logins</button>
+        <button class="db-action-btn sec-section-btn" data-sec="ssh-fingerprints" onclick="showSecSection('ssh-fingerprints')">Key Fingerprints</button>
+        <button class="db-action-btn sec-section-btn" data-sec="ssh-top-ips" onclick="showSecSection('ssh-top-ips')">Top IPs</button>
+      </div>
+    </div>
+    <div class="sec-cat-group" data-logcat="web" hidden>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center;">
+        <button class="db-action-btn sec-section-btn" data-sec="access-log" onclick="showSecSection('access-log')">Access Log</button>
+        <button class="db-action-btn sec-section-btn" data-sec="web-sessions" onclick="showSecSection('web-sessions')">Sessions</button>
+        <button class="db-action-btn sec-section-btn" data-sec="web-logs" onclick="showSecSection('web-logs')">Login Logs</button>
+        <button class="db-action-btn sec-section-btn" data-sec="web-blocked" onclick="showSecSection('web-blocked')">Blocked IPs</button>
+        <button class="db-action-btn sec-section-btn" data-sec="fp-blocked" onclick="showSecSection('fp-blocked')">Blocked Devices</button>
+      </div>
+    </div>
+    <div class="sec-cat-group" data-logcat="server">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center;">
+        <button class="db-action-btn sec-section-btn active" data-sec="panel-actions" onclick="showSecSection('panel-actions')">Panel Actions</button>
+      </div>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center;">
-      <div style="font-weight:700;font-size:13px;">Section:</div>
-      <button class="db-action-btn sec-section-btn active" data-sec="panel-actions" onclick="showSecSection('panel-actions')">Panel Actions</button>
-      <button class="db-action-btn sec-section-btn" data-sec="ssh-sessions" onclick="showSecSection('ssh-sessions')">Active SSH Sessions</button>
-      <button class="db-action-btn sec-section-btn" data-sec="ssh-events" onclick="showSecSection('ssh-events')">All SSH Events</button>
-      <button class="db-action-btn sec-section-btn" data-sec="ssh-accepted" onclick="showSecSection('ssh-accepted')">Successful Logins</button>
-      <button class="db-action-btn sec-section-btn" data-sec="ssh-fingerprints" onclick="showSecSection('ssh-fingerprints')">Key Fingerprints</button>
-      <button class="db-action-btn sec-section-btn" data-sec="ssh-top-ips" onclick="showSecSection('ssh-top-ips')">Top IPs</button>
-      <button class="db-action-btn sec-section-btn" data-sec="access-log" onclick="showSecSection('access-log')">Access Log</button>
-      <button class="db-action-btn sec-section-btn" data-sec="web-sessions" onclick="showSecSection('web-sessions')">Sessions</button>
-      <button class="db-action-btn sec-section-btn" data-sec="web-logs" onclick="showSecSection('web-logs')">Web Login Logs</button>
-      <button class="db-action-btn sec-section-btn" data-sec="web-blocked" onclick="showSecSection('web-blocked')">Blocked IPs</button>
-      <button class="db-action-btn sec-section-btn" data-sec="fp-blocked" onclick="showSecSection('fp-blocked')">Blocked Devices</button>
-      <button class="db-action-btn" onclick="loadSecurityLogs()" style="margin-left:auto;"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
+      <button class="db-action-btn" onclick="loadSecurityLogs()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
       <select id="sec-since-sel" onchange="loadSecurityLogs()" style="padding:5px 8px;border:1px solid var(--gray-200);border-radius:4px;font-size:12px;background:var(--white);color:var(--black);">
         <option value="">Last 200 events</option><option value="today">Today</option><option value="yesterday">Yesterday</option><option value="7 days ago">Last 7 days</option></select>
     </div>
     <div id="sec-content"><div class="empty-state">Loading security logs&hellip;</div></div>
   </div></div>
 
-  <!-- ACCOUNT — reached from the username in the top bar rather than the nav,
+  <!-- ACCOUNT, reached from the username in the top bar rather than the nav,
        because it is a rare errand, not one of the four places you work. -->
   <div class="pane" data-pane="account"><div class="pane-scroll">
     <div class="cfg-card">
@@ -745,16 +938,16 @@ _PANES = """
 </div>
 """
 
-def _mobile_tabbar():
+def _mobile_tabbar(nav):
     items = "".join(
         f'<button class="mtab" data-nav="{k}"><svg class="ic"><use href="#{ic}"/></svg><span>{label}</span></button>'
-        for k, label, ic in _NAV)
-    return f'<nav class="mobile-tabbar" style="grid-template-columns:repeat({len(_NAV)},1fr);">{items}</nav>'
+        for k, label, ic in nav)
+    return f'<nav class="mobile-tabbar" style="grid-template-columns:repeat({len(nav)},1fr);">{items}</nav>'
 
-def _topbar(mobile: bool, user: str):
+def _topbar(mobile: bool, user: str, nav):
     tabs = "".join(
         f'<button class="tab-btn" data-nav="{k}"><svg class="ic"><use href="#{ic}"/></svg>{label}</button>'
-        for k, label, ic in _NAV)
+        for k, label, ic in nav)
     safe_user = html.escape(user or "", quote=True)
     right = (
         '<button class="theme-btn" onclick="toggleTheme()" title="Toggle dark mode"><svg class="ic"><use href="#ic-moon" id="theme-ic"/></svg></button>'
@@ -774,15 +967,25 @@ def _topbar(mobile: bool, user: str):
         '</div>'
     )
 
-def _dashboard_html(mobile: bool, user: str) -> str:
+def _dashboard_html(mobile: bool, user: str, perms: dict) -> str:
     shell = "mgmt-mobile" if mobile else "mgmt-desktop"
+    nav = _visible_nav(perms)
+    panes = _PANES_TEMPLATE.replace("{config_pane}", _config_pane_html(perms))
+    perms_json = json.dumps({
+        "role": perms.get("role"),
+        "terminalAccess": perms.get("terminal_access"),
+        "databaseAccess": bool(perms.get("database_access")),
+        "databaseWrite": bool(perms.get("database_write")),
+        "logsAccess": bool(perms.get("logs_access")),
+        "diskAccess": bool(perms.get("disk_access")),
+    })
     return (
         "<!DOCTYPE html><html lang=\"en\"><head>"
         "<meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
         f"<title>Management</title><link rel=\"stylesheet\" href=\"{MGMT_BASE}/static/dash.css\">"
-        f"<script>window.MGMT_BASE={json.dumps(MGMT_BASE)};</script></head>"
+        f"<script>window.MGMT_BASE={json.dumps(MGMT_BASE)};window.MGMT_PERMS={perms_json};</script></head>"
         f"<body class=\"mgmt {shell}\">{_ICON_SPRITE}"
-        f"{_topbar(mobile, user)}{_PANES}{_mobile_tabbar()}"
+        f"{_topbar(mobile, user, nav)}{panes}{_mobile_tabbar(nav)}"
         f"<script src=\"{MGMT_BASE}/static/management.js\"></script></body></html>"
     )
 
@@ -790,7 +993,7 @@ def _is_mobile(request: Request) -> bool:
     ua = request.headers.get("user-agent", "").lower()
     return any(t in ua for t in ("mobi", "android", "iphone", "ipod", "windows phone"))
 
-# Login page — warm palette via the shared stylesheet, same /api/login flow.
+# Login page, warm palette via the shared stylesheet, same /api/login flow.
 # __BASE__ is substituted with MGMT_BASE by _login_html().
 _LOGIN_HTML = r"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -900,7 +1103,7 @@ _LOGIN_HTML = r"""<!DOCTYPE html><html lang="en"><head>
     try{ const res=await fetch('__BASE__/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({username:$('u').value.trim(),password:$('p').value})});
       const d=await res.json(); if(d.status==='ok'){ location.href='__BASE__/'; } else { er.textContent=d.error||'Invalid username or password.'; b.disabled=false; }
-    }catch(_){ er.textContent='Network error — please try again.'; b.disabled=false; }
+    }catch(_){ er.textContent='Network error, please try again.'; b.disabled=false; }
   });
 
   /* --- recover ----------------------------------------------------------- */
@@ -924,7 +1127,7 @@ _LOGIN_HTML = r"""<!DOCTYPE html><html lang="en"><head>
         er.textContent=d.error||'Could not reset the password.';
         b.disabled=false; b.textContent='Reset password';
       }
-    }catch(_){ er.textContent='Network error — please try again.'; b.disabled=false; b.textContent='Reset password'; }
+    }catch(_){ er.textContent='Network error, please try again.'; b.disabled=false; b.textContent='Reset password'; }
   });
 </script></body></html>"""
 
@@ -1008,6 +1211,8 @@ async def do_login(request: Request):
     password = body.get("password") or ""
     try:
         ok = await DB.run(DB.verify_admin, username, password)
+        if not ok:
+            ok = await DB.run(_verify_staff_login, username, password)
     except Exception as e:
         logging.error(f"verify_admin failed: {e}")
         ok = False
@@ -1110,7 +1315,7 @@ async def api_account_password(request: Request):
 
     write_log("ACTION", "AUTH", "Password changed", actor=username, ip=ip,
               detail="every other session was signed out")
-    # The epoch bump just invalidated this browser's cookie too — hand it a new
+    # The epoch bump just invalidated this browser's cookie too, hand it a new
     # one so the person who made the change is not signed out by their own action.
     resp = JSONResponse({"status": "ok"})
     resp.set_cookie("session", _create_session_token(username), httponly=True,
@@ -1256,13 +1461,52 @@ def _admin_exists_conn(conn, username: str) -> bool:
     finally:
         cur.close()
 
+# ---- staff accounts (panel_user) and permission resolution ----
+def _verify_staff_login(username: str, password: str) -> bool:
+    conn = DB.get_connection()
+    try:
+        return panel_users.verify_login(conn, username, password) is not None
+    finally:
+        DB.release_connection(conn)
+
+def _resolve_permissions(username: str) -> dict:
+    conn = DB.get_connection()
+    try:
+        return panel_users.resolve_permissions(conn, username)
+    finally:
+        DB.release_connection(conn)
+
+_NO_PERMISSIONS = {
+    "role": "none", "terminal_access": "none", "os_username": None,
+    "database_write": False, "database_access": False,
+    "logs_access": False, "disk_access": False,
+}
+
+async def _current_permissions(request: Request) -> dict:
+    username = _admin_name(request)
+    if not username:
+        return dict(_NO_PERMISSIONS)
+    return await DB.run(_resolve_permissions, username)
+
+async def _require(request: Request, check):
+    """check(perms) -> bool. Returns (perms, None) if allowed, or
+    (None, JSONResponse 403) if not -- always call _authed() first."""
+    perms = await _current_permissions(request)
+    if not check(perms):
+        return None, JSONResponse(status_code=403, content={"error": "Not permitted."})
+    return perms, None
+
+def _is_admin(perms):
+    return perms.get("role") == "admin"
+
 # ---- dashboard ----
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
     if not _authed(request):
         return RedirectResponse(url=f"{MGMT_BASE}/login", status_code=302)
-    return HTMLResponse(content=_dashboard_html(_is_mobile(request), _admin_name(request) or "admin"))
+    perms = await _current_permissions(request)
+    return HTMLResponse(content=_dashboard_html(_is_mobile(request), _admin_name(request) or "admin", perms))
 
 # ---- server status (System.py) ----
 @app.get("/api/system/static")
@@ -1305,6 +1549,9 @@ async def api_connections(request: Request):
 async def api_files(request: Request, path: str = "/"):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("disk_access"))
+    if denied:
+        return denied
     try:
         return await DB.run(System.list_dir, path)
     except Exception as e:
@@ -1314,6 +1561,9 @@ async def api_files(request: Request, path: str = "/"):
 async def api_download(request: Request, path: str = ""):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("disk_access"))
+    if denied:
+        return denied
     full, reason = System.resolve_download(path)
     if reason == "not_found":
         return JSONResponse(status_code=404, content={"error": "not found"})
@@ -1323,17 +1573,41 @@ async def api_download(request: Request, path: str = ""):
               ip=_client_ip(request), target=full[:200])
     return FileResponse(full, filename=os.path.basename(full), media_type="application/octet-stream")
 
+@app.delete("/api/system/delete")
+async def api_delete_file(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    # Deleting is admin-only, full stop -- disk_access only ever grants browsing/download.
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    path = body.get("path") or ""
+    ok, reason = await DB.run(System.delete_file, path)
+    if not ok:
+        code = 404 if reason == "not_found" else 400 if reason == "is_directory" else 403 if reason == "blocked" else 500
+        return JSONResponse(status_code=code, content={"error": reason or "delete failed"})
+    write_log("ACTION", "SYSTEM", "File deleted", actor=_admin_name(request),
+              ip=_client_ip(request), target=path[:200])
+    return {"status": "ok"}
+
 # ---- management bind config ----
 @app.get("/api/system/config")
 async def api_config_get(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     return mgmt_config_view()
 
 @app.post("/api/system/config")
 async def api_config_set(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     body = await request.json()
     try:
         host, port = await DB.run(set_mgmt_config, body.get("host"), body.get("port"))
@@ -1349,35 +1623,540 @@ async def api_config_set(request: Request):
 async def api_services(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     return await DB.run(list_services)
 
 @app.get("/api/services/{name}")
 async def api_service_detail(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     return await DB.run(service_detail, name)
 
 @app.post("/api/services/{name}/{action}")
 async def api_service_action(request: Request, name: str, action: str):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     ok, message = await DB.run(control_service, name, action)
     write_log("ACTION" if ok else "ERROR", "SERVICE", f"{action} service",
               actor=_admin_name(request), ip=_client_ip(request), target=name,
               detail=message[:1000], status="ok" if ok else "failed")
     return {"ok": ok, "message": message}
 
+# ---- Config: SSH access settings (admin only) ----
+def _ssh_status_data():
+    conn = DB.get_connection()
+    try:
+        rec = ssh_vault.get_record(conn)
+    finally:
+        DB.release_connection(conn)
+    return {
+        "sshd_running": ssh_vault.sshd_running(),
+        "key_exists": ssh_vault.key_files_exist(),
+        "public_key": (rec or {}).get("public_key", ""),
+        "fingerprint": (rec or {}).get("fingerprint", ""),
+        "password_saved": bool((rec or {}).get("password")),
+        "allow_password_login": ssh_vault.password_login_allowed(),
+        "generated_at": (rec or {}).get("generated_at"),
+    }
+
+@app.get("/api/config/ssh/status")
+async def api_ssh_status(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    return await DB.run(_ssh_status_data)
+
+def _ssh_generate(password):
+    ssh_vault.ensure_sshd_running()
+    public_key, private_key, fingerprint = ssh_vault.generate_keypair()
+    conn = DB.get_connection()
+    try:
+        allow = ssh_vault.password_login_allowed()
+        ssh_vault.save_record(conn, public_key, private_key, password, fingerprint, allow)
+    finally:
+        DB.release_connection(conn)
+    return {"public_key": public_key, "fingerprint": fingerprint}
+
+@app.post("/api/config/ssh/generate")
+async def api_ssh_generate(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    try:
+        result = await DB.run(_ssh_generate, body.get("password") or "")
+    except RuntimeError as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    write_log("ACTION", "SECURITY", "Generated SSH keypair", actor=_admin_name(request), ip=_client_ip(request))
+    return {"status": "ok", **result}
+
+def _ssh_save_password(password):
+    conn = DB.get_connection()
+    try:
+        ssh_vault.ensure_table(conn)
+        rec = ssh_vault.get_record(conn)
+        if rec is None:
+            return False
+        ssh_vault.update_password(conn, password)
+        return True
+    finally:
+        DB.release_connection(conn)
+
+@app.post("/api/config/ssh/password")
+async def api_ssh_password(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    saved = await DB.run(_ssh_save_password, body.get("password") or "")
+    if not saved:
+        return JSONResponse(status_code=400, content={"error": "Generate a key first."})
+    write_log("ACTION", "SECURITY", "Saved SSH reference password", actor=_admin_name(request), ip=_client_ip(request))
+    return {"status": "ok"}
+
+def _ssh_set_login_mode(allow):
+    ok, message = ssh_vault.set_password_login(allow)
+    if ok:
+        conn = DB.get_connection()
+        try:
+            rec = ssh_vault.get_record(conn)
+            if rec is not None:
+                cur = conn.cursor()
+                cur.execute("UPDATE ssh SET allow_password_login = %s, updated_at = CURRENT_TIMESTAMP", (allow,))
+                conn.commit()
+                cur.close()
+        finally:
+            DB.release_connection(conn)
+    return ok, message
+
+@app.post("/api/config/ssh/login-mode")
+async def api_ssh_login_mode(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    allow = bool(body.get("allow_password_login"))
+    ok, message = await DB.run(_ssh_set_login_mode, allow)
+    write_log("ACTION" if ok else "ERROR", "SECURITY", "SSH login mode",
+              actor=_admin_name(request), ip=_client_ip(request),
+              detail=("password allowed" if allow else "key only") + ": " + message,
+              status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=500, content={"error": message})
+    return {"status": "ok", "message": message}
+
+def _ssh_private_key():
+    conn = DB.get_connection()
+    try:
+        rec = ssh_vault.get_record(conn)
+    finally:
+        DB.release_connection(conn)
+    return (rec or {}).get("private_key", "")
+
+@app.get("/api/config/ssh/private-key")
+async def api_ssh_private_key(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    key = await DB.run(_ssh_private_key)
+    if not key:
+        return JSONResponse(status_code=404, content={"error": "No key generated yet."})
+    write_log("ACTION", "SECURITY", "Downloaded SSH private key", actor=_admin_name(request), ip=_client_ip(request))
+    return Response(content=key, media_type="application/x-pem-file",
+                     headers={"Content-Disposition": "attachment; filename=id_ed25519"})
+
+# ---- Config: User Management (admin only) ----
+def _list_panel_users():
+    conn = DB.get_connection()
+    try:
+        return panel_users.list_users(conn)
+    finally:
+        DB.release_connection(conn)
+
+@app.get("/api/config/users")
+async def api_users_list(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    return {"users": await DB.run(_list_panel_users)}
+
+def _create_panel_user(username, password, terminal_access, database_access,
+                        logs_access, disk_access, created_by):
+    conn = DB.get_connection()
+    try:
+        return panel_users.create_user(conn, username, password, terminal_access,
+                                        database_access, logs_access, disk_access, created_by)
+    finally:
+        DB.release_connection(conn)
+
+@app.post("/api/config/users")
+async def api_users_create(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    terminal_access = body.get("terminal_access") or "none"
+    if not username or len(username) > 100:
+        return JSONResponse(status_code=400, content={"error": "Enter a username."})
+    problem = recovery.password_problem(password, username)
+    if problem:
+        return JSONResponse(status_code=400, content={"error": problem})
+    if terminal_access not in panel_users.TERMINAL_LEVELS:
+        return JSONResponse(status_code=400, content={"error": "Unknown terminal access level."})
+    try:
+        os_username = await DB.run(
+            _create_panel_user, username, password, terminal_access,
+            bool(body.get("database_access")), bool(body.get("logs_access")),
+            bool(body.get("disk_access")), _admin_name(request),
+        )
+    except RuntimeError as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    except Exception as e:
+        msg = "That username is already taken." if "unique" in str(e).lower() else "Could not create the user."
+        return JSONResponse(status_code=400, content={"error": msg})
+    write_log("ACTION", "SECURITY", "Created panel user", actor=_admin_name(request),
+              ip=_client_ip(request), target=username, detail=f"terminal={terminal_access}")
+    return {"status": "ok", "os_username": os_username}
+
+def _update_panel_user_perms(username, **fields):
+    conn = DB.get_connection()
+    try:
+        return panel_users.update_permissions(conn, username, **fields)
+    finally:
+        DB.release_connection(conn)
+
+@app.post("/api/config/users/{username}/permissions")
+async def api_users_update(request: Request, username: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    fields = {}
+    if "terminal_access" in body:
+        fields["terminal_access"] = body["terminal_access"]
+    if "database_access" in body:
+        fields["database_access"] = bool(body["database_access"])
+    if "logs_access" in body:
+        fields["logs_access"] = bool(body["logs_access"])
+    if "disk_access" in body:
+        fields["disk_access"] = bool(body["disk_access"])
+    try:
+        ok = await DB.run(_update_panel_user_perms, username, **fields)
+    except RuntimeError as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "No such user."})
+    write_log("ACTION", "SECURITY", "Updated panel user permissions", actor=_admin_name(request),
+              ip=_client_ip(request), target=username, detail=str(fields))
+    return {"status": "ok"}
+
+def _delete_panel_user(username):
+    conn = DB.get_connection()
+    try:
+        return panel_users.delete_user(conn, username)
+    finally:
+        DB.release_connection(conn)
+
+@app.delete("/api/config/users/{username}")
+async def api_users_delete(request: Request, username: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    ok = await DB.run(_delete_panel_user, username)
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "No such user."})
+    write_log("ACTION", "SECURITY", "Deleted panel user", actor=_admin_name(request),
+              ip=_client_ip(request), target=username)
+    return {"status": "ok"}
+
+# ---- Config: Database viewer/editor (panel's own tables only) ----
+_DB_SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",
+                      "management_log", "admin_action", "ssh_log", "web_login_log",
+                      "web_fp_block", "web_login_block", "web_session_log",
+                      "http_access_log", "ssh", "panel_user")
+_DB_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]{0,58}$")
+_DB_COLUMN_TYPES = ("TEXT", "INTEGER", "BIGINT", "BOOLEAN", "TIMESTAMPTZ", "NUMERIC", "DATE")
+
+def _db_tables_present():
+    return [t for t in _DB_SCHEMA_TABLES if t in set(DB.get_table_list())]
+
+@app.get("/api/config/db/tables")
+async def api_db_tables(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("database_access"))
+    if denied:
+        return denied
+    return {"tables": await DB.run(_db_tables_present), "write": perms.get("role") == "admin"}
+
+def _db_table_page(name, page):
+    data = DB.get_table_page(name, page, rows_per_page=25)
+    data["total"] = DB.get_table_count(name)
+    return data
+
+@app.get("/api/config/db/table/{name}")
+async def api_db_table(request: Request, name: str, page: int = 1):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("database_access"))
+    if denied:
+        return denied
+    if name not in _DB_SCHEMA_TABLES:
+        return JSONResponse(status_code=404, content={"error": "No such table."})
+    try:
+        data = await DB.run(_db_table_page, name, max(1, page))
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    data["page"] = max(1, page)
+    return data
+
+def _db_insert_row(name, values):
+    conn = DB.get_connection()
+    try:
+        cur = conn.cursor()
+        cols = [c for c in values.keys() if _DB_IDENT_RE.match(c)]
+        query = pg_sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+            pg_sql.Identifier(name),
+            pg_sql.SQL(", ").join(pg_sql.Identifier(c) for c in cols),
+            pg_sql.SQL(", ").join(pg_sql.Placeholder() for _ in cols),
+        )
+        cur.execute(query, [values[c] for c in cols])
+        conn.commit()
+        cur.close()
+    finally:
+        DB.release_connection(conn)
+
+def _db_update_row(name, pk_column, pk_value, values):
+    if not _DB_IDENT_RE.match(pk_column):
+        raise ValueError("bad primary key column")
+    conn = DB.get_connection()
+    try:
+        cur = conn.cursor()
+        cols = [c for c in values.keys() if _DB_IDENT_RE.match(c)]
+        assignments = pg_sql.SQL(", ").join(
+            pg_sql.SQL("{} = {}").format(pg_sql.Identifier(c), pg_sql.Placeholder()) for c in cols
+        )
+        query = pg_sql.SQL("UPDATE {} SET {} WHERE {} = %s").format(
+            pg_sql.Identifier(name), assignments, pg_sql.Identifier(pk_column)
+        )
+        cur.execute(query, [values[c] for c in cols] + [pk_value])
+        changed = cur.rowcount
+        conn.commit()
+        cur.close()
+        return changed
+    finally:
+        DB.release_connection(conn)
+
+def _db_delete_row(name, pk_column, pk_value):
+    if not _DB_IDENT_RE.match(pk_column):
+        raise ValueError("bad primary key column")
+    conn = DB.get_connection()
+    try:
+        cur = conn.cursor()
+        query = pg_sql.SQL("DELETE FROM {} WHERE {} = %s").format(
+            pg_sql.Identifier(name), pg_sql.Identifier(pk_column)
+        )
+        cur.execute(query, (pk_value,))
+        changed = cur.rowcount
+        conn.commit()
+        cur.close()
+        return changed
+    finally:
+        DB.release_connection(conn)
+
+def _db_add_column(name, col_name, col_type):
+    conn = DB.get_connection()
+    try:
+        cur = conn.cursor()
+        query = pg_sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} " + col_type).format(
+            pg_sql.Identifier(name), pg_sql.Identifier(col_name)
+        )
+        cur.execute(query)
+        conn.commit()
+        cur.close()
+    finally:
+        DB.release_connection(conn)
+
+@app.post("/api/config/db/table/{name}/row")
+async def api_db_row_insert(request: Request, name: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    if name not in _DB_SCHEMA_TABLES:
+        return JSONResponse(status_code=404, content={"error": "No such table."})
+    body = await _json_body(request)
+    values = body.get("values") or {}
+    try:
+        await DB.run(_db_insert_row, name, values)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)[:300]})
+    write_log("ACTION", "SECURITY", "Inserted database row", actor=_admin_name(request),
+              ip=_client_ip(request), target=name)
+    return {"status": "ok"}
+
+@app.put("/api/config/db/table/{name}/row")
+async def api_db_row_update(request: Request, name: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    if name not in _DB_SCHEMA_TABLES:
+        return JSONResponse(status_code=404, content={"error": "No such table."})
+    body = await _json_body(request)
+    pk_column, pk_value = body.get("pk_column"), body.get("pk_value")
+    values = body.get("values") or {}
+    if not pk_column or pk_value is None:
+        return JSONResponse(status_code=400, content={"error": "Missing primary key."})
+    try:
+        changed = await DB.run(_db_update_row, name, pk_column, pk_value, values)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)[:300]})
+    write_log("ACTION", "SECURITY", "Updated database row", actor=_admin_name(request),
+              ip=_client_ip(request), target=f"{name}:{pk_value}")
+    return {"status": "ok", "changed": changed}
+
+@app.delete("/api/config/db/table/{name}/row")
+async def api_db_row_delete(request: Request, name: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    if name not in _DB_SCHEMA_TABLES:
+        return JSONResponse(status_code=404, content={"error": "No such table."})
+    body = await _json_body(request)
+    pk_column, pk_value = body.get("pk_column"), body.get("pk_value")
+    if not pk_column or pk_value is None:
+        return JSONResponse(status_code=400, content={"error": "Missing primary key."})
+    try:
+        changed = await DB.run(_db_delete_row, name, pk_column, pk_value)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)[:300]})
+    write_log("ACTION", "SECURITY", "Deleted database row", actor=_admin_name(request),
+              ip=_client_ip(request), target=f"{name}:{pk_value}")
+    return {"status": "ok", "changed": changed}
+
+@app.post("/api/config/db/table/{name}/column")
+async def api_db_add_column(request: Request, name: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    if name not in _DB_SCHEMA_TABLES:
+        return JSONResponse(status_code=404, content={"error": "No such table."})
+    body = await _json_body(request)
+    col_name = (body.get("name") or "").strip().lower()
+    col_type = (body.get("type") or "").strip().upper()
+    if not _DB_IDENT_RE.match(col_name):
+        return JSONResponse(status_code=400, content={"error": "Bad column name."})
+    if col_type not in _DB_COLUMN_TYPES:
+        return JSONResponse(status_code=400, content={"error": "Unsupported column type."})
+    try:
+        await DB.run(_db_add_column, name, col_name, col_type)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)[:300]})
+    write_log("ACTION", "SECURITY", "Added database column", actor=_admin_name(request),
+              ip=_client_ip(request), target=f"{name}.{col_name}", detail=col_type)
+    return {"status": "ok"}
+
+# ---- Config: Proxy (nginx reverse proxy hosts, admin only) ----
+@app.get("/api/config/proxy/hosts")
+async def api_proxy_list(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    return {"installed": nginx_proxy.nginx_installed(),
+            "hosts": await DB.run(nginx_proxy.list_hosts)}
+
+@app.post("/api/config/proxy/hosts")
+async def api_proxy_create(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    domain = (body.get("domain") or "").strip()
+    target = (body.get("target") or "").strip()
+    websockets = bool(body.get("websockets"))
+    try:
+        await DB.run(nginx_proxy.create_host, domain, target, websockets)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except RuntimeError as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    write_log("ACTION", "SYSTEM", "Created proxy host", actor=_admin_name(request),
+              ip=_client_ip(request), target=domain, detail=f"-> {target}")
+    return {"status": "ok"}
+
+@app.delete("/api/config/proxy/hosts/{filename}")
+async def api_proxy_delete(request: Request, filename: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    try:
+        await DB.run(nginx_proxy.delete_host, filename)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except RuntimeError as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    write_log("ACTION", "SYSTEM", "Removed proxy host", actor=_admin_name(request),
+              ip=_client_ip(request), target=filename)
+    return {"status": "ok"}
+
 # ---- structured panel logs ----
 @app.get("/api/logs")
 async def api_logs(request: Request, level: str = "", category: str = "", q: str = "", limit: int = 200):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return {"logs": await DB.run(query_logs, level, category, q, limit)}
 
 @app.get("/api/logs/counts")
 async def api_logs_counts(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return await DB.run(log_counts)
 
 # ---- SSH / security logs (shared elink tables, via DB.py) ----
@@ -1385,6 +2164,9 @@ async def api_logs_counts(request: Request):
 async def api_ssh_logs(request: Request, since: str = "", limit: int = 200):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     try:
         return await DB.run(_parse_ssh_journal, since or None, limit)
     except Exception as e:
@@ -1394,24 +2176,36 @@ async def api_ssh_logs(request: Request, since: str = "", limit: int = 200):
 async def api_ssh_sessions(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return {"sessions": await DB.run(_get_current_ssh_sessions)}
 
 @app.get("/api/system/web-login-logs")
 async def api_web_login_logs(request: Request, page: int = 1, limit: int = 50):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return await DB.run(DB.get_web_login_logs, page, limit)
 
 @app.get("/api/system/web-blocked-ips")
 async def api_web_blocked_ips(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return {"blocked": await DB.run(DB.get_web_blocked_ips)}
 
 @app.post("/api/system/web-unblock")
 async def api_web_unblock(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     body = await request.json()
     ip = (body.get("ip") or "").strip()
     if not ip:
@@ -1424,6 +2218,9 @@ async def api_web_unblock(request: Request):
 async def api_web_block(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     body = await request.json()
     ip = (body.get("ip") or "").strip()
     hours = int(body.get("hours") or 8760)
@@ -1432,19 +2229,25 @@ async def api_web_block(request: Request):
         return JSONResponse(status_code=400, content={"error": "ip required"})
     await DB.run(DB.block_web_ip, ip, hours, note)
     write_log("ACTION", "SECURITY", "Block web IP", actor=_admin_name(request),
-              ip=_client_ip(request), target=ip, detail=f"{hours}h — {note}")
+              ip=_client_ip(request), target=ip, detail=f"{hours}h, {note}")
     return {"status": "blocked", "ip": ip, "hours": hours}
 
 @app.get("/api/system/access-log")
 async def api_access_log(request: Request, page: int = 1, limit: int = 100, ip: str = "", path: str = ""):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return await DB.run(DB.get_http_access_logs, page, min(limit, 500), ip, path)
 
 @app.get("/api/system/access-log-entry")
 async def api_access_log_entry(request: Request, id: int):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     entry = await DB.run(DB.get_http_access_entry, id)
     if not entry:
         return JSONResponse(status_code=404, content={"error": "Entry not found"})
@@ -1454,12 +2257,18 @@ async def api_access_log_entry(request: Request, id: int):
 async def api_web_sessions(request: Request, limit: int = 100):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return await DB.run(DB.get_web_sessions, limit)
 
 @app.get("/api/system/ip-profile")
 async def api_ip_profile(request: Request, ip: str = ""):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     if not (ip or "").strip():
         return JSONResponse(status_code=400, content={"error": "ip required"})
     return await DB.run(DB.get_ip_profile, ip.strip())
@@ -1468,12 +2277,18 @@ async def api_ip_profile(request: Request, ip: str = ""):
 async def api_security_log_counts(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return await DB.run(DB.get_security_log_counts)
 
 @app.post("/api/system/clear-log")
 async def api_clear_log(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     body = await request.json()
     kind = (body.get("kind") or "").strip()
     try:
@@ -1488,12 +2303,18 @@ async def api_clear_log(request: Request):
 async def api_fp_blocked(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     return {"blocked": await DB.run(DB.get_fp_blocked)}
 
 @app.post("/api/system/fp-unblock")
 async def api_fp_unblock(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     body = await request.json()
     fp_hash = (body.get("fp_hash") or "").strip()
     if not fp_hash:
@@ -1506,6 +2327,9 @@ async def api_fp_unblock(request: Request):
 async def api_ssh_attacker(request: Request, ip: str = ""):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, lambda p: _is_admin(p) or p.get("logs_access"))
+    if denied:
+        return denied
     if not (ip or "").strip():
         return JSONResponse(status_code=400, content={"error": "ip required"})
     return await DB.run(DB.get_ssh_attacker_detail, ip.strip())
@@ -1514,6 +2338,9 @@ async def api_ssh_attacker(request: Request, ip: str = ""):
 async def api_ssh_block(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     body = await request.json()
     ip = (body.get("ip") or "").strip()
     if not ip or not re.match(r"^[0-9a-fA-F:.]+$", ip):
@@ -1586,10 +2413,12 @@ def _safe_int(v, default):
         return default
 
 class _ManagedTerm:
-    def __init__(self, sid, persist, rows, cols):
+    def __init__(self, sid, persist, rows, cols, owner="", run_as=None):
         self.sid = sid
         self.persist = bool(persist)
-        self.sess = System.PtySession()
+        self.owner = owner
+        self.run_as = run_as
+        self.sess = System.PtySession(run_as=run_as)
         self.sess.spawn(rows=rows, cols=cols)
         self.rows, self.cols = rows, cols
         self.buffer = bytearray()
@@ -1665,9 +2494,19 @@ async def terminal_ws(websocket: WebSocket):
         if not _ingress_allowed(peer):
             await websocket.close(code=1008)
             return
-    if _get_token_data(websocket.cookies.get("session", "")) is None:
+    token_data = _get_token_data(websocket.cookies.get("session", ""))
+    if token_data is None:
         await websocket.close(code=1008)
         return
+    username = token_data.get("username", "")
+    perms = await DB.run(_resolve_permissions, username)
+    terminal_access = perms.get("terminal_access", "none")
+    if terminal_access == "none":
+        await websocket.close(code=1008)
+        return
+    run_as = perms.get("os_username") if terminal_access == "limited" else None
+    is_admin = perms.get("role") == "admin"
+
     await websocket.accept()
     qp = websocket.query_params
     sid = (qp.get("sid") or "").strip()[:64]
@@ -1678,11 +2517,16 @@ async def terminal_ws(websocket: WebSocket):
     if mt is not None and mt.dead:
         _term_close(sid)
         mt = None
+    if mt is not None and not is_admin and mt.owner != username:
+        # A restricted user cannot attach to someone else's terminal by
+        # guessing/reusing a session id -- start a fresh one instead.
+        sid = secrets.token_hex(8)
+        mt = None
     if mt is None:
         if not sid:
             sid = secrets.token_hex(8)
         try:
-            mt = _ManagedTerm(sid, persist, rows, cols)
+            mt = _ManagedTerm(sid, persist, rows, cols, owner=username, run_as=run_as)
         except Exception as e:
             logging.error(f"terminal spawn failed: {e}")
             await websocket.close(code=1011)

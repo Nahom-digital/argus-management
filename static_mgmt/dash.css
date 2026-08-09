@@ -5,7 +5,7 @@
     font-weight: 400 700;
     font-display: swap;
     /* relative to this sheet (…/static/dash.css) so the panel works under any
-       public path prefix — see MGMT_BASE in Management.py */
+       public path prefix, see MGMT_BASE in Management.py */
     src: url('../assets/fonts/notoserif.woff2') format('woff2');
   }
   @font-face {
@@ -19,7 +19,7 @@
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   /* ===================================================================
-     WElinkP2P — design tokens.  Warm light-brown / dark-brown / black /
+     WElinkP2P, design tokens.  Warm light-brown / dark-brown / black /
      white palette.  The whole UI is token-driven, so these definitions
      re-skin every component consistently.  --font (Noto Serif) is the
      system body face; --display (Oxanium) is used for large/brand text;
@@ -28,7 +28,7 @@
      =================================================================== */
   :root {
     --black: #2a1d0e;     /* primary text / strong surfaces (near-black brown) */
-    --white: #f7efe0;     /* primary surface — light cream-brown */
+    --white: #f7efe0;     /* primary surface, light cream-brown */
     --gray-50:  #f1e6d2;  /* sidebar / subtle fills */
     --gray-100: #e9dabf;  /* hover, code background */
     --gray-200: #dac6a1;  /* borders */
@@ -54,7 +54,7 @@
 
   [data-theme="dark"] {
     --black: #f3e7d2;     /* primary text */
-    --white: #241a0f;     /* primary surface — dark espresso */
+    --white: #241a0f;     /* primary surface, dark espresso */
     --gray-50:  #2b2014;
     --gray-100: #342718;
     --gray-200: #463420;  /* borders */
@@ -75,7 +75,7 @@
     --shadow-sm: 0 1px 2px rgba(0,0,0,0.35);
   }
 
-  /* ---- Inline SVG icons (sprite via <use>) — replaces all emoji markers ---- */
+  /* ---- Inline SVG icons (sprite via <use>), replaces all emoji markers ---- */
   .ic {
     width: 1em; height: 1em;
     display: inline-block;
@@ -654,7 +654,7 @@
   #srv-detail-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.45);
     z-index:2000; padding:30px; }
   #srv-detail-overlay.open { display:flex; align-items:center; justify-content:center; }
-  /* QR lightbox — blurs everything behind it, like opening an image in chat */
+  /* QR lightbox, blurs everything behind it, like opening an image in chat */
   #qr-lightbox { display:none; position:fixed; inset:0; z-index:2600; padding:24px;
     background:rgba(0,0,0,.55); backdrop-filter:blur(9px); -webkit-backdrop-filter:blur(9px); }
   #qr-lightbox.open { display:flex; align-items:center; justify-content:center; }
@@ -720,7 +720,7 @@
   .dev-key { font-size:10px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; color:var(--gray-400); }
   .dev-val { font-size:13px; color:var(--black); font-family:var(--mono); word-break:break-word; }
 
-  /* ---- TERMINAL (xterm.js PTY) — multi-session tabs ---- */
+  /* ---- TERMINAL (xterm.js PTY), multi-session tabs ---- */
   /* The terminal view fills the whole pane (no padding) so the PTY gets every
      available pixel; the stack holds one absolutely-positioned panel per session. */
   #srv-terminal { padding:0; overflow:hidden; display:flex; flex-direction:column; min-height:0; }
@@ -887,11 +887,11 @@
   }
 
   /* =====================================================================
-     MOBILE APP SHELL — an app-like bottom tab bar + chrome that activates
+     MOBILE APP SHELL, an app-like bottom tab bar + chrome that activates
      on touch/phone viewports (and whenever the server flags the User-Agent
      as mobile via html[data-ua="mobile"]). It is an in-flow flex item at the
      end of <body> (a flex column), so it reserves its own space and never
-     overlaps the scrolling panes — no per-pane padding hacks needed.
+     overlaps the scrolling panes, no per-pane padding hacks needed.
      ===================================================================== */
   /* Base appearance (kept hidden until a trigger shows it). */
   .mobile-tabbar {
@@ -1040,3 +1040,59 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
   .codes-box { animation: codesin .2s cubic-bezier(.22, 1, .36, 1) both; }
   @keyframes codesin { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 }
+
+/* ---- CONFIG: card menu + drill-down sub-pages ---- */
+.config-menu {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+.config-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+  text-align: left;
+  padding: 20px 20px 18px;
+  border: 1px solid var(--gray-200);
+  border-radius: 10px;
+  background: var(--white);
+  cursor: pointer;
+  font-family: var(--font);
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
+}
+.config-card:hover { border-color: var(--gray-300); box-shadow: var(--shadow-sm); }
+.config-card:active { transform: scale(0.98); }
+.config-card .ic { width: 22px; height: 22px; color: var(--accent); }
+.config-card-title { font-family: var(--display); font-weight: 700; font-size: 14.5px; color: var(--black); }
+.config-card-desc { font-size: 12px; line-height: 1.5; color: var(--gray-600); }
+@media (prefers-reduced-motion: reduce) { .config-card { transition: border-color 0.15s; } .config-card:active { transform: none; } }
+
+.config-sub { margin-top: 4px; }
+.config-back { margin-bottom: 16px; }
+.config-back .ic { width: 13px; height: 13px; }
+
+.perm-checks { display: flex; flex-direction: column; gap: 10px; }
+.perm-check { display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--black); cursor: pointer; font-weight: 500; }
+.perm-check input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; margin: 0; }
+
+.db-toolbar-row { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+.db-add-row-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0; padding: 14px; background: var(--gray-50); border-radius: 8px; }
+.db-add-row-form input { flex: 1; min-width: 120px; padding: 7px 10px; border: 1px solid var(--gray-200); border-radius: 6px; font-size: 12px; font-family: var(--mono); background: var(--white); color: var(--black); }
+.db-row-actions { display: flex; gap: 6px; }
+.db-row-actions .db-action-btn { padding: 4px 9px; font-size: 11px; }
+
+.proxy-host { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--gray-200); border-radius: 8px; margin-bottom: 10px; }
+.proxy-host-info { flex: 1; min-width: 0; }
+.proxy-host-domain { font-family: var(--display); font-weight: 700; font-size: 13.5px; color: var(--black); }
+.proxy-host-target { font-family: var(--mono); font-size: 11.5px; color: var(--gray-600); margin-top: 2px; }
+.proxy-host-badge { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; padding: 2px 7px; border-radius: 4px; background: var(--gray-100); color: var(--gray-600); }
+.proxy-host-badge.managed { background: var(--accent-soft); color: var(--accent); }
+
+/* ---- Logs: category tabs above the existing section switcher ---- */
+.log-cat-tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+.log-cat-tab {
+  padding: 8px 16px; border: 1px solid var(--gray-200); background: var(--white);
+  border-radius: 8px; font-family: var(--display); font-weight: 700; font-size: 12.5px;
+  color: var(--gray-700); cursor: pointer; transition: background 0.14s, border-color 0.14s, color 0.14s;
+}
+.log-cat-tab:hover { background: var(--gray-100); }
+.log-cat-tab.active { background: var(--accent); color: #fbf2e2; border-color: transparent; }
+[data-theme="dark"] .log-cat-tab.active { color: #20160c; }

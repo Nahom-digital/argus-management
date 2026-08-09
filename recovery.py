@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# recovery.py — admin password hashing and single-use account recovery codes.
+# recovery.py, admin password hashing and single-use account recovery codes.
 #
 # Shared deliberately by management.py (the setup wizard / CLI) and panel.py
 # (the running web panel) so the hash format and the code format can never
@@ -16,7 +16,7 @@ import secrets
 from datetime import datetime
 
 # The panel's own admin password hash. This MUST stay byte-identical to
-# DB._hash_pw() or logins stop verifying — same algorithm, same static salt,
+# DB._hash_pw() or logins stop verifying, same algorithm, same static salt,
 # same iteration count.
 _PW_SALT = b"botcontrol"
 _PW_ITERATIONS = 260_000
@@ -54,7 +54,7 @@ def password_problem(password: str, username: str = "") -> str:
     if len(password) > 200:
         return "That password is unreasonably long."
     if password.lower() in _COMMON_PASSWORDS:
-        return "That password is too common — pick another."
+        return "That password is too common, pick another."
     if username and password.lower() == username.lower():
         return "The password cannot be the same as the username."
     if password.isdigit():
@@ -77,7 +77,7 @@ def normalize_code(raw: str) -> str:
 
 
 def format_code(code: str) -> str:
-    """1234 5678 9012 — grouped for reading, never for storage."""
+    """1234 5678 9012, grouped for reading, never for storage."""
     code = normalize_code(code)
     return " ".join(code[i:i + 4] for i in range(0, len(code), 4))
 
@@ -232,7 +232,7 @@ def write_recovery_file(project_dir: str, username: str, codes) -> str:
     path = recovery_path(project_dir)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     body = [
-        "ARGUS MANAGEMENT — ACCOUNT RECOVERY CODES",
+        "ARGUS MANAGEMENT, ACCOUNT RECOVERY CODES",
         "=" * 48,
         "",
         f"Account : {username}",
@@ -248,7 +248,7 @@ def write_recovery_file(project_dir: str, username: str, codes) -> str:
     body += [f"  {i}.  {format_code(code)}" for i, code in enumerate(codes, 1)]
     body += ["", "=" * 48, ""]
 
-    # Create private from the outset — never briefly world-readable.
+    # Create private from the outset, never briefly world-readable.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
                  stat.S_IRUSR | stat.S_IWUSR)
     with os.fdopen(fd, "w") as f:
