@@ -27,6 +27,12 @@ def _load_or_create_key():
         with open(path, "rb") as f:
             _key_cache = f.read().strip()
         return _key_cache
+    # Imported here rather than at module scope for the same reason _fernet()
+    # does it: this module is importable before the dependency bootstrap has run.
+    # Naming Fernet without importing it made the very first encrypt on a fresh
+    # install raise NameError, which only ever showed up on a machine that had
+    # no key file yet, so never on one that had already worked once.
+    from cryptography.fernet import Fernet
     key = Fernet.generate_key()
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
     with os.fdopen(fd, "wb") as f:

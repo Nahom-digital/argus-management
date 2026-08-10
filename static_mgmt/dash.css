@@ -453,6 +453,11 @@
     transition: background 0.14s, border-color 0.14s, color 0.14s;
   }
   .db-action-btn:hover { background: var(--gray-100); border-color: var(--gray-300); }
+  /* A button that opens a panel stays visibly pressed while the panel is open,
+     read straight off the aria state so the two can never disagree. */
+  .db-action-btn[aria-expanded="true"] {
+    background: var(--gray-100); border-color: var(--gray-300); color: var(--black);
+  }
   .db-action-btn .ic { width: 13px; height: 13px; }
   .page-info { margin-left: auto; font-size: 12px; color: var(--gray-600); font-weight: 600; }
 
@@ -1643,3 +1648,186 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
 }
 
 [data-theme="dark"] .cf-missing { color: var(--white); }
+
+/* ===================================================================
+   MAIL
+   Two panes side by side: the list of messages and the one being read.
+   A mail client is one of the few places where this shape is not a
+   default but the right answer, because reading and choosing what to
+   read next are the same task. Below 900px the reader takes the whole
+   width once a message is open, since a phone has room for one of them.
+   =================================================================== */
+.nav-badge {
+  display: inline-grid; place-items: center; min-width: 17px; height: 17px;
+  margin-left: 7px; padding: 0 5px; border-radius: 999px;
+  background: var(--danger); color: #fff;
+  font-family: var(--display); font-weight: 700; font-size: 10.5px;
+  line-height: 1; letter-spacing: 0;
+}
+.nav-badge-m { position: absolute; top: 4px; left: 50%; margin-left: 6px; }
+.mobile-tabbar .mtab { position: relative; }
+
+.mail-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.mail-folders { display: flex; gap: 8px; flex-wrap: wrap; }
+.mail-box-pick { flex: 0 1 260px; min-width: 180px; padding: 8px 10px; font-size: 12.5px; }
+.mail-bar .save-btn, .mail-bar .db-action-btn { flex: none; }
+.mail-bar .mail-box-pick { margin-left: auto; }
+.mail-count {
+  margin-left: 7px; padding: 1px 6px; border-radius: 999px;
+  background: var(--danger); color: #fff; font-size: 10.5px; font-weight: 700;
+}
+
+/* Both columns are the same height and the list scrolls inside its own, the way
+   every mail client does it. Left to size themselves the two ended up short and
+   ragged, with a reading pane floating in an empty page. */
+.mail-split {
+  display: grid; grid-template-columns: minmax(260px, 380px) 1fr; gap: 16px;
+  align-items: stretch; min-height: min(560px, 62vh);
+}
+.mail-list {
+  border: 1px solid var(--gray-200); border-radius: 8px; background: var(--white);
+  overflow: hidden auto;
+}
+.mail-item {
+  display: block; width: 100%; text-align: left; padding: 11px 13px;
+  border: none; border-bottom: 1px solid var(--gray-200);
+  background: var(--white); cursor: pointer; color: var(--black);
+  transition: background 0.15s ease-out;
+}
+.mail-item:last-child { border-bottom: none; }
+.mail-item:hover { background: var(--gray-50); }
+.mail-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mail-item.active { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.mail-item-top {
+  display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px;
+}
+.mail-item-who {
+  font-family: var(--display); font-weight: 700; font-size: 12.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mail-item.unread .mail-item-who::before {
+  content: ""; display: inline-block; width: 6px; height: 6px;
+  margin-right: 6px; border-radius: 50%; background: var(--danger);
+  vertical-align: middle;
+}
+.mail-item-when {
+  margin-left: auto; flex: none; font-size: 10.5px; color: var(--gray-500);
+  font-family: var(--mono);
+}
+.mail-item-subject {
+  font-size: 12.5px; font-weight: 600; color: var(--black);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mail-item.unread .mail-item-subject { font-weight: 700; }
+.mail-item-preview {
+  font-size: 11.5px; color: var(--gray-500); margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.mail-read {
+  border: 1px solid var(--gray-200); border-radius: 8px; background: var(--white);
+  padding: 20px 22px; min-height: 240px; overflow-y: auto;
+}
+/* Nothing open yet: the prompt belongs in the middle of the pane it is talking
+   about, not pinned to a corner of it. */
+.mail-read:has(> .mail-read-nothing) { display: grid; place-items: center; }
+.mail-read-nothing {
+  text-align: center; max-width: 34ch; color: var(--gray-500); font-size: 13px;
+  line-height: 1.6;
+}
+.mail-read-nothing .ic {
+  width: 26px; height: 26px; margin-bottom: 10px; color: var(--gray-400);
+}
+.mail-read-nothing b {
+  display: block; margin-bottom: 4px; font-family: var(--display);
+  font-size: 13.5px; color: var(--gray-700);
+}
+.mail-read-subject {
+  font-family: var(--display); font-weight: 700; font-size: 17px;
+  line-height: 1.3; margin-bottom: 10px; text-wrap: balance;
+}
+.mail-read-meta {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding-bottom: 14px; margin-bottom: 16px;
+  border-bottom: 1px solid var(--gray-200);
+}
+.mail-read-body {
+  font-size: 13.5px; line-height: 1.65; white-space: pre-wrap;
+  word-break: break-word; max-width: 72ch; color: var(--black);
+}
+.mail-read-acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 20px; }
+
+/* Which way a message went is the first thing people ask about, so it is a
+   label on the message and not a detail in a drawer. */
+.mail-route {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.5px; padding: 2px 8px; border-radius: 999px;
+  background: var(--gray-100); color: var(--gray-600); white-space: nowrap;
+}
+.mail-route.internal {
+  background: color-mix(in srgb, var(--info) 15%, transparent); color: var(--info);
+}
+.mail-route.external {
+  background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn);
+}
+.mail-route.failed {
+  background: color-mix(in srgb, var(--danger) 13%, transparent); color: var(--danger);
+}
+
+.mail-avatar {
+  flex: none; width: 34px; height: 34px; border-radius: 50%;
+  display: grid; place-items: center; overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent); font-family: var(--display); font-weight: 700;
+  font-size: 13px; text-transform: uppercase;
+}
+.mail-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.mail-who-name { font-family: var(--display); font-weight: 700; font-size: 13px; }
+.mail-who-addr { font-family: var(--mono); font-size: 11.5px; color: var(--gray-500); }
+
+.mail-from {
+  display: flex; align-items: center; gap: 11px;
+  padding: 11px 13px; border-radius: 7px;
+  background: var(--gray-50); border: 1px solid var(--gray-200);
+}
+.mail-body-input {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.6; resize: vertical;
+  min-height: 160px;
+}
+
+/* Setup, which only an admin ever sees. Deliberately two cards side by side:
+   receiving and sending are separate problems with separate answers, and a
+   system can have one working without the other. */
+.mail-setup-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px; align-items: start;
+}
+.mail-dns {
+  border: 1px solid var(--gray-200); border-radius: 7px; overflow-x: auto;
+  margin-top: 12px;
+}
+.mail-dns table { width: 100%; min-width: 520px; }
+.mail-dns td, .mail-dns th { font-size: 11.5px; }
+.mail-dns .mono { font-family: var(--mono); word-break: break-all; }
+.mail-empty-note {
+  padding: 22px; border: 1px dashed var(--gray-300); border-radius: 8px;
+  font-size: 13px; line-height: 1.6; color: var(--gray-600);
+  background: var(--gray-50);
+}
+/* Reopened underneath the mail, the setup needs a line to sit below, or it
+   reads as more of the inbox. It only gets one when there is mail above it. */
+#mail-main:not([hidden]) ~ #mail-setup {
+  margin-top: 22px; padding-top: 22px; border-top: 1px solid var(--gray-200);
+}
+
+@media (max-width: 900px) {
+  .mail-split { grid-template-columns: 1fr; }
+  .mail-split.reading .mail-list { display: none; }
+  .mail-bar .mail-box-pick { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mail-item { transition: none; }
+}

@@ -51,6 +51,8 @@ import ssh_vault
 import vault
 import cloudflare_tunnel
 import firewall
+import mail
+import mailcow
 import web_guard
 import nginx_proxy
 from psycopg2 import sql as pg_sql
@@ -730,7 +732,8 @@ def _read_static(name: str) -> str:
 _ICON_SPRITE = _read_static("sprite.html")
 
 _NAV = [("server", "Server", "ic-server"), ("config", "Config", "ic-settings"),
-        ("terminal", "Terminal", "ic-monitor"), ("logs", "Logs", "ic-shield-alert")]
+        ("terminal", "Terminal", "ic-monitor"), ("mail", "Mail", "ic-mail"),
+        ("logs", "Logs", "ic-shield-alert")]
 
 def _visible_nav(perms: dict):
     """Which top-level tabs this identity gets. Config is always present,
@@ -1333,6 +1336,91 @@ _PANES_TEMPLATE = """
   </div></div>
 
   <!-- LOGS -->
+  <!-- MAIL. Two audiences in one pane: an admin who may still have to set the
+       whole thing up, and everybody else, who either has an address or does not.
+       Which of those you are decides what is on the page, so the shell here is
+       almost empty and the interface is built from the overview call. -->
+  <div class="pane" data-pane="mail"><div class="pane-scroll">
+    <div id="mail-main" hidden>
+      <div class="mail-bar">
+        <div class="mail-folders">
+          <button class="log-cat-tab active" data-mailfolder="inbox" onclick="mailFolder('inbox')">
+            <svg class="ic"><use href="#ic-inbox"/></svg>Inbox<span class="mail-count" id="mail-inbox-count"></span>
+          </button>
+          <button class="log-cat-tab" data-mailfolder="sent" onclick="mailFolder('sent')">
+            <svg class="ic"><use href="#ic-send"/></svg>Sent
+          </button>
+        </div>
+        <select class="field-input mail-box-pick" id="mail-box" aria-label="Mailbox"
+                onchange="loadMailMessages()"></select>
+        <button class="save-btn" id="mail-compose-btn" onclick="mailCompose()">
+          <svg class="ic"><use href="#ic-send"/></svg>Write
+        </button>
+        <button class="db-action-btn" id="mail-sync-btn" onclick="mailSync()" hidden>
+          <svg class="ic"><use href="#ic-refresh-cw"/></svg>Collect mail
+        </button>
+        <button class="db-action-btn" id="mail-settings-btn" onclick="mailToggleSettings()"
+                aria-expanded="false" aria-controls="mail-setup" hidden>
+          <svg class="ic"><use href="#ic-settings"/></svg>Mail settings
+        </button>
+      </div>
+
+      <div class="cfg-card cfg-card-wide" id="mail-compose-card" hidden>
+        <div class="px-card-head">
+          <div class="device-title">New message</div>
+          <button class="db-action-btn" onclick="mailCloseCompose()">Cancel</button>
+        </div>
+        <div class="mail-from" id="mail-from-row"></div>
+        <div class="grant-group" style="margin-top:14px;">
+          <div class="grant-legend">Where is it going</div>
+          <div class="field-hint" style="margin:0 0 10px;">
+            Internal mail is delivered inside this system and never reaches the
+            relay. External mail is handed to the relay and leaves the building.
+          </div>
+          <div class="grant-seg-group" id="mail-route-group">
+            <label class="grant-seg"><input type="radio" name="mail-route" value="internal" checked>Internal</label>
+            <label class="grant-seg"><input type="radio" name="mail-route" value="external">External</label>
+          </div>
+        </div>
+        <div class="field-group" style="margin-top:16px;">
+          <label class="field-label" for="mail-to">To</label>
+          <input class="field-input" id="mail-to" type="email" maxlength="320"
+                 placeholder="somebody@example.com" autocomplete="off" spellcheck="false">
+          <div class="field-hint" id="mail-to-hint"></div>
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="mail-subject">Subject</label>
+          <input class="field-input" id="mail-subject" type="text" maxlength="300" autocomplete="off">
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="mail-body">Message</label>
+          <textarea class="field-input mail-body-input" id="mail-body" rows="9" maxlength="100000"></textarea>
+        </div>
+        <div class="px-form-actions">
+          <button class="save-btn" id="mail-send" onclick="mailSend()">Send</button>
+          <div class="save-feedback" id="mail-send-feedback"></div>
+        </div>
+      </div>
+
+      <div class="mail-split">
+        <div class="mail-list" id="mail-list"><div class="empty-state">Loading&hellip;</div></div>
+        <div class="mail-read" id="mail-read">
+          <div class="mail-read-nothing">
+            <svg class="ic"><use href="#ic-mail"/></svg>
+            <b>Nothing open</b>
+            Pick a message on the left and it opens here. Unread ones carry a red dot.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- The setup sits below the mail, not above it. Until a domain exists it is
+         the only thing on the page, because there is nothing else to show. Once
+         mail is running it is reference material, and the button in the bar
+         brings it back. -->
+    <div id="mail-setup"></div>
+  </div></div>
+
   <div class="pane" data-pane="logs"><div class="pane-scroll">
     <!-- Four numbers, one question each. The old set mixed "total events" with
          "unique IPs" and "active sessions", which answered nothing you would
@@ -1429,15 +1517,28 @@ _PANES_TEMPLATE = """
 </div>
 """
 
+def _nav_badge(key):
+    """Mail is the one tab where something can be waiting for you, so it is the
+    one tab that carries a count. Empty until the count arrives, and hidden at
+    zero rather than showing a nought."""
+    if key != "mail":
+        return ""
+    return '<span class="nav-badge" id="mail-badge" hidden>0</span>'
+
 def _mobile_tabbar(nav):
     items = "".join(
-        f'<button class="mtab" data-nav="{k}"><svg class="ic"><use href="#{ic}"/></svg><span>{label}</span></button>'
+        f'<button class="mtab" data-nav="{k}"><svg class="ic"><use href="#{ic}"/></svg>'
+        f'<span>{label}</span>'
+        + ('<span class="nav-badge nav-badge-m" id="mail-badge-m" hidden>0</span>'
+           if k == "mail" else "")
+        + '</button>'
         for k, label, ic in nav)
     return f'<nav class="mobile-tabbar" style="grid-template-columns:repeat({len(nav)},1fr);">{items}</nav>'
 
 def _topbar(mobile: bool, user: str, nav):
     tabs = "".join(
-        f'<button class="tab-btn" data-nav="{k}"><svg class="ic"><use href="#{ic}"/></svg>{label}</button>'
+        f'<button class="tab-btn" data-nav="{k}"><svg class="ic"><use href="#{ic}"/></svg>'
+        f'{label}{_nav_badge(k)}</button>'
         for k, label, ic in nav)
     safe_user = html.escape(user or "", quote=True)
     right = (
@@ -1625,11 +1726,17 @@ _LOGIN_HTML = r"""<!DOCTYPE html><html lang="en"><head>
 def _login_html() -> str:
     return _LOGIN_HTML.replace("__BASE__", MGMT_BASE)
 
-def _ensure_tunnel_tables():
+def _ensure_feature_tables():
+    """Tables for features that arrived after the first release.
+
+    A panel upgraded in place would otherwise serve the page and not have the
+    tables behind it. Every statement is IF NOT EXISTS, so this costs one round
+    trip at boot and nothing after that.
+    """
     conn = DB.get_connection()
     try:
         cur = conn.cursor()
-        for statement in cloudflare_tunnel.SCHEMA:
+        for statement in cloudflare_tunnel.SCHEMA + mail.SCHEMA:
             cur.execute(statement)
         cur.close()
     finally:
@@ -1648,13 +1755,10 @@ async def lifespan(app: FastAPI):
         ensure_management_log()
     except Exception as e:
         logging.error(f"ensure_management_log failed: {e}")
-    # The tunnel tables arrived after the first release, so a panel upgraded in
-    # place would otherwise have the page and not the tables behind it. The
-    # statements are all IF NOT EXISTS, so this costs one round trip at boot.
     try:
-        _ensure_tunnel_tables()
+        _ensure_feature_tables()
     except Exception as e:
-        logging.error(f"cloudflare tunnel tables failed: {e}")
+        logging.error(f"feature tables failed: {e}")
     write_log("INFO", "SYSTEM", "Management panel started", actor="system", detail=f"pid={os.getpid()}")
     yield
     write_log("INFO", "SYSTEM", "Management panel stopped", actor="system")
@@ -3460,6 +3564,397 @@ async def api_tunnel_service(request: Request):
     if not ok:
         return JSONResponse(status_code=400, content={"error": message})
     return {"status": "ok", "message": message}
+
+# ---- Mail ----
+# Mail is not gated on a grant: everybody with an account gets the tab, and what
+# they see is decided by which mailboxes are theirs. The admin is the only one who
+# can configure anything or hand an address out, so those endpoints check for the
+# admin and the rest filter by ownership. visible_boxes is the single place that
+# decision is made, and every read passes its result through as the box filter,
+# so there is no path that reads a mailbox somebody does not own.
+def _mail_work(fn, *args, **kwargs):
+    def work():
+        conn = DB.get_connection()
+        try:
+            mail.ensure_schema(conn)
+            return fn(conn, *args, **kwargs)
+        finally:
+            DB.release_connection(conn)
+    return work
+
+def _mail_identity(perms):
+    return perms.get("username") or "", perms.get("role") == "admin"
+
+def _mail_overview(conn, username, is_admin):
+    cfg = mail.config(conn)
+    mine = mail.visible_boxes(conn, username, is_admin)
+    out = {
+        "configured": cfg["configured"],
+        "domain": cfg["domain"],
+        "is_admin": is_admin,
+        "username": username,
+        "boxes": mine,
+        "unread": mail.unread_count(conn, [b["id"] for b in mine]),
+        "outbound_ready": cfg["outbound_ready"],
+    }
+    if is_admin:
+        out["config"] = cfg
+        out["all_boxes"] = mail.boxes(conn)
+        out["inbound"] = mailcow.status(conn)
+        out["dns"] = mailcow.dns_help(cfg["domain"])
+        out["staff"] = [u["username"] for u in panel_users.list_users(conn)]
+    return out
+
+@app.get("/api/mail/overview")
+async def api_mail_overview(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    username, is_admin = _mail_identity(perms)
+    return await DB.run(_mail_work(_mail_overview, username, is_admin))
+
+@app.get("/api/mail/unread")
+async def api_mail_unread(request: Request):
+    """Just the number behind the tab, so the badge does not cost a full read."""
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    username, is_admin = _mail_identity(perms)
+
+    def work(conn):
+        mine = mail.visible_boxes(conn, username, is_admin)
+        return {"unread": mail.unread_count(conn, [b["id"] for b in mine]),
+                "boxes": len(mine)}
+    return await DB.run(_mail_work(work))
+
+@app.get("/api/mail/messages")
+async def api_mail_messages(request: Request, folder: str = "inbox",
+                            box: str = "", page: int = 1):
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    username, is_admin = _mail_identity(perms)
+
+    def work(conn):
+        mine = mail.visible_boxes(conn, username, is_admin)
+        ids = [b["id"] for b in mine]
+        if box:
+            # A box filter can only ever narrow what the caller may already read.
+            ids = [b["id"] for b in mine if b["address"] == box.strip().lower()]
+        return mail.messages(conn, ids, folder=folder, page=page)
+    return await DB.run(_mail_work(work))
+
+@app.post("/api/mail/read")
+async def api_mail_read(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    username, is_admin = _mail_identity(perms)
+    body = await _json_body(request)
+    try:
+        message_id = int(body.get("id"))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": "Which message?"})
+    read = bool(body.get("read", True))
+
+    def work(conn):
+        mine = mail.visible_boxes(conn, username, is_admin)
+        return mail.mark_read(conn, message_id, [b["id"] for b in mine], read)
+    if not await DB.run(_mail_work(work)):
+        return JSONResponse(status_code=404, content={"error": "No such message."})
+    return {"status": "ok"}
+
+@app.delete("/api/mail/message/{message_id}")
+async def api_mail_delete(request: Request, message_id: int):
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    username, is_admin = _mail_identity(perms)
+
+    def work(conn):
+        mine = mail.visible_boxes(conn, username, is_admin)
+        return mail.delete_message(conn, message_id, [b["id"] for b in mine])
+    if not await DB.run(_mail_work(work)):
+        return JSONResponse(status_code=404, content={"error": "No such message."})
+    return {"status": "ok"}
+
+@app.post("/api/mail/send")
+async def api_mail_send(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    username, is_admin = _mail_identity(perms)
+    body = await _json_body(request)
+    from_address = (body.get("from") or "").strip().lower()
+    route = (body.get("route") or "").strip().lower()
+
+    def work(conn):
+        mine = mail.visible_boxes(conn, username, is_admin)
+        if from_address not in {b["address"] for b in mine}:
+            return False, "That is not one of your addresses.", ""
+        display = next((b["full_name"] for b in mine
+                        if b["address"] == from_address), "") or perms.get("full_name", "")
+        return mail.send(conn, from_address, body.get("to") or "",
+                         body.get("subject") or "", body.get("body") or "",
+                         route, actor=username, from_name=display)
+
+    ok, message, used = await DB.run(_mail_work(work))
+    write_log("ACTION" if ok else "WARN", "MAIL", "Mail sent", actor=username,
+              ip=_client_ip(request), target=(body.get("to") or "")[:200],
+              detail=f"{used or route}: {message}"[:400],
+              status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message, "route": used}
+
+# ---- Mail configuration and mailboxes, admin only ----
+@app.post("/api/mail/domain")
+async def api_mail_domain(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    domain = (body.get("domain") or "").strip().lower()
+    actor = _admin_name(request)
+    ok, message = await DB.run(_mail_work(mail.set_domain, domain, actor))
+    write_log("ACTION" if ok else "WARN", "MAIL", "Mail domain set", actor=actor,
+              ip=_client_ip(request), target=domain, detail=message[:300],
+              status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.post("/api/mail/relay")
+async def api_mail_relay(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    actor = _admin_name(request)
+    ok, message = await DB.run(_mail_work(
+        mail.set_relay, body.get("host") or "", body.get("port") or mail.DEFAULT_RELAY_PORT,
+        body.get("user") or "", body.get("password") or "",
+        bool(body.get("starttls", True)), body.get("from") or "", actor))
+    write_log("ACTION" if ok else "WARN", "MAIL", "Outbound relay configured",
+              actor=actor, ip=_client_ip(request),
+              target=(body.get("host") or "")[:200], detail=message[:300],
+              status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.post("/api/mail/relay/check")
+async def api_mail_relay_check(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    ok, detail = await DB.run(_mail_work(mail.check_relay))
+    write_log("ACTION" if ok else "WARN", "MAIL", "Relay check", actor=_admin_name(request),
+              ip=_client_ip(request), detail=detail[:300], status="ok" if ok else "failed")
+    return {"status": "ok" if ok else "failed", "ok": ok, "detail": detail}
+
+@app.post("/api/mail/box")
+async def api_mail_box_create(request: Request):
+    """Create an address under the configured domain, and create it at mailcow too
+    when mailcow is reachable, so the same address exists in both places."""
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    local_part = (body.get("local_part") or "").strip().lower()
+    owner = (body.get("owner") or "").strip()
+    full_name = body.get("full_name") or ""
+    actor = _admin_name(request)
+
+    def work(conn):
+        cfg = mail.config(conn)
+        if not cfg["domain"]:
+            return False, "Configure the mail domain first.", ""
+        secret = secrets.token_urlsafe(18)
+        server_side, note = False, ""
+        if mailcow.api_ready(conn):
+            made, detail = mailcow.add_mailbox(conn, local_part, cfg["domain"],
+                                               secret, full_name)
+            server_side = bool(made)
+            if not made:
+                note = f" mailcow would not create it: {detail}"
+        ok, message, _box_id = mail.create_box(conn, local_part, owner, full_name,
+                                               actor, secret=secret,
+                                               server_side=server_side)
+        return ok, message + note, ("server" if server_side else "panel")
+
+    ok, message, where = await DB.run(_mail_work(work))
+    write_log("ACTION" if ok else "WARN", "MAIL", "Mailbox created", actor=actor,
+              ip=_client_ip(request), target=local_part[:100],
+              detail=f"{where}; owner={owner or 'admin'}; {message}"[:400],
+              status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message, "where": where}
+
+@app.post("/api/mail/box/assign")
+async def api_mail_box_assign(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    address = (body.get("address") or "").strip().lower()
+    owner = (body.get("owner") or "").strip()
+
+    def work(conn):
+        if owner and not panel_users.get_user(conn, owner):
+            return False, f"There is no account called {owner}."
+        return mail.assign_box(conn, address, owner)
+
+    ok, message = await DB.run(_mail_work(work))
+    write_log("ACTION" if ok else "WARN", "MAIL", "Mailbox assigned",
+              actor=_admin_name(request), ip=_client_ip(request), target=address,
+              detail=message[:300], status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.post("/api/mail/box/name")
+async def api_mail_box_name(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    ok, message = await DB.run(_mail_work(
+        mail.set_box_name, (body.get("address") or "").strip().lower(),
+        body.get("full_name") or ""))
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.delete("/api/mail/box/{address}")
+async def api_mail_box_delete(request: Request, address: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    address = (address or "").strip().lower()
+
+    def work(conn):
+        if mailcow.api_ready(conn):
+            mailcow.delete_mailbox(conn, address)
+        return mail.delete_box(conn, address)
+
+    ok, message = await DB.run(_mail_work(work))
+    write_log("ACTION" if ok else "WARN", "MAIL", "Mailbox deleted",
+              actor=_admin_name(request), ip=_client_ip(request), target=address,
+              detail=message[:300], status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.post("/api/mail/inbound/prepare")
+async def api_mail_inbound_prepare(request: Request):
+    """Set up mailcow for the domain, and open the one port mail arrives on.
+
+    Port 25 is opened here rather than left to the operator because a mail server
+    nothing can reach is not a mail server, and this is the moment the intent is
+    unambiguous.
+    """
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    domain = (body.get("domain") or "").strip().lower()
+    actor = _admin_name(request)
+
+    def work(conn):
+        ok, message = mail.set_domain(conn, domain, actor)
+        if not ok:
+            return False, message, {}
+        started, note = mailcow.prepare(domain)
+        opened, detail = firewall.set_rule(
+            conn, mailcow.SMTP_PORT, "tcp", "in", True,
+            note="inbound mail", auto=True, created_by=actor)
+        return started, f"{message} {note}", {"port_opened": bool(opened),
+                                              "port_detail": detail}
+
+    try:
+        ok, message, extra = await DB.run(_mail_work(work))
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    write_log("ACTION" if ok else "WARN", "MAIL", "Inbound mail prepared",
+              actor=actor, ip=_client_ip(request), target=domain,
+              detail=message[:400], status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message, **extra}
+
+@app.post("/api/mail/inbound/{action}")
+async def api_mail_inbound_action(request: Request, action: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    if action == "start":
+        ok, message = mailcow.start_stack()
+    elif action == "stop":
+        ok, message = mailcow.stop_stack()
+    elif action == "key":
+        body = await _json_body(request)
+        ok, message = await DB.run(_mail_work(mail.set_mailcow_key,
+                                              body.get("key") or "",
+                                              _admin_name(request)))
+    else:
+        return JSONResponse(status_code=400,
+                            content={"error": "That is not something inbound mail can be asked to do."})
+    write_log("ACTION" if ok else "WARN", "MAIL", f"Inbound mail {action}",
+              actor=_admin_name(request), ip=_client_ip(request),
+              detail=message[:300], status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.get("/api/mail/inbound-job")
+async def api_mail_inbound_job(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    return mailcow.job_state()
+
+@app.post("/api/mail/sync")
+async def api_mail_sync(request: Request):
+    """Collect what has arrived at a mailbox on the mail server into the panel."""
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    username, is_admin = _mail_identity(perms)
+    body = await _json_body(request)
+    address = (body.get("address") or "").strip().lower()
+
+    def work(conn):
+        mine = mail.visible_boxes(conn, username, is_admin)
+        if address not in {b["address"] for b in mine}:
+            return False, "That is not one of your addresses.", 0
+        return mailcow.sync_box(conn, address)
+
+    ok, message, added = await DB.run(_mail_work(work))
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message, "added": added}
 
 @app.get("/api/system/ssh-status")
 async def api_ssh_status(request: Request):

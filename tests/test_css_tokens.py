@@ -183,3 +183,42 @@ def test_a_locked_tunnel_step_is_still_readable():
     opacity = re.search(r"opacity:\s*([\d.]+)", body)
     assert opacity and float(opacity.group(1)) >= 0.6, \
         f"dimmer than 0.6 and the copy cannot be read: {body}"
+
+
+# A class in the markup that no rule matches is the same silent failure as an
+# undefined token: the element renders, unstyled, and nothing errors. The mail
+# STARTTLS row shipped with .px-check-label and .px-check-help, neither of which
+# exists, so its label and its help sentence ran together into one grey line.
+_JS_HOOK_CLASSES = {
+    # Selected by querySelectorAll and styled by nothing. A real hook, not a typo.
+    "sec-cat-group",
+}
+_CHECKED_PREFIXES = ("px-", "mail-", "cf-", "grant-", "log-", "sec-", "db-")
+
+
+def _markup_classes():
+    out = set()
+    for name in ("panel.py", os.path.join("static_mgmt", "management.js")):
+        with open(os.path.join(ROOT, name), encoding="utf-8") as fh:
+            text = fh.read()
+        for value in re.findall(r"""class(?:Name)?\s*=\s*['"`]([^'"`{}]+)['"`]""", text):
+            out.update(value.split())
+    return out
+
+
+def test_every_class_in_the_markup_has_a_rule_behind_it():
+    defined = set(re.findall(r"\.([a-zA-Z][\w-]*)", _strip_comments(_sheet())))
+    missing = sorted(c for c in _markup_classes()
+                     if c.startswith(_CHECKED_PREFIXES)
+                     and c not in defined and c not in _JS_HOOK_CLASSES)
+    assert not missing, f"styled by nothing: {missing}"
+
+
+def test_the_mail_comes_before_the_mail_setup():
+    """The setup cards used to render above #mail-main, so the one person who had
+    already finished the setup, the admin, had their inbox pushed off screen by
+    the questions they had already answered."""
+    with open(os.path.join(ROOT, "panel.py"), encoding="utf-8") as fh:
+        text = fh.read()
+    assert text.index('id="mail-main"') < text.index('id="mail-setup"'), \
+        "the inbox has to lead the Mail pane; the setup follows it"

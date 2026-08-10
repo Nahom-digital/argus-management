@@ -6,6 +6,11 @@
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function escAttr(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function $(id){return document.getElementById(id);}
+/* CSS honours prefers-reduced-motion on its own; a scroll asked for in script
+ * does not, so anything that scrolls has to ask. */
+function reduceMotion(){
+  return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
 
 function appToast(msg, type, ms){
   let wrap = $('app-toast-wrap');
@@ -62,6 +67,7 @@ function switchSection(name){
   if(name==='config') configBack(true);
   if(name==='terminal') setTimeout(initTerminal,30);
   if(name==='logs') loadSecurityLogs();
+  if(name==='mail') loadMail();
   if(name==='account') loadAccount();
 }
 
@@ -1258,6 +1264,538 @@ async function deleteProxyHost(filename){
   }catch(e){ appToast('Network error','err'); }
 }
 
+/* ================= MAIL =================
+   One pane, two audiences. An admin may still have to set the whole thing
+   up, so they get the setup cards until a domain exists. Everybody else
+   either has an address, in which case they get their mail, or does not,
+   in which case they are told so plainly and told who can fix it.
+
+   Which way a message went is part of every row, because "did that leave
+   the building" is the first thing anybody asks about a sent message. */
+let MAIL={}, MAIL_FOLDER='inbox', MAIL_MSGS=[], MAIL_OPEN=null, _mailBadgeTimer=null;
+
+async function loadMail(){
+  const setup=$('mail-setup'); if(!setup) return;
+  try{
+    const d=await getJSON('/api/mail/overview'); if(!d) return;
+    MAIL=d;
+    renderMailSetup();
+    const hasBox=(d.boxes||[]).length>0;
+    cfShow('mail-main', d.configured&&hasBox);
+    if(d.configured&&hasBox){
+      fillMailBoxes();
+      loadMailMessages();
+    }
+    setMailBadge(d.unread||0);
+  }catch(e){
+    setup.innerHTML='<div class="empty-state">Could not load mail.</div>';
+  }
+}
+
+function renderMailSetup(){
+  const el=$('mail-setup'); const d=MAIL||{};
+  const running=!!d.configured&&(d.boxes||[]).length>0;
+  cfShow('mail-settings-btn', !!d.is_admin&&running);
+  el.hidden=false;
+  if(!d.is_admin){
+    if(!d.configured){
+      el.innerHTML=`<div class="mail-empty-note">
+        <b>Mail is not configured yet.</b><br>
+        An administrator has to set up the mail domain before addresses can exist.
+        Ask them to do it, and your address will appear here.</div>`;
+      return;
+    }
+    if(!(d.boxes||[]).length){
+      el.innerHTML=`<div class="mail-empty-note">
+        <b>You do not have an address yet.</b><br>
+        Mail is running on <b>${esc(d.domain)}</b>. An administrator can create an
+        address for you and assign it to <b>${esc(d.username)}</b>.</div>`;
+      return;
+    }
+    el.innerHTML='';
+    return;
+  }
+  el.innerHTML=mailAdminHtml(d);
+  // Nobody opens Mail to look at a relay password. Once there is mail to read,
+  // the settings fold away behind the button in the bar; while there is not,
+  // they stay open, because they are the whole page.
+  el.hidden=running;
+  const btn=$('mail-settings-btn');
+  if(btn) btn.setAttribute('aria-expanded','false');
+}
+
+function mailNothingOpenHtml(){
+  return `<div class="mail-read-nothing">
+    <svg class="ic"><use href="#ic-mail"/></svg>
+    <b>Nothing open</b>
+    Pick a message on the left and it opens here. Unread ones carry a red dot.</div>`;
+}
+
+function mailToggleSettings(){
+  const el=$('mail-setup'); if(!el) return;
+  const opening=el.hidden;
+  el.hidden=!opening;
+  const btn=$('mail-settings-btn');
+  if(btn) btn.setAttribute('aria-expanded', opening?'true':'false');
+  if(opening) el.scrollIntoView({behavior:reduceMotion()?'auto':'smooth', block:'start'});
+}
+
+function mailAdminHtml(d){
+  const cfg=d.config||{}, inb=d.inbound||{};
+  const boxes=d.all_boxes||[], staff=d.staff||[];
+  const dns=(d.dns||[]).map(r=>`<tr><td class="mono">${esc(r.type)}</td>
+      <td class="mono">${esc(r.name)}</td><td class="mono">${esc(r.value)}</td>
+      <td style="color:var(--gray-600);">${esc(r.why)}</td></tr>`).join('');
+
+  const inboundState=inb.ready?'<span class="cf-state cf-ok">receiving</span>'
+    :inb.installed?'<span class="cf-state cf-wait">set up, not receiving</span>'
+    :'<span class="cf-state">not set up</span>';
+  const outState=cfg.relay_host?'<span class="cf-state cf-ok">configured</span>'
+    :'<span class="cf-state">not set up</span>';
+
+  const setup=!d.configured?`
+    <div class="cfg-card cfg-card-wide">
+      <div class="device-title">Set the mail domain</div>
+      <div class="settings-subtitle" style="margin:6px 0 14px;">
+        Every address on this system lives under one domain. It is asked once,
+        and the two buttons below disappear once it is answered.
+      </div>
+      <div class="cf-add-row">
+        <input class="field-input" id="mail-domain" type="text" maxlength="253"
+               placeholder="example.com" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="cf-btn-row" style="margin-top:12px;">
+        <button class="save-btn" onclick="mailConfigureInbound()">Configure inbound mail</button>
+        <button class="db-action-btn" onclick="mailConfigureOutbound()">Configure outbound mail</button>
+      </div>
+      <div class="field-hint" style="margin-top:10px;">
+        Inbound sets up mailcow on this server and opens port 25 so mail can
+        arrive. Outbound only needs a relay to hand mail to, and works on its own.
+      </div>
+      <div class="save-feedback" id="mail-domain-feedback"></div>
+    </div>`:'';
+
+  return `${setup}
+  <div class="mail-setup-grid" ${d.configured?'':'style="margin-top:16px;"'}>
+    <div class="cfg-card cfg-card-wide">
+      <div class="px-card-head">
+        <div><div class="device-title">Inbound mail</div>
+          <div class="settings-subtitle" style="margin-top:6px;">mailcow, on port 25.
+            Nothing arrives until this is running and DNS points here.</div></div>
+        ${inboundState}
+      </div>
+      <div class="px-fw-status" style="margin-top:12px;">
+        <span>Docker: ${inb.docker?'ready':esc(inb.docker_note||'not available')}</span>
+        <span>Compose: ${inb.compose?'ready':'missing'}</span>
+        <span>Containers: ${inb.containers_running||0}/${inb.containers_total||0}</span>
+        <span>Port 25: ${inb.smtp_listening?'listening':'closed'}</span>
+      </div>
+      ${(inb.problems||[]).map(p=>`<div class="cf-missing">${esc(p)}</div>`).join('')}
+      <div class="cf-btn-row" style="margin-top:14px;">
+        ${d.configured?`<button class="save-btn" onclick="mailInbound('prepare')">${inb.installed?'Re-run setup':'Set up mailcow'}</button>`:''}
+        <button class="db-action-btn" onclick="mailInbound('start')" ${inb.installed?'':'disabled'}>Start containers</button>
+        <button class="db-action-btn" onclick="mailInbound('stop')" ${inb.installed?'':'disabled'}>Stop</button>
+      </div>
+      <div class="save-feedback" id="mail-inbound-feedback">${inb.busy?esc(inb.action+'…'):''}</div>
+      <div class="field-group" style="margin-top:16px;">
+        <label class="field-label" for="mail-api-key">mailcow API key</label>
+        <div class="field-hint">Read and write, from mailcow's own admin page. With it,
+          an address created here is created on the mail server too.
+          ${cfg.mailcow_key_set?'A key is stored.':'No key stored yet.'}</div>
+        <input class="field-input" id="mail-api-key" type="password" maxlength="200"
+               autocomplete="off" placeholder="${cfg.mailcow_key_set?'stored, type to replace':''}">
+      </div>
+      <button class="db-action-btn" onclick="mailSaveKey()">Save key</button>
+      ${dns?`<div class="field-label" style="margin-top:18px;">DNS this needs</div>
+      <div class="mail-dns"><table><thead><tr><th>Type</th><th>Name</th><th>Value</th><th>Why</th></tr></thead>
+      <tbody>${dns}</tbody></table></div>`:''}
+    </div>
+
+    <div class="cfg-card cfg-card-wide">
+      <div class="px-card-head">
+        <div><div class="device-title">Outbound mail</div>
+          <div class="settings-subtitle" style="margin-top:6px;">The relay external
+            mail is handed to. Internal mail never goes near it.</div></div>
+        ${outState}
+      </div>
+      <div class="field-group" style="margin-top:14px;">
+        <label class="field-label" for="mail-relay-host">Relay host</label>
+        <input class="field-input" id="mail-relay-host" type="text" maxlength="255"
+               value="${escAttr(cfg.relay_host||'')}" placeholder="smtp.example.com"
+               autocomplete="off" spellcheck="false">
+      </div>
+      <div class="cf-route-form">
+        <div class="cf-field cf-field-port">
+          <label class="field-label" for="mail-relay-port">Port</label>
+          <input class="field-input" id="mail-relay-port" type="number" min="1" max="65535"
+                 value="${escAttr(cfg.relay_port||587)}" inputmode="numeric">
+        </div>
+        <div class="cf-field">
+          <label class="field-label" for="mail-relay-user">Username</label>
+          <input class="field-input" id="mail-relay-user" type="text" maxlength="255"
+                 value="${escAttr(cfg.relay_user||'')}" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="cf-field">
+          <label class="field-label" for="mail-relay-pass">Password</label>
+          <input class="field-input" id="mail-relay-pass" type="password" maxlength="300"
+                 autocomplete="new-password"
+                 placeholder="${cfg.relay_secret_set?'stored, type to replace':''}">
+        </div>
+      </div>
+      <label class="px-check-row" style="margin-top:12px;">
+        <input type="checkbox" id="mail-relay-tls" ${cfg.relay_starttls!==false?'checked':''}>
+        <span class="grant-copy">
+          <span class="grant-label">STARTTLS</span>
+          <span class="grant-help">Upgrade the connection to TLS before signing in.
+            Leave this on unless the relay does not support it.</span></span>
+      </label>
+      <div class="cf-btn-row" style="margin-top:14px;">
+        <button class="save-btn" onclick="mailSaveRelay()">Save relay</button>
+        <button class="db-action-btn" onclick="mailCheckRelay()" ${cfg.relay_host?'':'disabled'}>Test connection</button>
+      </div>
+      <div class="field-hint" style="margin-top:10px;">
+        ${cfg.relay_checked_at?esc('Last checked '+cfg.relay_checked_at+', '+(cfg.relay_check_detail||'')):'Not tested yet.'}
+      </div>
+      <div class="save-feedback" id="mail-relay-feedback"></div>
+    </div>
+  </div>
+
+  ${d.configured?`
+  <div class="cfg-card cfg-card-wide" style="margin-top:16px;">
+    <div class="device-title">Addresses on ${esc(d.domain)}</div>
+    <div class="settings-subtitle" style="margin:6px 0 14px;">
+      Create an address and hand it to somebody. An address with no owner is one
+      only you can read.
+    </div>
+    <div class="cf-route-form">
+      <div class="cf-field">
+        <label class="field-label" for="mail-new-local">Address</label>
+        <input class="field-input" id="mail-new-local" type="text" maxlength="64"
+               placeholder="sales" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="cf-field">
+        <label class="field-label" for="mail-new-name">Full name on the message</label>
+        <input class="field-input" id="mail-new-name" type="text" maxlength="160"
+               placeholder="Sales Desk" autocomplete="off">
+      </div>
+      <div class="cf-field">
+        <label class="field-label" for="mail-new-owner">Belongs to</label>
+        <select class="field-input" id="mail-new-owner">
+          <option value="">Admin only</option>
+          ${staff.map(u=>`<option value="${escAttr(u)}">${esc(u)}</option>`).join('')}
+        </select>
+      </div>
+      <button class="save-btn" onclick="mailCreateBox()">Create address</button>
+    </div>
+    <div class="save-feedback" id="mail-box-feedback"></div>
+    <div style="margin-top:16px;">
+      ${boxes.length?boxes.map(b=>`<div class="cf-row">
+        <div class="cf-row-main">
+          <div class="cf-row-name">${esc(b.address)}${b.server_side?' <span class="cf-badge">on the server</span>':''}</div>
+          <div class="cf-row-sub">${esc(b.full_name||'no display name')} · ${b.owner?'belongs to '+esc(b.owner):'admin only'}${b.unread?' · '+b.unread+' unread':''}</div>
+        </div>
+        <div class="cf-row-acts">
+          <select class="field-input" style="padding:5px 8px;font-size:12px;"
+                  onchange="mailAssign('${escAttr(b.address)}',this.value)">
+            <option value=""${b.owner?'':' selected'}>Admin only</option>
+            ${staff.map(u=>`<option value="${escAttr(u)}"${b.owner===u?' selected':''}>${esc(u)}</option>`).join('')}
+          </select>
+          <button class="db-action-btn cf-danger" onclick="mailDeleteBox('${escAttr(b.address)}')">Delete</button>
+        </div></div>`).join('')
+      :'<div class="empty-state">No addresses yet.</div>'}
+    </div>
+  </div>`:''}`;
+}
+
+function mailFeedback(id, ok, text){
+  const fb=$(id); if(!fb) return;
+  fb.className='save-feedback '+(ok?'ok':'err'); fb.textContent=text;
+}
+
+async function mailPost(path, payload, feedbackId, okMessage){
+  try{
+    const r=await api(path,{method:'POST',headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify(payload||{})});
+    const d=await r.json();
+    if(!r.ok){ if(feedbackId) mailFeedback(feedbackId,false,d.error||'That did not work.'); return null; }
+    if(feedbackId) mailFeedback(feedbackId,true,d.message||okMessage||'Saved.');
+    return d;
+  }catch(e){ if(feedbackId) mailFeedback(feedbackId,false,'Network error.'); return null; }
+}
+
+async function mailConfigureInbound(){
+  const domain=($('mail-domain').value||'').trim().toLowerCase();
+  if(!domain){ mailFeedback('mail-domain-feedback',false,'Type the domain first.'); return; }
+  const d=await mailPost('/api/mail/inbound/prepare',{domain},'mail-domain-feedback');
+  if(d){ appToast('Setting up inbound mail','ok'); mailWatchJob(); loadMail(); }
+}
+async function mailConfigureOutbound(){
+  const domain=($('mail-domain').value||'').trim().toLowerCase();
+  if(!domain){ mailFeedback('mail-domain-feedback',false,'Type the domain first.'); return; }
+  const d=await mailPost('/api/mail/domain',{domain},'mail-domain-feedback');
+  if(d){ appToast('Domain saved, now fill in the relay','ok'); loadMail(); }
+}
+async function mailInbound(action){
+  if(action==='prepare'){
+    const domain=(MAIL.domain||'');
+    const d=await mailPost('/api/mail/inbound/prepare',{domain},'mail-inbound-feedback');
+    if(d) mailWatchJob();
+    return;
+  }
+  const d=await mailPost('/api/mail/inbound/'+action,{},'mail-inbound-feedback');
+  if(d) mailWatchJob();
+}
+function mailWatchJob(){
+  /* Cloning mailcow and pulling its images take minutes, so the server runs it
+     in the background and this reports on it until it finishes. */
+  const tick=async()=>{
+    try{
+      const j=await getJSON('/api/mail/inbound-job'); if(!j) return;
+      if(j.busy){ mailFeedback('mail-inbound-feedback',true,j.action+'… '+j.seconds+'s'); setTimeout(tick,4000); return; }
+      if(j.error){ mailFeedback('mail-inbound-feedback',false,j.error); }
+      else if(j.action){ mailFeedback('mail-inbound-feedback',true,j.output||'Done.'); }
+      loadMail();
+    }catch(e){ /* the next tick may work */ }
+  };
+  setTimeout(tick,1500);
+}
+async function mailSaveKey(){
+  const key=($('mail-api-key').value||'').trim();
+  if(!key){ mailFeedback('mail-inbound-feedback',false,'Paste the API key first.'); return; }
+  const d=await mailPost('/api/mail/inbound/key',{key},'mail-inbound-feedback');
+  if(d){ $('mail-api-key').value=''; loadMail(); }
+}
+async function mailSaveRelay(){
+  const payload={host:($('mail-relay-host').value||'').trim(),
+                 port:($('mail-relay-port').value||'587').trim(),
+                 user:($('mail-relay-user').value||'').trim(),
+                 password:$('mail-relay-pass').value||'',
+                 starttls:$('mail-relay-tls').checked};
+  const d=await mailPost('/api/mail/relay',payload,'mail-relay-feedback');
+  if(d){ $('mail-relay-pass').value=''; loadMail(); }
+}
+async function mailCheckRelay(){
+  mailFeedback('mail-relay-feedback',true,'Connecting…');
+  try{
+    const r=await api('/api/mail/relay/check',{method:'POST'});
+    const d=await r.json();
+    mailFeedback('mail-relay-feedback',!!d.ok,(d.ok?'Works: ':'Failed: ')+(d.detail||''));
+    loadMail();
+  }catch(e){ mailFeedback('mail-relay-feedback',false,'Network error.'); }
+}
+async function mailCreateBox(){
+  const payload={local_part:($('mail-new-local').value||'').trim().toLowerCase(),
+                 full_name:($('mail-new-name').value||'').trim(),
+                 owner:$('mail-new-owner').value||''};
+  if(!payload.local_part){ mailFeedback('mail-box-feedback',false,'Type the part before the @.'); return; }
+  const d=await mailPost('/api/mail/box',payload,'mail-box-feedback');
+  if(d){ $('mail-new-local').value=''; $('mail-new-name').value=''; loadMail(); }
+}
+async function mailAssign(address, owner){
+  const d=await mailPost('/api/mail/box/assign',{address,owner},'mail-box-feedback');
+  if(d) loadMail();
+}
+async function mailDeleteBox(address){
+  if(!(await uiConfirm('Delete '+address+'?','Every message stored for it goes too.'))) return;
+  try{
+    const r=await api('/api/mail/box/'+encodeURIComponent(address),{method:'DELETE'});
+    const d=await r.json();
+    if(!r.ok){ mailFeedback('mail-box-feedback',false,d.error||'Could not delete it.'); return; }
+    appToast('Address deleted','ok'); loadMail();
+  }catch(e){ mailFeedback('mail-box-feedback',false,'Network error.'); }
+}
+
+/* ---- reading ---- */
+function fillMailBoxes(){
+  const sel=$('mail-box'); if(!sel) return;
+  const boxes=MAIL.boxes||[]; const keep=sel.value;
+  sel.innerHTML=(boxes.length>1?'<option value="">All my addresses</option>':'')
+    +boxes.map(b=>`<option value="${escAttr(b.address)}">${esc(b.address)}${b.unread?' ('+b.unread+')':''}</option>`).join('');
+  if(keep&&[...sel.options].some(o=>o.value===keep)) sel.value=keep;
+  const sync=$('mail-sync-btn');
+  if(sync) sync.hidden=!boxes.some(b=>b.server_side);
+}
+function mailFolder(folder){
+  MAIL_FOLDER=folder;
+  document.querySelectorAll('[data-mailfolder]').forEach(b=>
+    b.classList.toggle('active', b.dataset.mailfolder===folder));
+  loadMailMessages();
+}
+async function loadMailMessages(){
+  const list=$('mail-list'); if(!list) return;
+  list.innerHTML='<div class="empty-state">Loading&hellip;</div>';
+  const box=$('mail-box')?$('mail-box').value:'';
+  try{
+    const d=await getJSON(`/api/mail/messages?folder=${encodeURIComponent(MAIL_FOLDER)}&box=${encodeURIComponent(box)}`);
+    if(!d) return;
+    MAIL_MSGS=d.messages||[];
+    renderMailList();
+  }catch(e){ list.innerHTML='<div class="empty-state">Could not load messages.</div>'; }
+}
+function renderMailList(){
+  const list=$('mail-list');
+  if(!MAIL_MSGS.length){
+    list.innerHTML=`<div class="empty-state">${MAIL_FOLDER==='sent'
+      ?'Nothing sent yet.':'No mail here yet.'}</div>`;
+    return;
+  }
+  list.innerHTML=MAIL_MSGS.map((m,i)=>{
+    const who=MAIL_FOLDER==='sent'?m.to_addr:(m.from_name||m.from_addr);
+    const preview=(m.body||'').replace(/\s+/g,' ').slice(0,110);
+    return `<button class="mail-item${m.unread&&m.direction==='in'?' unread':''}${MAIL_OPEN===m.id?' active':''}"
+      onclick="mailOpen(${i})">
+      <div class="mail-item-top">
+        <span class="mail-item-who">${esc(who||'unknown')}</span>
+        <span class="mail-item-when">${esc(String(m.ts).slice(5,16))}</span>
+      </div>
+      <div class="mail-item-subject">${esc(m.subject||'(no subject)')}</div>
+      <div class="mail-item-preview">${esc(preview)}</div>
+    </button>`;
+  }).join('');
+}
+function mailInitials(name, addr){
+  const source=(name||addr||'?').trim();
+  const parts=source.split(/[\s.@_-]+/).filter(Boolean);
+  return ((parts[0]||'?')[0]+((parts[1]||'')[0]||'')).toUpperCase();
+}
+function mailOpen(index){
+  const m=MAIL_MSGS[index]; if(!m) return;
+  MAIL_OPEN=m.id;
+  const split=document.querySelector('.mail-split'); if(split) split.classList.add('reading');
+  const routeClass=m.status==='failed'?'failed':(m.route||'internal');
+  const routeLabel=m.status==='failed'?'not sent':(m.route==='internal'?'internal':'external');
+  const who=m.direction==='in'?(m.from_name||m.from_addr):m.to_addr;
+  const addr=m.direction==='in'?m.from_addr:m.to_addr;
+  $('mail-read').innerHTML=`
+    <div class="mail-read-subject">${esc(m.subject||'(no subject)')}</div>
+    <div class="mail-read-meta">
+      <span class="mail-avatar">${esc(mailInitials(m.from_name,addr))}</span>
+      <span><span class="mail-who-name">${esc(who||'unknown')}</span><br>
+        <span class="mail-who-addr">${esc(addr||'')}</span></span>
+      <span class="mail-route ${routeClass}">${esc(routeLabel)}</span>
+      <span class="mail-item-when" style="margin-left:auto;">${esc(m.ts)}</span>
+    </div>
+    ${m.status==='failed'&&m.detail?`<div class="cf-missing">${esc(m.detail)}</div>`:''}
+    <div class="mail-read-body">${esc(m.body||'(empty message)')}</div>
+    <div class="mail-read-acts">
+      <button class="save-btn" onclick="mailReply(${index})"><svg class="ic"><use href="#ic-send"/></svg>Reply</button>
+      <button class="db-action-btn" onclick="mailMarkUnread(${m.id})">Mark unread</button>
+      <button class="db-action-btn cf-danger" onclick="mailDelete(${m.id})">Delete</button>
+    </div>`;
+  if(m.unread&&m.direction==='in'){
+    m.unread=false; renderMailList();
+    mailPost('/api/mail/read',{id:m.id,read:true}).then(()=>refreshMailBadge());
+  }
+}
+async function mailMarkUnread(id){
+  await mailPost('/api/mail/read',{id,read:false});
+  loadMail();
+}
+async function mailDelete(id){
+  if(!(await uiConfirm('Delete this message?','It is removed from this panel.'))) return;
+  try{
+    const r=await api('/api/mail/message/'+id,{method:'DELETE'});
+    if(!r.ok){ appToast('Could not delete it','err'); return; }
+    MAIL_OPEN=null;
+    $('mail-read').innerHTML=mailNothingOpenHtml();
+    appToast('Deleted','ok'); loadMailMessages(); refreshMailBadge();
+  }catch(e){ appToast('Network error','err'); }
+}
+async function mailSync(){
+  const boxes=(MAIL.boxes||[]).filter(b=>b.server_side);
+  if(!boxes.length){ appToast('No mailbox on the mail server to collect from','warn'); return; }
+  const btn=$('mail-sync-btn'); if(btn){ btn.disabled=true; }
+  let added=0;
+  for(const b of boxes){
+    const d=await mailPost('/api/mail/sync',{address:b.address});
+    if(d) added+=d.added||0;
+  }
+  if(btn) btn.disabled=false;
+  appToast(added?added+' new message(s)':'Nothing new', added?'ok':'info');
+  loadMail();
+}
+
+/* ---- writing ---- */
+function mailCompose(prefill){
+  const boxes=MAIL.boxes||[]; if(!boxes.length) return;
+  const from=boxes[0];
+  $('mail-from-row').innerHTML=`
+    <span class="mail-avatar">${esc(mailInitials(from.full_name,from.address))}</span>
+    <span><span class="mail-who-name">${esc(from.full_name||MAIL.username||'')}</span><br>
+      <span class="mail-who-addr">${esc(from.address)}</span></span>`;
+  $('mail-from-row').dataset.address=from.address;
+  $('mail-to').value=(prefill&&prefill.to)||'';
+  $('mail-subject').value=(prefill&&prefill.subject)||'';
+  $('mail-body').value=(prefill&&prefill.body)||'';
+  mailFeedback('mail-send-feedback',true,'');
+  cfShow('mail-compose-card', true);
+  mailSyncRouteHint();
+  $('mail-to').focus();
+}
+function mailCloseCompose(){ cfShow('mail-compose-card', false); }
+function mailReply(index){
+  const m=MAIL_MSGS[index]; if(!m) return;
+  const quoted=(m.body||'').split('\n').map(l=>'> '+l).join('\n');
+  mailCompose({to:m.direction==='in'?m.from_addr:m.to_addr,
+               subject:/^re:/i.test(m.subject||'')?m.subject:'Re: '+(m.subject||''),
+               body:'\n\n'+quoted});
+}
+function mailRoute(){
+  const el=document.querySelector('input[name="mail-route"]:checked');
+  return el?el.value:'internal';
+}
+function mailSyncRouteHint(){
+  const hint=$('mail-to-hint'); if(!hint) return;
+  if(mailRoute()==='internal'){
+    hint.textContent='Internal: the address has to be one on this system, and the '
+      +'message never touches the relay.';
+  } else if(!MAIL.outbound_ready){
+    hint.textContent='External mail has no relay configured yet, so this cannot be sent.';
+  } else {
+    hint.textContent='External: handed to the relay and delivered outside.';
+  }
+}
+async function mailSend(){
+  const from=$('mail-from-row').dataset.address||'';
+  const payload={from, to:($('mail-to').value||'').trim(),
+                 subject:($('mail-subject').value||'').trim(),
+                 body:$('mail-body').value||'', route:mailRoute()};
+  if(!payload.to){ mailFeedback('mail-send-feedback',false,'Who is it going to?'); return; }
+  const btn=$('mail-send'); if(btn){ btn.disabled=true; btn.textContent='Sending…'; }
+  const d=await mailPost('/api/mail/send',payload,'mail-send-feedback');
+  if(btn){ btn.disabled=false; btn.textContent='Send'; }
+  if(d){
+    appToast(d.route==='internal'?'Delivered internally':'Handed to the relay','ok');
+    mailCloseCompose();
+    MAIL_FOLDER='sent'; mailFolder('sent');
+    loadMail();
+  }
+}
+
+/* ---- the badge ---- */
+function setMailBadge(count){
+  [['mail-badge'],['mail-badge-m']].forEach(([id])=>{
+    const el=$(id); if(!el) return;
+    el.textContent=count>99?'99+':String(count);
+    el.hidden=!count;
+  });
+  const inbox=$('mail-inbox-count');
+  if(inbox){ inbox.textContent=count?String(count):''; inbox.style.display=count?'':'none'; }
+}
+async function refreshMailBadge(){
+  if(!$('mail-badge')&&!$('mail-badge-m')) return;
+  try{
+    const d=await getJSON('/api/mail/unread');
+    if(d) setMailBadge(d.unread||0);
+  }catch(e){ /* the badge is not worth a message */ }
+}
+function startMailBadgePolling(){
+  if(_mailBadgeTimer) return;
+  refreshMailBadge();
+  /* A minute is often enough for a mailbox and rare enough to be invisible. */
+  _mailBadgeTimer=setInterval(refreshMailBadge, 60000);
+}
+
 /* ================= CLOUDFLARE TUNNEL =================
    Four steps, and which one you are on is decided by the server's answer
    rather than by clicking through: no account means step 1, an account and
@@ -2023,6 +2561,11 @@ window.addEventListener('orientationchange',()=>{ if(CURRENT==='terminal') setTi
     .forEach(r=>r.addEventListener('change', loadSecurityLogs));
   const hstsBox=document.querySelector('[data-px="hsts"]');
   if(hstsBox) hstsBox.addEventListener('change', pxSyncHsts);
+  /* Internal and external are not two ways of doing the same thing, so the
+     hint under the recipient says which one is about to happen. */
+  document.querySelectorAll('input[name="mail-route"]')
+    .forEach(r=>r.addEventListener('change', mailSyncRouteHint));
   applyMetricPermissions();
+  startMailBadgePolling();
   switchSection('server');
 })();
