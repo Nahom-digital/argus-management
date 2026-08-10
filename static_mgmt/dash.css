@@ -1477,3 +1477,19 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
   .px-card-head { flex-direction: column; align-items: stretch; }
   .px-card-head .save-btn { width: 100%; }
 }
+
+/* ===================================================================
+   LOGS: the time range control
+   The four tiles are meaningless without saying what window they cover,
+   so the control sits directly above them rather than in a toolbar
+   further down the page.
+   =================================================================== */
+.sec-range-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.sec-range-label {
+  font-family: var(--display); font-weight: 700; font-size: 11.5px;
+  text-transform: uppercase; letter-spacing: 0.6px; color: var(--gray-500);
+}
+.sec-range-row .db-action-btn { flex: none; }

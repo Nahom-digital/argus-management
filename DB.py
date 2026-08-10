@@ -572,16 +572,22 @@ def get_web_sessions(limit: int = 100):
     return {"sessions": rows, "active": active, "total": total}
 
 def log_web_login(ip: str, username: str, success: bool, user_agent: str,
-                  tried_password: str = "", details: str = "",
-                  fp_hash: str = "", fingerprint: str = ""):
+                  details: str = "", fp_hash: str = "", fingerprint: str = ""):
+    """Record one login attempt, and count it against the address and device.
+
+    The attempted password is deliberately not a parameter. People mistype, so
+    the column this table still carries would fill up with real passwords one
+    character off, in plain text, readable by anyone with the Logs grant. What
+    an attacker typed is not worth keeping a password store for, so it is
+    written empty and the reader below does not select it.
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO web_login_log
                (ip, username, success, user_agent, tried_password, details, fp_hash, fingerprint)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-        (ip, username, success, user_agent,
-         tried_password if not success else "", details,
+           VALUES (%s, %s, %s, %s, '', %s, %s, %s)""",
+        (ip, username, success, user_agent, details,
          fp_hash or None, fingerprint or None)
     )
     if not success:
@@ -628,32 +634,40 @@ def check_web_login_allowed(ip: str, fp_hash: str = ""):
 
     Blocks if EITHER the source IP or the device fingerprint has been blocked,
     so an attacker can't dodge the lockout just by switching IP on one machine.
-    Expired blocks are cleaned up lazily."""
-    import datetime
+    Expired blocks are cleaned up lazily.
+
+    Whether a block has expired is decided by Postgres, not by Python. The rows
+    are written with CURRENT_TIMESTAMP into a column with no time zone, so
+    comparing them against datetime.utcnow() was wrong by the server's offset:
+    in GMT+3 a 24 hour block released after 21, and west of UTC it overstayed.
+    One clock, in the same place the rows come from.
+    """
     conn = get_connection()
     cur = conn.cursor()
     try:
         # --- Device-fingerprint block takes precedence (harder to evade) ---
         if fp_hash:
             cur.execute(
-                "SELECT fail_count, blocked_until FROM web_fp_block WHERE fp_hash = %s",
+                """SELECT fail_count, blocked_until, blocked_until > now() AS still_blocked
+                   FROM web_fp_block WHERE fp_hash = %s""",
                 (fp_hash,))
             frow = cur.fetchone()
             if frow and frow[1] is not None:
-                if datetime.datetime.utcnow() < frow[1]:
+                if frow[2]:
                     return False, frow[0], frow[1]
                 cur.execute("DELETE FROM web_fp_block WHERE fp_hash = %s", (fp_hash,))
                 conn.commit()
 
         cur.execute(
-            "SELECT fail_count, blocked_until FROM web_login_block WHERE ip = %s",
+            """SELECT fail_count, blocked_until, blocked_until > now() AS still_blocked
+               FROM web_login_block WHERE ip = %s""",
             (ip,))
         row = cur.fetchone()
         if not row:
             return True, 0, None
-        fail_count, blocked_until = row
+        fail_count, blocked_until, still_blocked = row
         if blocked_until is not None:
-            if datetime.datetime.utcnow() < blocked_until:
+            if still_blocked:
                 return False, fail_count, blocked_until
             cur.execute("DELETE FROM web_login_block WHERE ip = %s", (ip,))
             conn.commit()
@@ -665,8 +679,12 @@ def check_web_login_allowed(ip: str, fp_hash: str = ""):
 def get_web_login_logs(page=1, limit=50):
     conn = get_connection()
     cur = conn.cursor()
+    # tried_password is not selected on purpose, see log_web_login. Old rows may
+    # still hold one from before that changed; not reading it is what keeps it
+    # from being displayed.
     cur.execute(
-        "SELECT id, ts, ip, username, success, user_agent, tried_password, details, fp_hash, fingerprint FROM web_login_log ORDER BY id DESC LIMIT %s OFFSET %s",
+        """SELECT id, ts, ip, username, success, user_agent, details, fp_hash, fingerprint
+           FROM web_login_log ORDER BY id DESC LIMIT %s OFFSET %s""",
         (limit, (page - 1) * limit)
     )
     rows = _rows_to_dicts(cur)
@@ -826,6 +844,55 @@ _CLEARABLE = {
     "blocked":   "web_login_block",
     "fp_blocked": "web_fp_block",
 }
+
+_INTERVAL_SHAPE = re.compile(r"^\d{1,3} (?:hour|hours|day|days)$")
+
+def get_login_summary(interval: str = "1 day") -> dict:
+    """The four numbers the Logs tab leads with, over one time window.
+
+    SSH and web are counted separately and success and failure are counted
+    separately, because "total events" and "unique IPs" answered a question
+    nobody was asking.
+
+    An INTERVAL literal cannot be a bound parameter, so the interval is spliced
+    into the text and therefore has to be checked here rather than trusted. The
+    caller picks it from a fixed set in web_guard; this is the second lock on the
+    same door, so that a future caller passing a query string straight in cannot
+    turn it into a way to write SQL.
+    """
+    if not _INTERVAL_SHAPE.match(interval or ""):
+        interval = "1 day"
+    conn = get_connection()
+    cur = conn.cursor()
+    out = {"ssh_success": 0, "ssh_failed": 0, "web_success": 0, "web_failed": 0,
+           "active_sessions": 0, "blocked_ips": 0, "blocked_devices": 0}
+    since = f"now() - INTERVAL '{interval}'"
+    queries = (
+        ("ssh_success", f"""SELECT COUNT(*) FROM ssh_log
+                            WHERE ts >= {since} AND event_type = 'ACCEPTED'"""),
+        ("ssh_failed",  f"""SELECT COUNT(*) FROM ssh_log
+                            WHERE ts >= {since} AND event_type <> 'ACCEPTED'"""),
+        ("web_success", f"""SELECT COUNT(*) FROM web_login_log
+                            WHERE ts >= {since} AND success"""),
+        ("web_failed",  f"""SELECT COUNT(*) FROM web_login_log
+                            WHERE ts >= {since} AND NOT success"""),
+        ("active_sessions", """SELECT COUNT(*) FROM web_session_log
+                               WHERE status = 'active'"""),
+        ("blocked_ips", """SELECT COUNT(*) FROM web_login_block
+                           WHERE blocked_until IS NOT NULL AND blocked_until > now()"""),
+        ("blocked_devices", """SELECT COUNT(*) FROM web_fp_block
+                               WHERE blocked_until IS NOT NULL AND blocked_until > now()"""),
+    )
+    for key, sql in queries:
+        try:
+            cur.execute(sql)
+            out[key] = cur.fetchone()[0]
+        except Exception:
+            conn.rollback()   # a missing table must not take the other counts down
+    cur.close()
+    release_connection(conn)
+    return out
+
 
 def get_security_log_counts() -> dict:
     """Total stored-row count for every security log section, for the UI."""

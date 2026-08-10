@@ -24,6 +24,7 @@
 
 import os
 import re
+import datetime
 import time
 import json
 import html
@@ -49,6 +50,7 @@ import panel_users
 import ssh_vault
 import vault
 import firewall
+import web_guard
 import nginx_proxy
 from psycopg2 import sql as pg_sql
 
@@ -146,10 +148,15 @@ def _user_epoch(username: str) -> int:
 def _forget_user_epoch(username: str) -> None:
     _USER_EPOCH_CACHE.pop(username, None)
 
+# How long a signed session cookie is good for. Stated once so the cookie, the
+# token claim and the row in the sessions log cannot disagree about when a
+# session ends.
+SESSION_TTL = 86400
+
 def _create_session_token(username: str = "admin", sid: str = None) -> str:
     if sid is None:
         sid = secrets.token_hex(16)
-    payload = json.dumps({"exp": int(time.time()) + 86400,
+    payload = json.dumps({"exp": int(time.time()) + SESSION_TTL,
                           "username": username, "sid": sid,
                           "ae": _auth_epoch(), "ue": _user_epoch(username)}).encode()
     sig = hmac.new(_JWT_SECRET.encode(), payload, hashlib.sha256).hexdigest()
@@ -219,9 +226,15 @@ def _ingress_allowed(ip: str) -> bool:
     return _is_local_ip(ip) or _is_cloudflare_ip(ip)
 
 def _hop_ip(request: Request) -> str:
-    """Who actually connected to our public edge. nginx fronts this panel on
-    loopback, so the socket peer is 127.0.0.1 and the real peer nginx saw is in
-    X-Real-IP, trustworthy only because it arrived over loopback."""
+    """Who connected to our edge, as the ingress gate has to judge it.
+
+    nginx fronts this panel on loopback, so the socket peer is 127.0.0.1 and the
+    peer nginx itself saw is in X-Real-IP, trustworthy only because it arrived
+    over loopback. This is the value the Cloudflare gate rules on, so nothing
+    softer than X-Real-IP belongs here. X-Forwarded-For in particular is a list
+    any caller may prepend to, and honouring it here would let a stranger name
+    their own hop and talk their way past the gate.
+    """
     peer = request.client.host if request.client else ""
     if _is_local_ip(peer):
         real = request.headers.get("x-real-ip", "").strip()
@@ -230,11 +243,25 @@ def _hop_ip(request: Request) -> str:
     return peer
 
 def _client_ip(request: Request) -> str:
+    """The visitor, for logging and for login blocking.
+
+    Behind Cloudflare the hop is an edge address and the visitor is named in
+    CF-Connecting-IP. Behind a plain proxy the hop is already the visitor.
+    X-Forwarded-For is the last resort and is read only from a local hop,
+    because getting this wrong is no longer cosmetic: with login blocking wired
+    up, a deployment whose proxy sends nothing else would file every visitor
+    under 127.0.0.1 and let one stranger's five failures lock everybody out.
+    Only the leftmost entry is taken.
+    """
     hop = _hop_ip(request)
     if _is_cloudflare_ip(hop):
         cf = request.headers.get("cf-connecting-ip", "").strip()
         if cf:
             return cf
+    if _is_local_ip(hop):
+        first = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if first:
+            return first
     return hop
 
 def _client_ip_ws(websocket: WebSocket) -> str:
@@ -290,6 +317,50 @@ class _BasePathStrip:
                     if raw.startswith(prefix):
                         scope["raw_path"] = raw[len(prefix):] or b"/"
         await self.app(scope, receive, send)
+
+# Paths that would drown the access log without telling anyone anything: the
+# stylesheet, the fonts, the terminal bundle. A request for a font is not an
+# event worth a row, and one page load makes a dozen of them.
+_ACCESS_LOG_SKIP = ("/static/", "/assets/", "/favicon")
+
+def _record_access(ip, method, path, query, status, duration_ms, ua, referer, user):
+    """One row in the access log.
+
+    The response body is deliberately not captured. Storing it would put every
+    answer this panel ever gave, including admin-only ones, in a table any
+    account with the Logs grant can read, and would grow without bound. The
+    entry viewer already says "no response body captured" when there is none.
+    """
+    try:
+        DB.log_http_request(ip, method, path, query, status, duration_ms,
+                            ua[:400], (referer or "")[:400], user or None)
+    except Exception as e:
+        logging.warning(f"access log write failed: {e}")
+
+class _AccessLog(BaseHTTPMiddleware):
+    """Records every request that got past the ingress gate.
+
+    The table and its reader already existed; nothing ever wrote to it, so the
+    Access Log section of the Logs tab had been permanently empty. Logging must
+    never change the outcome of a request, so every failure here is swallowed.
+    """
+    async def dispatch(self, request, call_next):
+        started = time.monotonic()
+        response = await call_next(request)
+        path = request.url.path
+        if any(path.startswith(skip) for skip in _ACCESS_LOG_SKIP):
+            return response
+        duration = int((time.monotonic() - started) * 1000)
+        try:
+            user = _admin_name(request) if _authed(request) else ""
+        except Exception:
+            user = ""
+        asyncio.create_task(DB.run(
+            _record_access, _client_ip(request), request.method, path,
+            request.url.query, response.status_code, duration,
+            request.headers.get("user-agent", ""),
+            request.headers.get("referer", ""), user))
+        return response
 
 class _SecurityHeaders(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
@@ -1132,11 +1203,26 @@ _PANES_TEMPLATE = """
 
   <!-- LOGS -->
   <div class="pane" data-pane="logs"><div class="pane-scroll">
+    <!-- Four numbers, one question each. The old set mixed "total events" with
+         "unique IPs" and "active sessions", which answered nothing you would
+         actually ask. Every tile here is scoped by the range control beside it,
+         so the numbers move when you change the window. -->
+    <div class="sec-range-row">
+      <div class="sec-range-label">Showing</div>
+      <div class="grant-seg-group" id="sec-range-group">
+        <label class="grant-seg"><input type="radio" name="sec-range" value="today" checked>Today</label>
+        <label class="grant-seg"><input type="radio" name="sec-range" value="3days">Last 3 days</label>
+        <label class="grant-seg"><input type="radio" name="sec-range" value="week">Last week</label>
+        <label class="grant-seg"><input type="radio" name="sec-range" value="month">Last month</label>
+      </div>
+      <button class="db-action-btn" style="margin-left:auto;" onclick="loadSecurityLogs()">
+        <svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
+    </div>
     <div class="srv-grid" id="sec-ssh-cards" style="margin-bottom:18px;">
-      <div class="metric-card"><div class="metric-head"><span class="metric-title">SSH Total Events</span><span class="metric-now" id="sec-total">&hellip;</span></div><div class="metric-foot" id="sec-unique-ips">unique IPs: &hellip;</div></div>
-      <div class="metric-card"><div class="metric-head"><span class="metric-title">Successful Logins</span><span class="metric-now" style="color:#27ae60" id="sec-accepted">&hellip;</span></div><div class="metric-foot" id="sec-sessions">active sessions: &hellip;</div></div>
-      <div class="metric-card"><div class="metric-head"><span class="metric-title">Failed Attempts</span><span class="metric-now" style="color:#e74c3c" id="sec-failed">&hellip;</span></div><div class="metric-foot" id="sec-attackers">attacker IPs: &hellip;</div></div>
-      <div class="metric-card"><div class="metric-head"><span class="metric-title">Web Login Attempts</span><span class="metric-now" id="sec-web-total">&hellip;</span></div><div class="metric-foot" id="sec-web-fail">failed: &hellip;</div></div>
+      <div class="metric-card"><div class="metric-head"><span class="metric-title">SSH logins</span><span class="metric-now" style="color:var(--success)" id="sec-ssh-ok">&hellip;</span></div><div class="metric-foot" id="sec-ssh-ok-foot">successful, over SSH</div></div>
+      <div class="metric-card"><div class="metric-head"><span class="metric-title">SSH failures</span><span class="metric-now" style="color:var(--danger)" id="sec-ssh-bad">&hellip;</span></div><div class="metric-foot" id="sec-ssh-bad-foot">rejected SSH attempts</div></div>
+      <div class="metric-card"><div class="metric-head"><span class="metric-title">Panel logins</span><span class="metric-now" style="color:var(--success)" id="sec-web-ok">&hellip;</span></div><div class="metric-foot" id="sec-web-ok-foot">successful, in this panel</div></div>
+      <div class="metric-card"><div class="metric-head"><span class="metric-title">Panel failures</span><span class="metric-now" style="color:var(--danger)" id="sec-web-bad">&hellip;</span></div><div class="metric-foot" id="sec-web-bad-foot">wrong username or password</div></div>
     </div>
     <div class="log-cat-tabs">
       <button class="log-cat-tab" data-logcat="ssh" onclick="showLogCategory('ssh')">SSH Log</button>
@@ -1165,11 +1251,6 @@ _PANES_TEMPLATE = """
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center;">
         <button class="db-action-btn sec-section-btn active" data-sec="panel-actions" onclick="showSecSection('panel-actions')">Panel Actions</button>
       </div>
-    </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center;">
-      <button class="db-action-btn" onclick="loadSecurityLogs()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
-      <select id="sec-since-sel" onchange="loadSecurityLogs()" style="padding:5px 8px;border:1px solid var(--gray-200);border-radius:4px;font-size:12px;background:var(--white);color:var(--black);">
-        <option value="">Last 200 events</option><option value="today">Today</option><option value="yesterday">Yesterday</option><option value="7 days ago">Last 7 days</option></select>
     </div>
     <div id="sec-content"><div class="empty-state">Loading security logs&hellip;</div></div>
   </div></div>
@@ -1431,6 +1512,9 @@ async def lifespan(app: FastAPI):
     write_log("INFO", "SYSTEM", "Management panel stopped", actor="system")
 
 app = FastAPI(title="Management", lifespan=lifespan)
+# Added first => innermost, so it sees the path after the prefix is stripped and
+# only requests the ingress gate already let through.
+app.add_middleware(_AccessLog)
 app.add_middleware(_SecurityHeaders)
 app.add_middleware(_CloudflareOnly)
 # Added last => outermost, so the prefix is gone before anything else looks at
@@ -1478,16 +1562,39 @@ async def login_page(request: Request):
         return RedirectResponse(url=f"{MGMT_BASE}/", status_code=302)
     return HTMLResponse(content=_login_html())
 
+_WRONG_CREDENTIALS = "Invalid username or password."
+
 @app.post("/api/login")
 async def do_login(request: Request):
     ip = _client_ip(request)
     ua = request.headers.get("user-agent", "")
+    fp_hash, device = web_guard.fingerprint(request)
+    private = web_guard.is_private(ip)
     try:
         body = await request.json()
     except Exception:
         body = {}
     username = (body.get("username") or "").strip()
     password = body.get("password") or ""
+
+    # A blocked address or device gets the same answer as a wrong password.
+    # Saying "you are blocked" would confirm the lockout exists, reveal how long
+    # it lasts, and tell the caller that a different address gets further. The
+    # attempt is still recorded, so the operator sees it even though the caller
+    # learns nothing. A private address is blocked exactly like a public one.
+    allowed, prior_fails, blocked_until = await DB.run(
+        DB.check_web_login_allowed, ip, fp_hash)
+    if not allowed:
+        await DB.run(DB.log_web_login, ip, username, False, ua,
+                     f"refused, already blocked until {blocked_until}",
+                     fp_hash, device)
+        write_log("WARN", "AUTH", "Login attempt from a blocked source",
+                  actor=username or "?", ip=ip,
+                  detail=f"{device}; {'private' if private else 'public'} address; "
+                         f"blocked until {blocked_until}",
+                  status="denied")
+        return JSONResponse(status_code=401, content={"error": _WRONG_CREDENTIALS})
+
     try:
         ok = await DB.run(DB.verify_admin, username, password)
         if not ok:
@@ -1495,24 +1602,54 @@ async def do_login(request: Request):
     except Exception as e:
         logging.error(f"verify_admin failed: {e}")
         ok = False
+
     if not ok:
+        await DB.run(DB.log_web_login, ip, username, False, ua,
+                     "wrong username or password", fp_hash, device)
+        fails = prior_fails + 1
+        now_blocked = fails >= web_guard.FAIL_LIMIT
         write_log("WARN", "AUTH", "Failed login", actor=username or "?", ip=ip,
-                  detail=f"ua={ua[:120]}", status="denied")
-        return JSONResponse(status_code=401, content={"error": "Invalid username or password."})
+                  detail=(f"{device}; attempt {fails} of {web_guard.FAIL_LIMIT}"
+                          + (f"; address and device blocked for "
+                             f"{web_guard.BLOCK_HOURS}h" if now_blocked else "")),
+                  status="denied")
+        return JSONResponse(status_code=401, content={"error": _WRONG_CREDENTIALS})
+
     sid = secrets.token_hex(16)
     token = _create_session_token(username, sid=sid)
-    write_log("ACTION", "AUTH", "Login success", actor=username, ip=ip, detail=f"ua={ua[:120]}")
+    await DB.run(DB.log_web_login, ip, username, True, ua, "", fp_hash, device)
+    await DB.run(_record_session, sid, username, ip, ua)
+    write_log("ACTION", "AUTH", "Login success", actor=username, ip=ip,
+              detail=device)
     resp = JSONResponse(content={"status": "ok"})
     # Path-scoped to MGMT_BASE: MainApp serves its own "session" cookie on the
     # same domain now, so an unscoped cookie here would clobber that one.
-    resp.set_cookie("session", token, httponly=True, max_age=86400, samesite="lax",
+    resp.set_cookie("session", token, httponly=True, max_age=SESSION_TTL, samesite="lax",
                     secure=_is_https(request), path=_COOKIE_PATH)
     return resp
+
+def _record_session(sid, username, ip, ua):
+    """Sessions has been an empty table since it was built, because nothing ever
+    called the writer. A failure here must not cost the user their login."""
+    try:
+        expires = datetime.datetime.now() + datetime.timedelta(seconds=SESSION_TTL)
+        DB.log_session_created(sid, username, ip, ua[:400], expires)
+    except Exception as e:
+        logging.warning(f"session log write failed: {e}")
+
+def _end_session(sid, reason="logout"):
+    try:
+        DB.log_session_ended(sid, reason)
+    except Exception as e:
+        logging.warning(f"session log close failed: {e}")
 
 @app.get("/logout")
 async def logout(request: Request):
     if _authed(request):
+        data = _get_token_data(request)
         write_log("ACTION", "AUTH", "Logout", actor=_admin_name(request), ip=_client_ip(request))
+        if data and data.get("sid"):
+            await DB.run(_end_session, data["sid"], "logout")
     resp = RedirectResponse(url=f"{MGMT_BASE}/login", status_code=302)
     resp.delete_cookie("session", path=_COOKIE_PATH)
     return resp
@@ -1604,7 +1741,7 @@ async def api_account_password(request: Request):
     # one so the person who made the change is not signed out by their own action.
     resp = JSONResponse({"status": "ok"})
     resp.set_cookie("session", _create_session_token(username), httponly=True,
-                    max_age=86400, samesite="lax", secure=_is_https(request),
+                    max_age=SESSION_TTL, samesite="lax", secure=_is_https(request),
                     path=_COOKIE_PATH)
     return resp
 
@@ -2737,6 +2874,26 @@ async def api_security_log_counts(request: Request):
     if denied:
         return denied
     return await DB.run(DB.get_security_log_counts)
+
+@app.get("/api/system/security-summary")
+async def api_security_summary(request: Request, range: str = ""):
+    """The four numbers at the top of the Logs tab, over a chosen window.
+
+    The window is resolved through web_guard's fixed table rather than passed
+    through, so a query string never reaches SQL and an unknown value falls back
+    instead of failing.
+    """
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("logs_access"))
+    if denied:
+        return denied
+    label, interval = web_guard.range_interval(range)
+    counts = await DB.run(DB.get_login_summary, interval)
+    counts["range"] = range if range in web_guard.RANGES else web_guard.DEFAULT_RANGE
+    counts["range_label"] = label
+    counts["ranges"] = [{"key": k, "label": v[0]} for k, v in web_guard.RANGES.items()]
+    return counts
 
 @app.post("/api/system/clear-log")
 async def api_clear_log(request: Request):

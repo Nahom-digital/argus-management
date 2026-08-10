@@ -1416,30 +1416,47 @@ async function clearSecLog(kind,label){
     appToast(`Cleared ${d.removed} record(s) from ${label}.`,'ok'); loadSecurityLogs();
   }catch(e){ appToast('Network error: '+e,'err'); }
 }
+/* The range control drives both the tiles and the SSH event list, so the
+   numbers and the rows below them always describe the same window. The server
+   resolves the range name; sending it raw would let a query string pick an
+   interval. */
+function secRange(){
+  const el=document.querySelector('input[name="sec-range"]:checked');
+  return el?el.value:'today';
+}
+const SEC_RANGE_SINCE={today:'today','3days':'3 days ago',week:'7 days ago',month:'30 days ago'};
+
 async function loadSecurityLogs(){
-  const since=$('sec-since-sel')?.value||'';
+  const range=secRange();
+  const since=SEC_RANGE_SINCE[range]||'today';
   $('sec-content').innerHTML='<div class="empty-state">Loading…</div>';
   try{
-    const [sshRes,webRes,cntRes]=await Promise.all([
-      api('/api/system/ssh-logs?limit=300'+(since?'&since='+encodeURIComponent(since):'')),
+    const [sshRes,webRes,cntRes,sumRes]=await Promise.all([
+      api('/api/system/ssh-logs?limit=300&since='+encodeURIComponent(since)),
       api('/api/system/web-login-logs?limit=100'),
-      api('/api/system/log-counts')]);
+      api('/api/system/log-counts'),
+      api('/api/system/security-summary?range='+encodeURIComponent(range))]);
     try{ _secCounts=await cntRes.json()||{}; }catch(_){ _secCounts={}; }
     _secSSHData=await sshRes.json(); const webData=await webRes.json();
     _secSSHData._webLogs=webData.logs||[]; _secSSHData._webTotal=webData.total||0;
     _secSSHData._webSuccess=webData.success||0; _secSSHData._webFailed=webData.failed||0;
-    const s=_secSSHData.summary||{};
-    $('sec-total').textContent=s.total_events??'n/a';
-    $('sec-unique-ips').textContent='unique IPs: '+(s.unique_ips??'n/a');
-    $('sec-accepted').textContent=s.accepted_count??'n/a';
-    $('sec-sessions').textContent='active sessions: '+(_secSSHData.current_sessions?.length??0);
-    $('sec-failed').textContent=s.failed_count??'n/a';
-    $('sec-attackers').textContent='attacker IPs: '+(s.attacker_ips??'n/a');
-    $('sec-web-total').textContent=webData.total??'n/a';
-    $('sec-web-fail').textContent='failed: '+(webData.failed??'n/a');
+
+    let sum={}; try{ sum=await sumRes.json()||{}; }catch(_){}
+    const n=v=>(v==null?'n/a':Number(v).toLocaleString());
+    const win=(sum.range_label||'today').toLowerCase();
+    $('sec-ssh-ok').textContent=n(sum.ssh_success);
+    $('sec-ssh-bad').textContent=n(sum.ssh_failed);
+    $('sec-web-ok').textContent=n(sum.web_success);
+    $('sec-web-bad').textContent=n(sum.web_failed);
+    $('sec-ssh-ok-foot').textContent='accepted over SSH, '+win;
+    $('sec-ssh-bad-foot').textContent='refused over SSH, '+win;
+    $('sec-web-ok-foot').textContent='signed in here, '+win;
+    $('sec-web-bad-foot').textContent='wrong credentials, '+win;
+    _secBlocked={ips:sum.blocked_ips||0,devices:sum.blocked_devices||0,sessions:sum.active_sessions||0};
   }catch(e){ _secSSHData={error:String(e)}; }
   renderSecSection();
 }
+let _secBlocked={ips:0,devices:0,sessions:0};
 function renderSecSection(){
   const c=$('sec-content');
   if(_secSection==='panel-actions') return loadPanelActions(c);
@@ -1466,15 +1483,24 @@ function renderSecSection(){
     c.innerHTML=secHeader('SSH Events','ssh','Top IPs by connection attempts (green = got in). Click an IP to see what it tried.')+`<table><thead><tr><th>IP</th><th>Attempts</th><th>Success</th><th>Last Seen</th><th>Action</th></tr></thead><tbody>${rows||'<tr><td colspan="5" style="color:var(--gray-400);text-align:center;">No data.</td></tr>'}</tbody></table>`; return;
   }
   if(_secSection==='ssh-events'){
+    /* Every row that names an address carries a Block action. Seeing a source
+       hammering the log and then having to go find it in another section to do
+       anything about it is where the old layout gave up. */
     const rows=(_secSSHData.events||[]).slice(0,200).map(e=>{ const color=e.event==='ACCEPTED'?'var(--success)':e.event==='FAILED'?'var(--danger)':'var(--gray-600)';
-      return `<tr><td style="white-space:nowrap;font-size:11px;">${esc(e.ts)}</td><td style="color:${color};font-weight:${e.event==='ACCEPTED'?'700':'400'}">${esc(e.event)}</td><td>${esc(e.ip??'n/a')}</td><td>${esc(e.user??'n/a')}</td><td>${esc(e.method??'n/a')}</td><td style="font-family:monospace;font-size:10px;">${esc(e.fingerprint??'')}</td></tr>`;}).join('');
-    c.innerHTML=secHeader('SSH Events','ssh','All SSH events (most recent first), persisted across journald rotation.')+`<table><thead><tr><th>Timestamp</th><th>Event</th><th>IP</th><th>User</th><th>Method</th><th>Fingerprint</th></tr></thead><tbody>${rows||'<tr><td colspan="6" style="color:var(--gray-400);text-align:center;">No events.</td></tr>'}</tbody></table>`; return;
+      const act=e.ip?`<button class="db-action-btn" style="border-color:var(--danger);color:var(--danger);font-size:11px;padding:2px 8px;" onclick="sshBlock('${escAttr(e.ip)}')">Block IP</button>`:'';
+      return `<tr><td style="white-space:nowrap;font-size:11px;">${esc(e.ts)}</td><td style="color:${color};font-weight:${e.event==='ACCEPTED'?'700':'400'}">${esc(e.event)}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="sshAttacker('${escAttr(e.ip||'')}')">${esc(e.ip??'n/a')}</td><td>${esc(e.user??'n/a')}</td><td>${esc(e.method??'n/a')}</td><td style="font-family:monospace;font-size:10px;">${esc(e.fingerprint??'')}</td><td>${act}</td></tr>`;}).join('');
+    c.innerHTML=secHeader('SSH Events','ssh',`All SSH events (most recent first), persisted across journald rotation. ${_secSSHData.autoblock_note||''}`)+`<table><thead><tr><th>Timestamp</th><th>Event</th><th>IP</th><th>User</th><th>Method</th><th>Fingerprint</th><th>Action</th></tr></thead><tbody>${rows||'<tr><td colspan="7" style="color:var(--gray-400);text-align:center;">No events.</td></tr>'}</tbody></table>`; return;
   }
   if(_secSection==='web-logs'){
+    /* The attempted password used to have a column here. It is no longer stored:
+       people mistype, so it was a plaintext password store readable by anyone
+       with the Logs grant. What replaced it is the device, which is what you
+       actually need to know when the same machine keeps trying. */
     const rows=(_secSSHData._webLogs||[]).map((e,i)=>{ const ok=e.success;
-      const pwCell=!ok&&e.tried_password?`<code style="background:color-mix(in srgb, var(--danger) 10%, transparent);color:var(--danger);padding:1px 5px;border-radius:3px;font-size:11px;">${esc(e.tried_password)}</code>`:'<span style="color:var(--gray-400);">n/a</span>';
-      return `<tr style="${!ok?'background:color-mix(in srgb, var(--danger) 4%, transparent)':''}"><td style="white-space:nowrap;font-size:11px;cursor:pointer;text-decoration:underline dotted;" onclick="openLineDetail('Web login',_secSSHData._webLogs[${i}])">${esc(String(e.ts).slice(0,19))}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="openIpDetail('${escAttr(e.ip)}')"><b>${esc(e.ip)}</b></td><td style="font-family:monospace;">${esc(e.username??'n/a')}</td><td style="color:${ok?'var(--success)':'var(--danger)'};font-weight:700">${ok?'OK':'FAIL'}</td><td>${pwCell}</td><td style="font-size:11px;color:var(--gray-600);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(e.user_agent??'')}">${esc((e.user_agent??'').slice(0,45))}</td><td style="font-size:11px;color:var(--gray-600);">${esc(e.details??'')}</td></tr>`;}).join('');
-    c.innerHTML=secHeader('Web Login Logs','web_logins',`Panel login history, ${_secSSHData._webTotal??0} total · ${_secSSHData._webSuccess??0} ok · ${_secSSHData._webFailed??0} failed.`)+`<table><thead><tr><th>Timestamp</th><th>IP</th><th>Username</th><th>Result</th><th>Tried Password</th><th>User Agent</th><th>Details</th></tr></thead><tbody>${rows||'<tr><td colspan="7" style="color:var(--gray-400);text-align:center;">No login records.</td></tr>'}</tbody></table>`; return;
+      const dev=e.fingerprint?`<span title="${escAttr((e.fingerprint||'')+' · '+(e.fp_hash||''))}">${esc(e.fingerprint)}</span>`:'<span style="color:var(--gray-400);">not recorded</span>';
+      const act=e.ip?`<button class="db-action-btn" style="border-color:var(--danger);color:var(--danger);font-size:11px;padding:2px 8px;" onclick="sshBlock('${escAttr(e.ip)}')">Block IP</button>`:'';
+      return `<tr style="${!ok?'background:color-mix(in srgb, var(--danger) 4%, transparent)':''}"><td style="white-space:nowrap;font-size:11px;cursor:pointer;text-decoration:underline dotted;" onclick="openLineDetail('Web login',_secSSHData._webLogs[${i}])">${esc(String(e.ts).slice(0,19))}</td><td style="cursor:pointer;text-decoration:underline dotted;" onclick="openIpDetail('${escAttr(e.ip)}')"><b>${esc(e.ip)}</b></td><td style="font-family:monospace;">${esc(e.username??'n/a')}</td><td style="color:${ok?'var(--success)':'var(--danger)'};font-weight:700">${ok?'OK':'FAIL'}</td><td style="font-size:11px;">${dev}</td><td style="font-size:11px;color:var(--gray-600);">${esc(e.details??'')}</td><td>${act}</td></tr>`;}).join('');
+    c.innerHTML=secHeader('Web Login Logs','web_logins',`Panel login history, ${_secSSHData._webTotal??0} total · ${_secSSHData._webSuccess??0} ok · ${_secSSHData._webFailed??0} failed. ${_secBlocked.ips} address(es) and ${_secBlocked.devices} device(s) blocked right now.`)+`<table><thead><tr><th>Timestamp</th><th>IP</th><th>Username</th><th>Result</th><th>Device</th><th>Details</th><th>Action</th></tr></thead><tbody>${rows||'<tr><td colspan="7" style="color:var(--gray-400);text-align:center;">No login records.</td></tr>'}</tbody></table>`; return;
   }
 }
 async function loadPanelActions(c){
@@ -1722,6 +1748,11 @@ window.addEventListener('orientationchange',()=>{ if(CURRENT==='terminal') setTi
      inline so the markup stays readable. */
   document.querySelectorAll('input[name="px-listen"]')
     .forEach(r=>r.addEventListener('change', pxSyncScheme));
+  /* The Logs time range re-queries rather than filtering what was already
+     fetched, so the tiles show counts over the whole window, not over the last
+     page of rows. */
+  document.querySelectorAll('input[name="sec-range"]')
+    .forEach(r=>r.addEventListener('change', loadSecurityLogs));
   const hstsBox=document.querySelector('[data-px="hsts"]');
   if(hstsBox) hstsBox.addEventListener('change', pxSyncHsts);
   applyMetricPermissions();

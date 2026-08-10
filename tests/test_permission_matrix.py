@@ -26,8 +26,11 @@ PROBES = {
     "db_write":      ("POST", "/api/config/db/table/system_settings/column"),
     "net_proxy":     ("GET", "/api/config/proxy/hosts"),
     "svc_status":    ("GET", "/api/services"),
-    "svc_restart":   ("POST", "/api/services/nonexistent-svc/restart"),
-    "svc_stop":      ("POST", "/api/services/nonexistent-svc/stop"),
+    # A name _norm_service rejects, so the grant check still runs but systemctl
+    # never does. With a plausible name these two probes each spent 25 seconds
+    # waiting on a real "systemctl restart" of a unit that does not exist.
+    "svc_restart":   ("POST", "/api/services/not%20a%20unit/restart"),
+    "svc_stop":      ("POST", "/api/services/not%20a%20unit/stop"),
     "logs_access":   ("GET", "/api/system/log-counts"),
     "firewall_manage": ("GET", "/api/config/firewall"),
 }
@@ -207,3 +210,14 @@ def test_the_proxy_and_firewall_routes_listed_here_actually_exist():
         if path.endswith("pytest-nothing.conf"):
             path = path.rsplit("/", 1)[0] + "/{filename}"
         assert (method, path) in known, f"{method} {path} is not a real route"
+
+
+def test_the_service_probes_reach_the_grant_check_without_running_systemctl():
+    """The two service probes use a name the validator refuses. If that stopped
+    being refused they would start shelling out to systemctl, which is both slow
+    and a real state change from a test run."""
+    import panel
+    assert panel._norm_service("not a unit") == "", \
+        "the service probes rely on this name being rejected"
+    ok, message = panel.control_service("not a unit", "restart")
+    assert ok is False and "invalid" in message

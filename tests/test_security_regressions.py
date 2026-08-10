@@ -212,3 +212,39 @@ def test_a_request_cannot_ask_for_an_unbounded_number_of_locations():
             "locations": [{"path": f"/p{i}", "forward_host": "127.0.0.1",
                            "forward_port": 9000} for i in range(500)]}
     assert len(panel._proxy_spec_from_body(body)["locations"]) <= 40
+
+
+def test_the_ingress_gate_does_not_take_the_callers_word_for_who_they_are():
+    """The gate rules on the hop, and the hop must never come from a header any
+    caller can write. X-Forwarded-For is exactly that: a comma separated list a
+    stranger prepends to at will. It is read for logging, from a local hop only,
+    so the two have to stay separate.
+    """
+    class Req:
+        def __init__(self, peer, headers):
+            self.client = type("C", (), {"host": peer})()
+            self.headers = headers
+
+    cloudflare = "173.245.48.1"
+
+    # A stranger naming a Cloudflare address does not become Cloudflare.
+    outsider = Req("203.0.113.7", {"x-forwarded-for": cloudflare,
+                                   "x-real-ip": cloudflare,
+                                   "cf-connecting-ip": cloudflare})
+    assert panel._hop_ip(outsider) == "203.0.113.7"
+    assert panel._ingress_allowed(panel._hop_ip(outsider)) is False
+
+    # Through nginx on loopback, the hop is what nginx reports and nothing else.
+    proxied = Req("127.0.0.1", {"x-real-ip": cloudflare,
+                                "x-forwarded-for": "198.51.100.9",
+                                "cf-connecting-ip": "198.51.100.9"})
+    assert panel._hop_ip(proxied) == cloudflare
+    assert panel._client_ip(proxied) == "198.51.100.9", \
+        "the visitor Cloudflare named is who gets logged and blocked"
+
+    # No Cloudflare in front: the leftmost forwarded entry is the visitor, and
+    # only the leftmost, so appending entries cannot shift the blame.
+    plain = Req("127.0.0.1", {"x-forwarded-for": "198.51.100.9, 10.0.0.1, 10.0.0.2"})
+    assert panel._hop_ip(plain) == "127.0.0.1"
+    assert panel._ingress_allowed("127.0.0.1") is True
+    assert panel._client_ip(plain) == "198.51.100.9"
