@@ -39,9 +39,11 @@ import subprocess
 import recovery
 import ssh_vault
 import panel_users
+import provision
 import cloudflare_tunnel
 import firewall
 import mail
+import identity
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "deploy.json")
@@ -691,69 +693,49 @@ def install_cloudflared():
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-DOCKER_PACKAGES = {
-    "apt-get": ["docker.io", "docker-compose-v2"],
-    "dnf": ["docker", "docker-compose"], "yum": ["docker", "docker-compose"],
-    "pacman": ["docker", "docker-compose"], "zypper": ["docker", "docker-compose"],
-    "apk": ["docker", "docker-compose"], "brew": ["docker"],
-}
-
-def _compose_present():
-    if shutil.which("docker"):
-        rc, _, _ = run(["docker", "compose", "version"], timeout=60)
-        if rc == 0:
-            return True
-    return shutil.which("docker-compose") is not None
-
 def install_mail_prerequisites():
     """Make inbound mail possible: mailcow needs Docker and Compose.
 
+    The packages are named by provision.py, which is the same table the running
+    panel installs from, so a machine set up here and a machine repaired from the
+    Mail tab end up with the same thing. Compose in particular is called three
+    different names across distributions, and this used to install one of them
+    and then tell the operator to go and install another by hand.
+
     The mailcow stack itself is several gigabytes and needs a domain and DNS
     before it is worth pulling, so it is set up from the Mail tab where the admin
-    types the domain. What is installed here is the part that has to exist before
-    that button can do anything. Never fatal: without it only inbound mail is
-    unavailable, and outbound still works through a relay.
+    types the domain. Never fatal: without it only inbound mail is unavailable,
+    and outbound still works through a relay.
     """
-    have_docker = shutil.which("docker") is not None
-    if have_docker and _compose_present():
+    missing = [c for c in ("docker", "compose") if not provision.present(c)]
+    if not missing:
         ok("Docker and Compose present, mailcow can be set up from the Mail tab")
         return True
-    mgr = detect_package_manager()
-    packages = DOCKER_PACKAGES.get(mgr)
-    if not packages:
-        warn("no supported package manager found, so install Docker by hand if "
-             "you want to receive mail on this server")
-        return False
-    step(f"installing Docker and Compose with {mgr}: {' '.join(packages)}")
-    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
-    if mgr == "apt-get":
-        run(sudo_prefix() + ["apt-get", "update", "-qq"], timeout=900, env=env)
-        rc, _, stderr = run(sudo_prefix() + ["apt-get", "install", "-y"] + packages,
-                            timeout=1800, env=env)
-    elif mgr == "brew":
-        rc, _, stderr = run(["brew", "install"] + packages, timeout=1800)
-    elif mgr == "pacman":
-        rc, _, stderr = run(sudo_prefix() + ["pacman", "-Sy", "--noconfirm"] + packages,
-                            timeout=1800)
-    elif mgr == "zypper":
-        rc, _, stderr = run(sudo_prefix() + ["zypper", "--non-interactive", "install"] + packages,
-                            timeout=1800)
-    elif mgr == "apk":
-        rc, _, stderr = run(sudo_prefix() + ["apk", "add"] + packages, timeout=1800)
-    else:
-        rc, _, stderr = run(sudo_prefix() + [mgr, "install", "-y"] + packages, timeout=1800)
-    if rc != 0:
-        warn("Docker could not be installed, so receiving mail stays unavailable: "
-             + stderr.strip()[:200])
-        return False
-    run(sudo_prefix() + ["systemctl", "enable", "docker"], timeout=60)
-    run(sudo_prefix() + ["systemctl", "start", "docker"], timeout=120)
-    if not _compose_present():
-        warn("Docker is installed but Compose is not, so mailcow cannot be "
-             "started. Install docker-compose-plugin and run this again.")
+    step("installing " + " and ".join(provision.COMPONENTS[c]["label"] for c in missing))
+    installed, detail = provision.ensure_all(missing)
+    for line in detail.splitlines():
+        (ok if installed else warn)(line)
+    if not installed:
+        warn("receiving mail stays unavailable until that is installed")
         return False
     ok("Docker and Compose installed, mailcow can be set up from the Mail tab")
     return True
+
+def install_terminal_jail():
+    """Install what confines a limited terminal to its own home directory.
+
+    A staff account with a limited terminal is meant to see its own files and
+    nothing else. Without bubblewrap it still runs as their own OS user, but the
+    rest of the filesystem is readable, which is not what the person granting it
+    was promised. Small package, never fatal.
+    """
+    if provision.present("jail"):
+        ok("bubblewrap present, a limited terminal is confined to its own home")
+        return True
+    step("installing bubblewrap, which confines a limited terminal")
+    installed, detail = provision.ensure("jail")
+    (ok if installed else warn)(detail)
+    return installed
 
 def install_postgres():
     """Install a PostgreSQL server with whatever package manager is present."""
@@ -1456,6 +1438,7 @@ SCHEMA = (
     ("firewall blocks and port rules", firewall.SCHEMA),
     ("Cloudflare tunnels and their forwards", cloudflare_tunnel.SCHEMA),
     ("mailboxes, messages and mail settings", mail.SCHEMA),
+    ("names and pictures for each account", identity.SCHEMA),
 )
 
 # Columns added to tables that may predate this version of the schema. Each is
@@ -1476,7 +1459,8 @@ SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",
                  "web_fp_block", "web_login_block", "web_session_log",
                  "http_access_log", "ssh", "panel_user",
                  "fw_block", "fw_rule", "cf_tunnel", "cf_route",
-                 "mail_config", "mail_box", "mail_message")
+                 "mail_config", "mail_box", "mail_message",
+                 "panel_identity")
 
 
 def app_connection(cfg):
@@ -2154,6 +2138,7 @@ def upgrade_mode():
         ensure_nginx_stream()
     install_cloudflared()
     install_mail_prerequisites()
+    install_terminal_jail()
 
     cfg = load_config()
     if os.path.exists(CONFIG_PATH):
@@ -2361,6 +2346,7 @@ def wizard():
         ensure_nginx_stream()
     install_cloudflared()  # best-effort too, for the Cloudflare Tunnel card
     install_mail_prerequisites()   # Docker and Compose, for receiving mail
+    install_terminal_jail()        # bubblewrap, for a limited staff terminal
 
     # --- 3. a privileged connection ---------------------------------------- #
     channel = obtain_admin_channel(cfg)

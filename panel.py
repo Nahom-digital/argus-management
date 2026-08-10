@@ -53,6 +53,9 @@ import cloudflare_tunnel
 import firewall
 import mail
 import mailcow
+import identity
+import branding
+import provision
 import web_guard
 import nginx_proxy
 from psycopg2 import sql as pg_sql
@@ -373,12 +376,17 @@ class _SecurityHeaders(BaseHTTPMiddleware):
         h["Referrer-Policy"] = "same-origin"
         h["Permissions-Policy"] = "geolocation=(), camera=(), microphone=(), payment=()"
         h["X-Frame-Options"] = "DENY"
-        h["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
-            "font-src 'self'; connect-src 'self' ws: wss:; "
-            "frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
-        )
+        # A route that already set its own policy wanted a stricter one than the
+        # page policy below, and this used to overwrite it. Uploaded pictures are
+        # served with default-src 'none', which the app policy would have widened
+        # back to script-src 'self' 'unsafe-inline' on the way out.
+        if "content-security-policy" not in h:
+            h["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+                "font-src 'self'; connect-src 'self' ws: wss:; "
+                "frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+            )
         if _is_https(request):
             h["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
@@ -751,18 +759,22 @@ def _visible_nav(perms: dict):
 def _config_cards(perms: dict):
     """Which Config sub-pages this identity may open, in display order.
 
-    Staff always get their own account card, and then only the cards their
-    grants unlock. The admin gets everything.
+    One card per grant, which is the whole point: a staff member granted only
+    Cloudflare tunnels opens Config and finds Cloudflare Tunnel, not somebody
+    else's idea of where tunnels live. Proxy, Cloudflare and the firewall used to
+    share the proxy page, so two of the three grants led to an empty Config.
+
+    Staff always get their own account card. The admin gets everything.
     """
     if perms.get("role") == "admin":
-        return ["users", "server", "service", "database", "proxy"]
+        return ["users", "server", "service", "database", "proxy", "tunnel",
+                "firewall"]
     cards = ["account"]
-    if perms.get("svc_status"):
-        cards.append("service")
-    if perms.get("db_read"):
-        cards.append("database")
-    if perms.get("net_proxy"):
-        cards.append("proxy")
+    for grant, key in (("svc_status", "service"), ("db_read", "database"),
+                       ("net_proxy", "proxy"), ("tunnel_manage", "tunnel"),
+                       ("firewall_manage", "firewall")):
+        if perms.get(grant):
+            cards.append(key)
     return cards
 
 _CONFIG_CARD_META = {
@@ -778,6 +790,10 @@ _CONFIG_CARD_META = {
                  "Browse and edit the tables this panel uses."),
     "proxy":    ("Proxy", "ic-globe",
                  "Reverse proxy hosts served by nginx."),
+    "tunnel":   ("Cloudflare Tunnel", "ic-cloud",
+                 "Publish a name on the internet without opening a port."),
+    "firewall": ("Firewall", "ic-shield-alert",
+                 "Which ports this server accepts, and which addresses are blocked."),
 }
 
 _CONFIG_BACK = (
@@ -950,175 +966,6 @@ def _config_sub_proxy(perms):
         f'value="{value}"{" checked" if value == "http" else ""}>{label}</label>'
         for value, label in (("http", "HTTP"), ("https", "HTTPS")))
 
-    # The Cloudflare card is a sequence, not a set of independent switches: there
-    # is nothing to create until an account is connected, nothing to forward until
-    # a tunnel exists, and nothing to run until something is forwarded. The steps
-    # are numbered because the order carries that information, and each one stays
-    # closed until the step before it is satisfied.
-    tunnel_card = ""
-    if perms.get("tunnel_manage"):
-        tunnel_card = """
-    <div class="cfg-card cfg-card-wide" id="cf-card" style="margin-top:18px;">
-      <div class="px-card-head">
-        <div>
-          <div class="device-title">Cloudflare Tunnel</div>
-          <div class="settings-subtitle" style="margin-top:6px;">
-            Publish a name on the internet without opening a port. Cloudflare
-            answers HTTPS at its edge and the tunnel hands the request to a port
-            on this machine over plain HTTP, so the port stays closed.
-          </div>
-        </div>
-        <span class="cf-version" id="cf-version"></span>
-      </div>
-
-      <div class="cf-missing" id="cf-missing" hidden></div>
-
-      <ol class="cf-steps" id="cf-steps">
-        <li class="cf-step" id="cf-step-account">
-          <div class="cf-step-head">
-            <span class="cf-step-n">1</span>
-            <span class="cf-step-title">Connect a Cloudflare account</span>
-            <span class="cf-state" id="cf-account-state">checking</span>
-          </div>
-          <div class="cf-step-body">
-            <div id="cf-account-idle">
-              <div class="field-hint" style="margin-bottom:10px;">
-                Opening the link signs this server in to your account. It only
-                has to be done once.
-              </div>
-              <button class="save-btn" id="cf-login" onclick="tunnelLogin()">Create the link</button>
-            </div>
-            <div id="cf-link-row" hidden>
-              <div class="cf-link-note"><span class="cf-pulse"></span>Waiting for you to finish in the browser</div>
-              <div class="cf-link-box">
-                <a class="cf-link" id="cf-link" href="#" target="_blank" rel="noopener noreferrer"></a>
-                <button class="db-action-btn" onclick="tunnelCopyLink()">Copy link</button>
-              </div>
-            </div>
-            <div id="cf-account-done" hidden>
-              <div class="field-hint" style="margin-bottom:10px;">
-                This server can manage the tunnels on your account.
-              </div>
-              <button class="db-action-btn cf-danger" onclick="tunnelDisconnect()">Disconnect account</button>
-            </div>
-            <div class="save-feedback" id="cf-account-feedback"></div>
-          </div>
-        </li>
-
-        <li class="cf-step" id="cf-step-tunnel">
-          <div class="cf-step-head">
-            <span class="cf-step-n">2</span>
-            <span class="cf-step-title">Create a tunnel</span>
-            <span class="cf-state" id="cf-tunnel-state">waiting</span>
-          </div>
-          <div class="cf-step-body">
-            <div id="cf-tunnel-list"></div>
-            <div class="cf-add-row">
-              <input class="field-input" id="cf-tunnel-name" type="text" maxlength="62"
-                     placeholder="Tunnel name, for example home-server" autocomplete="off"
-                     spellcheck="false">
-              <button class="save-btn" id="cf-tunnel-create" onclick="tunnelCreate()">Create tunnel</button>
-            </div>
-            <div class="save-feedback" id="cf-tunnel-feedback"></div>
-          </div>
-        </li>
-
-        <li class="cf-step" id="cf-step-forward">
-          <div class="cf-step-head">
-            <span class="cf-step-n">3</span>
-            <span class="cf-step-title">Forward a hostname to a local port</span>
-            <span class="cf-state" id="cf-route-state">waiting</span>
-          </div>
-          <div class="cf-step-body">
-            <div id="cf-route-list"></div>
-            <div class="cf-route-form">
-              <div class="cf-field">
-                <label class="field-label" for="cf-hostname">Public hostname</label>
-                <input class="field-input" id="cf-hostname" type="text" maxlength="253"
-                       placeholder="app.example.com" autocomplete="off" spellcheck="false">
-              </div>
-              <div class="cf-field">
-                <label class="field-label" for="cf-local-host">Local address</label>
-                <input class="field-input" id="cf-local-host" type="text" maxlength="255"
-                       value="127.0.0.1" autocomplete="off" spellcheck="false">
-              </div>
-              <div class="cf-field cf-field-port">
-                <label class="field-label" for="cf-local-port">Local port</label>
-                <input class="field-input" id="cf-local-port" type="number" min="1" max="65535"
-                       placeholder="8080" inputmode="numeric" autocomplete="off">
-              </div>
-              <button class="save-btn" id="cf-route-add" onclick="tunnelAddRoute()">Add forward</button>
-            </div>
-            <div class="field-hint">
-              The DNS record is created at Cloudflare for you. The local side is
-              plain HTTP, so the service does not need a certificate of its own.
-            </div>
-            <div class="save-feedback" id="cf-route-feedback"></div>
-          </div>
-        </li>
-
-        <li class="cf-step" id="cf-step-run">
-          <div class="cf-step-head">
-            <span class="cf-step-n">4</span>
-            <span class="cf-step-title">Keep the tunnel running</span>
-            <span class="cf-state" id="cf-service-state">waiting</span>
-          </div>
-          <div class="cf-step-body">
-            <div class="field-hint" style="margin-bottom:10px;" id="cf-service-note">
-              Installed as a service, the tunnel comes back by itself after a reboot.
-            </div>
-            <div class="cf-btn-row">
-              <button class="save-btn" id="cf-svc-install" onclick="tunnelService('install')">Install and start</button>
-              <button class="db-action-btn" id="cf-svc-restart" onclick="tunnelService('restart')">Restart</button>
-              <button class="db-action-btn" id="cf-svc-stop" onclick="tunnelService('stop')">Stop</button>
-              <button class="db-action-btn cf-danger" id="cf-svc-remove" onclick="tunnelService('uninstall')">Remove service</button>
-            </div>
-            <div class="save-feedback" id="cf-service-feedback"></div>
-          </div>
-        </li>
-      </ol>
-    </div>"""
-
-    firewall_card = ""
-    if perms.get("firewall_manage"):
-        firewall_card = f"""
-    <div class="cfg-card cfg-card-wide" style="margin-top:18px;">
-      <div class="device-title">Firewall settings</div>
-      <div class="settings-subtitle" style="margin:6px 0 4px;">
-        Which ports this server accepts and which it may reach out on. A proxy
-        host opens its own inbound port here automatically.
-      </div>
-      <div id="px-fw-status" class="px-fw-status"></div>
-      <div class="px-fw-add">
-        <select class="field-input px-fw-dir" id="px-fw-direction" aria-label="Direction">
-          <option value="in">Inbound</option>
-          <option value="out">Outbound</option>
-        </select>
-        <select class="field-input px-fw-proto" id="px-fw-protocol" aria-label="Protocol">
-          <option value="tcp">TCP</option>
-          <option value="udp">UDP</option>
-        </select>
-        <input class="field-input px-fw-port" id="px-fw-port" type="number" min="1" max="65535"
-               placeholder="Port" inputmode="numeric" autocomplete="off">
-        <input class="field-input px-fw-note" id="px-fw-note" type="text"
-               placeholder="What is it for" maxlength="120" autocomplete="off">
-        <button class="save-btn" id="px-fw-add" onclick="addFirewallRule()">Add rule</button>
-      </div>
-      <div class="save-feedback" id="px-fw-feedback"></div>
-      <div class="px-fw-cols">
-        <div>
-          <div class="px-fw-legend">Inbound</div>
-          <div id="px-fw-in"><div class="empty-state">Loading&hellip;</div></div>
-        </div>
-        <div>
-          <div class="px-fw-legend">Outbound</div>
-          <div id="px-fw-out"><div class="empty-state">Loading&hellip;</div></div>
-        </div>
-      </div>
-      <div class="px-fw-legend" style="margin-top:20px;">Blocked addresses</div>
-      <div id="px-fw-blocks"><div class="empty-state">Loading&hellip;</div></div>
-    </div>"""
-
     return f"""
   <div class="config-sub" data-cfgsub="proxy" hidden>
     {_CONFIG_BACK}
@@ -1254,8 +1101,184 @@ def _config_sub_proxy(perms):
         <div class="save-feedback" id="px-feedback"></div>
       </div>
     </div>
-{tunnel_card}
-{firewall_card}
+  </div>"""
+
+def _config_sub_tunnel(perms):
+    """Cloudflare Tunnel, on its own page.
+
+    It is a sequence, not a set of independent switches: there is nothing to
+    create until an account is connected, nothing to forward until a tunnel
+    exists, and nothing to run until something is forwarded. The steps are
+    numbered because the order carries that information, and each one stays
+    closed until the step before it is satisfied.
+    """
+    return """
+  <div class="config-sub" data-cfgsub="tunnel" hidden>
+    """ + _CONFIG_BACK + """
+    <div class="mgmt-h2">Cloudflare Tunnel</div>
+    <div class="cfg-card cfg-card-wide" id="cf-card">
+      <div class="px-card-head">
+        <div class="settings-subtitle">
+          Publish a name on the internet without opening a port. Cloudflare
+          answers HTTPS at its edge and the tunnel hands the request to a port
+          on this machine over plain HTTP, so the port stays closed.
+        </div>
+        <span class="cf-version" id="cf-version"></span>
+      </div>
+
+      <div class="cf-missing" id="cf-missing" hidden></div>
+
+      <ol class="cf-steps" id="cf-steps">
+        <li class="cf-step" id="cf-step-account">
+          <div class="cf-step-head">
+            <span class="cf-step-n">1</span>
+            <span class="cf-step-title">Connect a Cloudflare account</span>
+            <span class="cf-state" id="cf-account-state">checking</span>
+          </div>
+          <div class="cf-step-body">
+            <div id="cf-account-idle">
+              <div class="field-hint" style="margin-bottom:10px;">
+                Opening the link signs this server in to your account. It only
+                has to be done once.
+              </div>
+              <button class="save-btn" id="cf-login" onclick="tunnelLogin()">Create the link</button>
+            </div>
+            <div id="cf-link-row" hidden>
+              <div class="cf-link-note"><span class="cf-pulse"></span>Waiting for you to finish in the browser</div>
+              <div class="cf-link-box">
+                <a class="cf-link" id="cf-link" href="#" target="_blank" rel="noopener noreferrer"></a>
+                <button class="db-action-btn" onclick="tunnelCopyLink()">Copy link</button>
+              </div>
+            </div>
+            <div id="cf-account-done" hidden>
+              <div class="field-hint" style="margin-bottom:10px;">
+                This server can manage the tunnels on your account.
+              </div>
+              <button class="db-action-btn cf-danger" onclick="tunnelDisconnect()">Disconnect account</button>
+            </div>
+            <div class="save-feedback" id="cf-account-feedback"></div>
+          </div>
+        </li>
+
+        <li class="cf-step" id="cf-step-tunnel">
+          <div class="cf-step-head">
+            <span class="cf-step-n">2</span>
+            <span class="cf-step-title">Create a tunnel</span>
+            <span class="cf-state" id="cf-tunnel-state">waiting</span>
+          </div>
+          <div class="cf-step-body">
+            <div id="cf-tunnel-list"></div>
+            <div class="cf-add-row">
+              <input class="field-input" id="cf-tunnel-name" type="text" maxlength="62"
+                     placeholder="Tunnel name, for example home-server" autocomplete="off"
+                     spellcheck="false">
+              <button class="save-btn" id="cf-tunnel-create" onclick="tunnelCreate()">Create tunnel</button>
+            </div>
+            <div class="save-feedback" id="cf-tunnel-feedback"></div>
+          </div>
+        </li>
+
+        <li class="cf-step" id="cf-step-forward">
+          <div class="cf-step-head">
+            <span class="cf-step-n">3</span>
+            <span class="cf-step-title">Forward a hostname to a local port</span>
+            <span class="cf-state" id="cf-route-state">waiting</span>
+          </div>
+          <div class="cf-step-body">
+            <div id="cf-route-list"></div>
+            <div class="cf-route-form">
+              <div class="cf-field">
+                <label class="field-label" for="cf-hostname">Public hostname</label>
+                <input class="field-input" id="cf-hostname" type="text" maxlength="253"
+                       placeholder="app.example.com" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="cf-field">
+                <label class="field-label" for="cf-local-host">Local address</label>
+                <input class="field-input" id="cf-local-host" type="text" maxlength="255"
+                       value="127.0.0.1" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="cf-field cf-field-port">
+                <label class="field-label" for="cf-local-port">Local port</label>
+                <input class="field-input" id="cf-local-port" type="number" min="1" max="65535"
+                       placeholder="8080" inputmode="numeric" autocomplete="off">
+              </div>
+              <button class="save-btn" id="cf-route-add" onclick="tunnelAddRoute()">Add forward</button>
+            </div>
+            <div class="field-hint">
+              The DNS record is created at Cloudflare for you. The local side is
+              plain HTTP, so the service does not need a certificate of its own.
+            </div>
+            <div class="save-feedback" id="cf-route-feedback"></div>
+          </div>
+        </li>
+
+        <li class="cf-step" id="cf-step-run">
+          <div class="cf-step-head">
+            <span class="cf-step-n">4</span>
+            <span class="cf-step-title">Keep the tunnel running</span>
+            <span class="cf-state" id="cf-service-state">waiting</span>
+          </div>
+          <div class="cf-step-body">
+            <div class="field-hint" style="margin-bottom:10px;" id="cf-service-note">
+              Installed as a service, the tunnel comes back by itself after a reboot.
+            </div>
+            <div class="cf-btn-row">
+              <button class="save-btn" id="cf-svc-install" onclick="tunnelService('install')">Install and start</button>
+              <button class="db-action-btn" id="cf-svc-restart" onclick="tunnelService('restart')">Restart</button>
+              <button class="db-action-btn" id="cf-svc-stop" onclick="tunnelService('stop')">Stop</button>
+              <button class="db-action-btn cf-danger" id="cf-svc-remove" onclick="tunnelService('uninstall')">Remove service</button>
+            </div>
+            <div class="save-feedback" id="cf-service-feedback"></div>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </div>"""
+
+def _config_sub_firewall(perms):
+    """The firewall, on its own page. A proxy host opens its own inbound port as
+    it is saved, so this is where that shows up as well as where a port is opened
+    by hand."""
+    return """
+  <div class="config-sub" data-cfgsub="firewall" hidden>
+    """ + _CONFIG_BACK + """
+    <div class="mgmt-h2">Firewall</div>
+    <div class="cfg-card cfg-card-wide">
+      <div class="device-title">Firewall settings</div>
+      <div class="settings-subtitle" style="margin:6px 0 4px;">
+        Which ports this server accepts and which it may reach out on. A proxy
+        host opens its own inbound port here automatically.
+      </div>
+      <div id="px-fw-status" class="px-fw-status"></div>
+      <div class="px-fw-add">
+        <select class="field-input px-fw-dir" id="px-fw-direction" aria-label="Direction">
+          <option value="in">Inbound</option>
+          <option value="out">Outbound</option>
+        </select>
+        <select class="field-input px-fw-proto" id="px-fw-protocol" aria-label="Protocol">
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
+        </select>
+        <input class="field-input px-fw-port" id="px-fw-port" type="number" min="1" max="65535"
+               placeholder="Port" inputmode="numeric" autocomplete="off">
+        <input class="field-input px-fw-note" id="px-fw-note" type="text"
+               placeholder="What is it for" maxlength="120" autocomplete="off">
+        <button class="save-btn" id="px-fw-add" onclick="addFirewallRule()">Add rule</button>
+      </div>
+      <div class="save-feedback" id="px-fw-feedback"></div>
+      <div class="px-fw-cols">
+        <div>
+          <div class="px-fw-legend">Inbound</div>
+          <div id="px-fw-in"><div class="empty-state">Loading&hellip;</div></div>
+        </div>
+        <div>
+          <div class="px-fw-legend">Outbound</div>
+          <div id="px-fw-out"><div class="empty-state">Loading&hellip;</div></div>
+        </div>
+      </div>
+      <div class="px-fw-legend" style="margin-top:20px;">Blocked addresses</div>
+      <div id="px-fw-blocks"><div class="empty-state">Loading&hellip;</div></div>
+    </div>
   </div>"""
 
 _CONFIG_SUB_BUILDERS = {
@@ -1265,6 +1288,8 @@ _CONFIG_SUB_BUILDERS = {
     "service": lambda perms: _config_sub_service(),
     "database": lambda perms: _config_sub_database(perms),
     "proxy": lambda perms: _config_sub_proxy(perms),
+    "tunnel": lambda perms: _config_sub_tunnel(perms),
+    "firewall": lambda perms: _config_sub_firewall(perms),
 }
 
 def _config_pane_html(perms: dict) -> str:
@@ -1474,36 +1499,7 @@ _PANES_TEMPLATE = """
     <div id="sec-content"><div class="empty-state">Loading security logs&hellip;</div></div>
   </div></div>
 
-  <!-- ACCOUNT, reached from the username in the top bar rather than the nav,
-       because it is a rare errand, not one of the four places you work. -->
-  <div class="pane" data-pane="account"><div class="pane-scroll">
-    <div class="cfg-card">
-      <div class="device-title">Password</div>
-      <div class="settings-subtitle" style="margin:6px 0 18px;">Changing it signs out every other browser currently using this account.</div>
-      <div class="field-group"><label class="field-label" for="acct-cur">Current password</label>
-        <input class="field-input" id="acct-cur" type="password" autocomplete="current-password"></div>
-      <div class="field-group"><label class="field-label" for="acct-new">New password</label>
-        <div class="field-hint">At least 8 characters, and not only digits.</div>
-        <input class="field-input" id="acct-new" type="password" autocomplete="new-password"></div>
-      <div class="field-group"><label class="field-label" for="acct-new2">Confirm new password</label>
-        <input class="field-input" id="acct-new2" type="password" autocomplete="new-password"></div>
-      <button class="save-btn" id="acct-save" onclick="changePassword()">Change Password</button>
-      <div class="save-feedback" id="acct-feedback"></div>
-    </div>
-
-    <div class="cfg-card" style="margin-top:18px;">
-      <div class="device-title">Recovery codes</div>
-      <div class="settings-subtitle" style="margin:6px 0 16px;">Single-use codes that reset this password from the login page when you cannot sign in.
-        <svg class="ic" style="color:var(--danger)"><use href="#ic-triangle-alert"/></svg> Anyone holding a code can take over the panel.</div>
-      <div class="cfg-running" id="acct-codes-state">Checking&hellip;</div>
-      <div class="field-group" style="margin-top:16px;"><label class="field-label" for="acct-regen-pw">Current password</label>
-        <div class="field-hint">Required, because issuing new codes retires every existing one.</div>
-        <input class="field-input" id="acct-regen-pw" type="password" autocomplete="current-password"></div>
-      <button class="save-btn" id="acct-regen" onclick="regenerateRecoveryCodes()">Generate New Codes</button>
-      <div class="save-feedback" id="acct-regen-feedback"></div>
-      <div id="acct-codes-out" hidden></div>
-    </div>
-  </div></div>
+  {account_pane}
 </div>
 
 <div id="srv-detail-overlay" onclick="if(event.target===this)closeServerDetail()">
@@ -1516,6 +1512,96 @@ _PANES_TEMPLATE = """
   </div>
 </div>
 """
+
+def _account_pane_html(perms: dict) -> str:
+    """Reached from the picture in the top bar rather than the nav, because it is
+    a rare errand, not one of the places you work.
+
+    What is on it depends on who you are, and one card is the reason this is a
+    function instead of a constant: recovery codes belong to the admin alone, so
+    a staff member is not shown a card they cannot use. They are told where to go
+    instead, which is a person, not a page.
+    """
+    is_admin = perms.get("role") == "admin"
+
+    recovery_card = """
+    <div class="cfg-card" style="margin-top:18px;">
+      <div class="device-title">Recovery codes</div>
+      <div class="settings-subtitle" style="margin:6px 0 16px;">Single-use codes that reset this password from the login page when you cannot sign in.
+        <svg class="ic" style="color:var(--danger)"><use href="#ic-triangle-alert"/></svg> Anyone holding a code can take over the panel.</div>
+      <div class="cfg-running" id="acct-codes-state">Checking&hellip;</div>
+      <div class="field-group" style="margin-top:16px;"><label class="field-label" for="acct-regen-pw">Current password</label>
+        <div class="field-hint">Required, because issuing new codes retires every existing one.</div>
+        <input class="field-input" id="acct-regen-pw" type="password" autocomplete="current-password"></div>
+      <button class="save-btn" id="acct-regen" onclick="regenerateRecoveryCodes()">Generate New Codes</button>
+      <div class="save-feedback" id="acct-regen-feedback"></div>
+      <div id="acct-codes-out" hidden></div>
+    </div>""" if is_admin else """
+    <div class="mail-empty-note" style="margin-top:18px;">
+      <b>There are no recovery codes for staff accounts.</b><br>
+      If you cannot sign in, ask an administrator to reset your password. They do
+      it in person, which is a stronger check than a code in a file, and it means
+      nothing exists that could sign in as you if it were found.
+    </div>"""
+
+    return f"""
+  <div class="pane" data-pane="account"><div class="pane-scroll">
+    <div class="cfg-card acct-id-card">
+      <div class="acct-id-head">
+        <span class="acct-face acct-face-lg" id="acct-face">
+          <img id="acct-face-img" alt="" hidden><span id="acct-face-txt">&hellip;</span>
+        </span>
+        <div class="acct-id-copy">
+          <div class="acct-id-name" id="acct-id-name">&hellip;</div>
+          <div class="acct-id-sub"><span id="acct-id-user"></span>
+            <span class="acct-role-chip" id="acct-id-role"></span></div>
+        </div>
+      </div>
+      <div class="acct-id-body">
+        <div class="field-group">
+          <label class="field-label" for="acct-fullname">Full name</label>
+          <div class="field-hint" id="acct-name-hint">Shown in the top bar, and on every
+            message you send.</div>
+          <input class="field-input" id="acct-fullname" type="text" maxlength="120"
+                 autocomplete="name" placeholder="Your name as it should appear">
+        </div>
+        <div class="px-form-actions">
+          <button class="save-btn" onclick="saveFullName()">Save name</button>
+          <div class="save-feedback" id="acct-name-feedback"></div>
+        </div>
+        <div class="acct-pic">
+          <div class="field-label">Picture</div>
+          <div class="field-hint" id="acct-pic-hint">PNG or SVG. It is rebuilt from the
+            parts we recognise before it is stored, so nothing else in the file survives.</div>
+          <div class="cf-btn-row" style="margin-top:10px;">
+            <label class="db-action-btn acct-upload">
+              <svg class="ic"><use href="#ic-upload"/></svg>Choose a picture
+              <input type="file" id="acct-pic-input" accept="image/png,image/svg+xml"
+                     onchange="uploadAvatar(this)" hidden>
+            </label>
+            <button class="db-action-btn" id="acct-pic-clear" onclick="removeAvatar()" hidden>Remove</button>
+          </div>
+          <div class="save-feedback" id="acct-pic-feedback"></div>
+          <div class="field-hint" id="acct-bimi" hidden></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="cfg-card" style="margin-top:18px;">
+      <div class="device-title">Password</div>
+      <div class="settings-subtitle" style="margin:6px 0 18px;">Changing it signs out every other browser currently using this account.</div>
+      <div class="field-group"><label class="field-label" for="acct-cur">Current password</label>
+        <input class="field-input" id="acct-cur" type="password" autocomplete="current-password"></div>
+      <div class="field-group"><label class="field-label" for="acct-new">New password</label>
+        <div class="field-hint">At least 8 characters, and not only digits.</div>
+        <input class="field-input" id="acct-new" type="password" autocomplete="new-password"></div>
+      <div class="field-group"><label class="field-label" for="acct-new2">Confirm new password</label>
+        <input class="field-input" id="acct-new2" type="password" autocomplete="new-password"></div>
+      <button class="save-btn" id="acct-save" onclick="changePassword()">Change Password</button>
+      <div class="save-feedback" id="acct-feedback"></div>
+    </div>
+    {recovery_card}
+  </div></div>"""
 
 def _nav_badge(key):
     """Mail is the one tab where something can be waiting for you, so it is the
@@ -1535,20 +1621,31 @@ def _mobile_tabbar(nav):
         for k, label, ic in nav)
     return f'<nav class="mobile-tabbar" style="grid-template-columns:repeat({len(nav)},1fr);">{items}</nav>'
 
-def _topbar(mobile: bool, user: str, nav):
+def _topbar(mobile: bool, user: str, nav, me: dict, role: str):
     tabs = "".join(
         f'<button class="tab-btn" data-nav="{k}"><svg class="ic"><use href="#{ic}"/></svg>'
         f'{label}{_nav_badge(k)}</button>'
         for k, label, ic in nav)
     safe_user = html.escape(user or "", quote=True)
+    shown = html.escape(me.get("full_name") or user or "", quote=True)
+    role_label = "Administrator" if role == "admin" else "Staff"
+    # The picture is an <img>, never inlined markup, whatever kind of file it is.
+    # An SVG in an <img> cannot run script or fetch anything; the same SVG pasted
+    # into this page could do both.
+    if me.get("has_avatar"):
+        src = f'{MGMT_BASE}/api/account/avatar/{safe_user}?v={html.escape(me.get("avatar_hash", "")[:16])}'
+        face = f'<img src="{src}" alt="" width="30" height="30">'
+    else:
+        face = f'<span>{html.escape(me.get("initials") or "?")}</span>'
     right = (
         '<button class="theme-btn" onclick="toggleTheme()" title="Toggle dark mode"><svg class="ic"><use href="#ic-moon" id="theme-ic"/></svg></button>'
         # The username was inert text; it is now the way into account settings,
         # which is where people already look for it.
-        f'<button class="db-action-btn acct-btn" data-nav="account" onclick="switchSection(\'account\')" '
+        f'<button class="acct-btn" data-nav="account" onclick="switchSection(\'account\')" '
         f'title="Account settings for {safe_user}" aria-label="Account settings for {safe_user}">'
-        f'<svg class="ic"><use href="#ic-lock-keyhole"/></svg>'
-        f'<span class="acct-name">{safe_user}</span></button>'
+        f'<span class="acct-face" id="topbar-face">{face}</span>'
+        f'<span class="acct-copy"><span class="acct-name" id="topbar-name">{shown}</span>'
+        f'<span class="acct-role">{role_label}</span></span></button>'
         f'<a href="{MGMT_BASE}/logout" class="db-action-btn"><svg class="ic"><use href="#ic-log-out"/></svg>Logout</a>'
     )
     return (
@@ -1559,10 +1656,16 @@ def _topbar(mobile: bool, user: str, nav):
         '</div>'
     )
 
-def _dashboard_html(mobile: bool, user: str, perms: dict) -> str:
+def _dashboard_html(mobile: bool, user: str, perms: dict, me: dict = None) -> str:
     shell = "mgmt-mobile" if mobile else "mgmt-desktop"
     nav = _visible_nav(perms)
-    panes = _PANES_TEMPLATE.replace("{config_pane}", _config_pane_html(perms))
+    # No identity passed means nobody looked it up: fall back to the account name
+    # and its initials rather than making the caller supply a dict it does not have.
+    me = me or {"full_name": perms.get("full_name") or "", "has_avatar": False,
+                "initials": identity.initials(perms.get("full_name"), user)}
+    panes = (_PANES_TEMPLATE
+             .replace("{config_pane}", _config_pane_html(perms))
+             .replace("{account_pane}", _account_pane_html(perms)))
     # The whole resolved grant set goes to the client so the interface can hide
     # controls nobody can use. This is a convenience for the person looking at
     # the page and never a security boundary: every one of these is enforced
@@ -1574,10 +1677,12 @@ def _dashboard_html(mobile: bool, user: str, perms: dict) -> str:
     return (
         "<!DOCTYPE html><html lang=\"en\"><head>"
         "<meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
-        f"<title>Management</title><link rel=\"stylesheet\" href=\"{MGMT_BASE}/static/dash.css\">"
+        f"<title>Management</title>"
+        f"<link rel=\"icon\" href=\"{MGMT_BASE}/favicon.ico\">"
+        f"<link rel=\"stylesheet\" href=\"{MGMT_BASE}/static/dash.css\">"
         f"<script>window.MGMT_BASE={json.dumps(MGMT_BASE)};window.MGMT_PERMS={perms_json};</script></head>"
         f"<body class=\"mgmt {shell}\">{_ICON_SPRITE}"
-        f"{_topbar(mobile, user, nav)}{panes}{_mobile_tabbar(nav)}"
+        f"{_topbar(mobile, user, nav, me, perms.get('role', ''))}{panes}{_mobile_tabbar(nav)}"
         f"<script src=\"{MGMT_BASE}/static/management.js\"></script></body></html>"
     )
 
@@ -1589,7 +1694,8 @@ def _is_mobile(request: Request) -> bool:
 # __BASE__ is substituted with MGMT_BASE by _login_html().
 _LOGIN_HTML = r"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Management</title><link rel="stylesheet" href="__BASE__/static/dash.css">
+<title>Management</title><link rel="icon" href="__BASE__/favicon.ico">
+<link rel="stylesheet" href="__BASE__/static/dash.css">
 <style>
   body.login { display:flex; align-items:center; justify-content:center; min-height:100dvh; padding:24px;
     background:radial-gradient(120% 120% at 50% 0%, var(--bg1,#ede0c8) 0%, var(--bg2,#d8c19c) 100%); }
@@ -1736,7 +1842,8 @@ def _ensure_feature_tables():
     conn = DB.get_connection()
     try:
         cur = conn.cursor()
-        for statement in cloudflare_tunnel.SCHEMA + mail.SCHEMA:
+        for statement in (cloudflare_tunnel.SCHEMA + mail.SCHEMA
+                          + identity.SCHEMA):
             cur.execute(statement)
         cur.close()
     finally:
@@ -1957,6 +2064,30 @@ async def api_recovery_status(request: Request):
     return JSONResponse({"username": username, "unused": unused, "total": total,
                          "generated_at": made.isoformat() if made else None})
 
+def _verify_own_password(username, password):
+    """The current password, checked against whichever table this account is in.
+
+    This used to ask the admin table and nothing else, so a staff member had a
+    password form on their account page that could never succeed: their own
+    password was compared against a row that does not exist.
+    """
+    conn = DB.get_connection()
+    try:
+        if panel_users.is_admin_username(conn, username):
+            return "admin", DB.verify_admin(username, password)
+        return "staff", bool(panel_users.verify_login(conn, username, password))
+    finally:
+        DB.release_connection(conn)
+
+def _set_own_password(role, username, password):
+    if role == "admin":
+        return _set_admin_password(username, password)
+    conn = DB.get_connection()
+    try:
+        return 1 if panel_users.update_user(conn, username, password=password) else 0
+    finally:
+        DB.release_connection(conn)
+
 @app.post("/api/account/password")
 async def api_account_password(request: Request):
     if not _authed(request):
@@ -1966,7 +2097,8 @@ async def api_account_password(request: Request):
     current = body.get("current_password") or ""
     new = body.get("new_password") or ""
 
-    if not await DB.run(DB.verify_admin, username, current):
+    role, ok = await DB.run(_verify_own_password, username, current)
+    if not ok:
         write_log("WARN", "AUTH", "Password change refused", actor=username, ip=ip,
                   detail="current password did not match", status="denied")
         return JSONResponse(status_code=403,
@@ -1980,9 +2112,16 @@ async def api_account_password(request: Request):
                             content={"error": "The new password must be different from the current one."})
 
     try:
-        if not await DB.run(_set_admin_password, username, new):
+        if not await DB.run(_set_own_password, role, username, new):
             return JSONResponse(status_code=500, content={"error": "Could not update the password."})
-        await DB.run(_bump_auth_epoch)
+        if role == "admin":
+            # The global epoch signs out everybody, which is what the admin
+            # changing their own password should do. A staff member changing
+            # theirs must not, so their row's own epoch is bumped instead, which
+            # update_user already did.
+            await DB.run(_bump_auth_epoch)
+        else:
+            _forget_user_epoch(username)
     except Exception as e:
         logging.error(f"password change failed: {e}")
         return JSONResponse(status_code=500, content={"error": "Could not update the password."})
@@ -2041,6 +2180,204 @@ async def api_account_recovery_codes(request: Request):
               detail=f"{len(codes)} new codes; all previous codes invalidated")
     return JSONResponse({"status": "ok", "path": path, "file_error": file_error,
                          "codes": [recovery.format_code(c) for c in codes]})
+
+# ===========================================================================
+# Identity: the name and the picture that go in front of a person
+# ===========================================================================
+def _identity_work(fn, *args):
+    """Own connection, no commit here: the pool hands out autocommit
+    connections, so the module's own conn.commit() calls are the no-ops they
+    look like and a commit at this level would be one too."""
+    conn = DB.get_connection()
+    try:
+        return fn(conn, *args)
+    finally:
+        DB.release_connection(conn)
+
+def _identity_overview(username, role):
+    conn = DB.get_connection()
+    try:
+        me = identity.get(conn, username)
+        me["role"] = role
+        me["role_label"] = "Administrator" if role == "admin" else "Staff account"
+        # Recovery codes are the admin's alone, so the page must be told that
+        # rather than guessing from the role name.
+        me["has_recovery"] = role == "admin"
+        me["max_upload_kb"] = identity.MAX_UPLOAD // 1024
+        kind, data, _digest = identity.avatar(conn, username)
+        me["bimi"] = ("" if not kind else identity.bimi_problem(kind, data or b""))
+        me["mail_domain"] = (mail.config(conn) or {}).get("domain", "")
+        return me
+    finally:
+        DB.release_connection(conn)
+
+@app.get("/api/account/identity")
+async def api_identity_get(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    username = _admin_name(request)
+    try:
+        return JSONResponse(await DB.run(_identity_overview, username, perms.get("role")))
+    except Exception as e:
+        logging.error(f"identity read failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not read your account."})
+
+@app.post("/api/account/name")
+async def api_identity_name(request: Request):
+    """Your own display name. Nobody sets anybody else's here: an admin editing
+    a staff member does it through the staff form, which writes the same row."""
+    if not _authed(request):
+        return _need_auth()
+    username = _admin_name(request)
+    body = await _json_body(request)
+    problem = identity.name_problem(body.get("full_name"))
+    if problem:
+        return JSONResponse(status_code=400, content={"error": problem})
+    try:
+        ok, name = await DB.run(_identity_work, identity.set_full_name,
+                                username, body.get("full_name"))
+    except Exception as e:
+        logging.error(f"name change failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not save that name."})
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": name})
+    write_log("ACTION", "SETTINGS", "Display name changed", actor=username,
+              ip=_client_ip(request), detail=f"now shown as {name}")
+    return {"status": "ok", "full_name": name}
+
+@app.post("/api/account/avatar")
+async def api_identity_avatar_set(request: Request):
+    """The picture, posted as the raw file rather than a multipart form.
+
+    One less parser in the request path, and it makes no difference to what is
+    trusted: the bytes decide what the file is, never the content type the
+    browser attached and never the name it came with.
+    """
+    if not _authed(request):
+        return _need_auth()
+    username = _admin_name(request)
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > identity.MAX_UPLOAD:
+        return JSONResponse(status_code=413, content={
+            "error": f"Use a file under {identity.MAX_UPLOAD // 1024} KB."})
+    raw = await request.body()
+    if len(raw) > identity.MAX_UPLOAD:
+        return JSONResponse(status_code=413, content={
+            "error": f"Use a file under {identity.MAX_UPLOAD // 1024} KB."})
+    try:
+        ok, detail = await DB.run(_identity_work, identity.set_avatar, username, raw)
+    except Exception as e:
+        logging.error(f"avatar upload failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not store that picture."})
+    if not ok:
+        write_log("WARN", "SETTINGS", "Picture refused", actor=username,
+                  ip=_client_ip(request), detail=detail, status="denied")
+        return JSONResponse(status_code=400, content={"error": detail})
+    write_log("ACTION", "SETTINGS", "Picture changed", actor=username,
+              ip=_client_ip(request), detail=f"{detail}, {len(raw)} bytes uploaded")
+    return {"status": "ok", "kind": detail}
+
+@app.delete("/api/account/avatar")
+async def api_identity_avatar_clear(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    username = _admin_name(request)
+    try:
+        await DB.run(_identity_work, identity.clear_avatar, username)
+    except Exception as e:
+        logging.error(f"avatar removal failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not remove it."})
+    write_log("ACTION", "SETTINGS", "Picture removed", actor=username, ip=_client_ip(request))
+    return {"status": "ok"}
+
+def _avatar_response(kind, data, digest, request):
+    """An avatar served so that it cannot become a document.
+
+    An SVG rendered in an <img> already cannot run script, and the panel only
+    ever renders them that way. This is the second lock: opened directly in a
+    tab, the CSP leaves it nothing it is allowed to do, and nosniff stops the
+    browser deciding the bytes are really HTML.
+    """
+    if request.headers.get("if-none-match") == f'"{digest}"':
+        return Response(status_code=304)
+    return Response(content=data, media_type=identity.MIME[kind], headers={
+        "Cache-Control": "private, max-age=0, must-revalidate",
+        "ETag": f'"{digest}"',
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+        "Content-Disposition": f'inline; filename="avatar.{kind}"',
+    })
+
+@app.get("/api/account/avatar/{username}")
+async def api_identity_avatar_get(request: Request, username: str):
+    """Anybody signed in may see anybody's picture: it appears beside their name
+    on every message they send, so hiding it from colleagues would be theatre."""
+    if not _authed(request):
+        return _need_auth()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", username or ""):
+        return JSONResponse(status_code=400, content={"error": "Bad name."})
+    try:
+        kind, data, digest = await DB.run(_identity_work, identity.avatar, username)
+    except Exception as e:
+        logging.error(f"avatar read failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not read it."})
+    if not kind:
+        return JSONResponse(status_code=404, content={"error": "No picture."})
+    return _avatar_response(kind, data, digest, request)
+
+def _bimi_logo(username):
+    conn = DB.get_connection()
+    try:
+        # Only an address on the configured mail domain gets a published logo:
+        # BIMI exists to be fetched by strangers, so it is offered for exactly
+        # the accounts that send mail and no others.
+        if not mail.boxes(conn, owner=username):
+            return None, "", ""
+        kind, data, digest = identity.avatar(conn, username)
+        if not kind or identity.bimi_problem(kind, data or b""):
+            return None, "", ""
+        return identity.bimi_svg(data, identity.display_name(conn, username)), digest, "svg"
+    finally:
+        DB.release_connection(conn)
+
+@app.get("/bimi/{username}.svg")
+async def api_bimi_logo(request: Request, username: str):
+    """Deliberately open, because a receiving mail server fetches this with no
+    session and no way to get one. It is one sanitized SVG per account that
+    already publishes an address, and nothing else is reachable from here."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", username or ""):
+        return JSONResponse(status_code=400, content={"error": "Bad name."})
+    try:
+        data, digest, _kind = await DB.run(_bimi_logo, username)
+    except Exception as e:
+        logging.error(f"bimi read failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not read it."})
+    if not data:
+        return JSONResponse(status_code=404, content={"error": "No logo published."})
+    return Response(content=data, media_type="image/svg+xml", headers={
+        "Cache-Control": "public, max-age=3600",
+        "ETag": f'"{digest}"',
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    })
+
+# ===========================================================================
+# The mark in the tab: the Argus Recon icon, shipped with the panel
+# ===========================================================================
+@app.get("/favicon.ico")
+async def api_favicon(request: Request):
+    """No session needed. A browser asks for this before it has one, and it is
+    the panel's own badge, not anybody's data."""
+    kind, data, digest = branding.get()
+    if request.headers.get("if-none-match") == f'"{digest}"':
+        return Response(status_code=304)
+    return Response(content=data, media_type=identity.MIME[kind], headers={
+        "Cache-Control": "public, max-age=86400",
+        "ETag": f'"{digest}"',
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    })
 
 # --- unauthenticated recovery ----------------------------------------------- #
 # The only route that changes a password without a session, so it is throttled
@@ -2202,7 +2539,13 @@ async def dashboard(request: Request):
     if not _authed(request):
         return RedirectResponse(url=f"{MGMT_BASE}/login", status_code=302)
     perms = await _current_permissions(request)
-    return HTMLResponse(content=_dashboard_html(_is_mobile(request), _admin_name(request) or "admin", perms))
+    username = _admin_name(request) or "admin"
+    try:
+        me = await DB.run(_identity_work, identity.get, username)
+    except Exception as e:
+        logging.warning(f"identity read failed, falling back to the account name: {e}")
+        me = None
+    return HTMLResponse(content=_dashboard_html(_is_mobile(request), username, perms, me))
 
 # ---- server status (System.py) ----
 @app.get("/api/system/static")
@@ -2254,8 +2597,15 @@ async def api_files(request: Request, path: str = ""):
     perms, denied = await _require(request, _can_browse)
     if denied:
         return denied
+    root = _disk_root(perms)
+    if root and not os.path.isdir(root):
+        # Scoped to their own files, with no directory to scope to. Saying so is
+        # better than the browser reporting that a path is not a directory.
+        return {"error": "There is no home directory for this account on this "
+                         "server yet, so there is nothing to browse.",
+                "path": "", "parent": None, "entries": []}
     try:
-        return await DB.run(System.list_dir, path or None, _disk_root(perms))
+        return await DB.run(System.list_dir, path or None, root)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -2580,7 +2930,13 @@ async def api_users_create(request: Request):
 def _update_panel_user(username, **fields):
     conn = DB.get_connection()
     try:
-        return panel_users.update_user(conn, username, **fields)
+        ok = panel_users.update_user(conn, username, **fields)
+        # A name the admin sets here is the same name the person sees on their own
+        # account page and the same one that goes on their mail, so it is written
+        # to the identity row too rather than left to disagree with it.
+        if ok and fields.get("full_name") and not identity.name_problem(fields["full_name"]):
+            identity.set_full_name(conn, username, fields["full_name"])
+        return ok
     finally:
         DB.release_connection(conn)
 
@@ -3585,7 +3941,74 @@ def _mail_work(fn, *args, **kwargs):
 def _mail_identity(perms):
     return perms.get("username") or "", perms.get("role") == "admin"
 
-def _mail_overview(conn, username, is_admin):
+def _mail_faces(conn):
+    """Which addresses on this system have a face, and what to write when they
+    do not.
+
+    Built once per overview rather than per message: a mailbox belongs to a panel
+    account, that account may have a picture, and a message from that address
+    should show it. Mail from outside has no account and so gets initials, which
+    is the honest answer, not a missing image.
+    """
+    people = identity.everyone(conn)
+    out = {}
+    for box in mail.boxes(conn):
+        owner = box["owner"]
+        who = people.get(owner, {}) if owner else {}
+        name = box["full_name"] or who.get("full_name") or box["local_part"]
+        out[box["address"]] = {
+            "name": name,
+            "initials": identity.initials(name, box["local_part"]),
+            "avatar": (f"{MGMT_BASE}/api/account/avatar/{owner}"
+                       f"?v={who.get('avatar_hash', '')[:16]}") if who.get("has_avatar") else "",
+        }
+    return out
+
+def _public_origin(request: Request) -> str:
+    """The address this panel is being looked at from, or "" if it is a local one.
+
+    Used only to suggest a DNS value to the admin reading the page, never to
+    fetch anything and never in a redirect, which is what makes it safe to read
+    the Host header here: the worst a forged one can do is print the wrong
+    suggestion back to the person who forged it.
+    """
+    host = (request.headers.get("host") or "").strip()
+    if not host or not re.fullmatch(r"[A-Za-z0-9.\-]+(:\d{1,5})?", host):
+        return ""
+    name = host.split(":")[0].lower()
+    if name in ("localhost", "127.0.0.1", "::1") or name.endswith(".local"):
+        return ""
+    scheme = "https" if _is_https(request) else "http"
+    return f"{scheme}://{host}"
+
+def _bimi_state(conn, username, domain, public_origin=""):
+    """Whether this account's picture can be published as its mail logo, and the
+    DNS value that would do it.
+
+    Kept honest on purpose: BIMI wants a square SVG, most pictures are neither,
+    and a record pointing at a logo a receiver cannot draw is worse than not
+    publishing one. So the reason is reported rather than the record.
+    """
+    url = f"{public_origin}{MGMT_BASE}/bimi/{username}.svg" if public_origin else ""
+    kind, data, _digest = identity.avatar(conn, username)
+    if not kind:
+        return {"ready": False, "problem": "This account has no picture yet.",
+                "url": url, "record": ""}
+    problem = identity.bimi_problem(kind, data or b"")
+    if problem:
+        return {"ready": False, "problem": problem, "url": url, "record": ""}
+    if not domain:
+        return {"ready": False, "problem": "Set the mail domain first.",
+                "url": url, "record": ""}
+    if not url:
+        return {"ready": False, "problem": ("A logo has to be fetched over HTTPS from "
+                                            "outside, so the panel needs a public "
+                                            "address before it can publish one."),
+                "url": "", "record": ""}
+    return {"ready": True, "problem": "", "url": url,
+            "record": identity.bimi_record(url)}
+
+def _mail_overview(conn, username, is_admin, public_origin=""):
     cfg = mail.config(conn)
     mine = mail.visible_boxes(conn, username, is_admin)
     out = {
@@ -3596,12 +4019,15 @@ def _mail_overview(conn, username, is_admin):
         "boxes": mine,
         "unread": mail.unread_count(conn, [b["id"] for b in mine]),
         "outbound_ready": cfg["outbound_ready"],
+        "faces": _mail_faces(conn),
+        "me": identity.get(conn, username),
     }
     if is_admin:
         out["config"] = cfg
         out["all_boxes"] = mail.boxes(conn)
         out["inbound"] = mailcow.status(conn)
-        out["dns"] = mailcow.dns_help(cfg["domain"])
+        out["bimi"] = _bimi_state(conn, username, cfg["domain"], public_origin)
+        out["dns"] = mailcow.dns_help(cfg["domain"], out["bimi"]["record"])
         out["staff"] = [u["username"] for u in panel_users.list_users(conn)]
     return out
 
@@ -3611,7 +4037,8 @@ async def api_mail_overview(request: Request):
         return _need_auth()
     perms = await _current_permissions(request)
     username, is_admin = _mail_identity(perms)
-    return await DB.run(_mail_work(_mail_overview, username, is_admin))
+    return await DB.run(_mail_work(_mail_overview, username, is_admin,
+                                   _public_origin(request)))
 
 @app.get("/api/mail/unread")
 async def api_mail_unread(request: Request):
@@ -3692,8 +4119,12 @@ async def api_mail_send(request: Request):
         mine = mail.visible_boxes(conn, username, is_admin)
         if from_address not in {b["address"] for b in mine}:
             return False, "That is not one of your addresses.", ""
-        display = next((b["full_name"] for b in mine
-                        if b["address"] == from_address), "") or perms.get("full_name", "")
+        # A named address speaks for itself: mail from sales@ says "Sales Desk",
+        # not the name of whoever happens to be holding it. An address with no
+        # name of its own borrows the name of the person sending from it.
+        display = (next((b["full_name"] for b in mine
+                         if b["address"] == from_address), "")
+                   or identity.display_name(conn, username))
         return mail.send(conn, from_address, body.get("to") or "",
                          body.get("subject") or "", body.get("body") or "",
                          route, actor=username, from_name=display)
@@ -3926,6 +4357,46 @@ async def api_mail_inbound_action(request: Request, action: str):
         return JSONResponse(status_code=400, content={"error": message})
     return {"status": "ok", "message": message}
 
+@app.post("/api/system/install")
+async def api_system_install(request: Request):
+    """Install a missing system component the panel knows how to install.
+
+    The body names a component, never a package: the name is looked up in
+    provision.COMPONENTS and only that entry's own fixed package list is handed
+    to the package manager, so nothing from a request reaches a command line.
+    """
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    raw = body.get("components") or ([body["component"]] if body.get("component") else [])
+    wanted = [c for c in raw if isinstance(c, str) and c in provision.COMPONENTS]
+    if not wanted:
+        return JSONResponse(status_code=400,
+                            content={"error": "That is not something the panel can install."})
+    started, message = provision.install_async(wanted)
+    write_log("ACTION" if started else "WARN", "SYSTEM", "Install missing packages",
+              actor=_admin_name(request), ip=_client_ip(request),
+              target=",".join(wanted), detail=message[:300],
+              status="ok" if started else "busy")
+    if not started:
+        return JSONResponse(status_code=409, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.get("/api/system/install")
+async def api_system_install_state(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    state = provision.job_state()
+    state["missing"] = provision.missing()
+    state["can_install"] = provision.escalation() is not None
+    return state
+
 @app.get("/api/mail/inbound-job")
 async def api_mail_inbound_job(request: Request):
     if not _authed(request):
@@ -4005,12 +4476,12 @@ def _safe_int(v, default):
         return default
 
 class _ManagedTerm:
-    def __init__(self, sid, persist, rows, cols, owner="", run_as=None):
+    def __init__(self, sid, persist, rows, cols, owner="", run_as=None, jail=False):
         self.sid = sid
         self.persist = bool(persist)
         self.owner = owner
         self.run_as = run_as
-        self.sess = System.PtySession(run_as=run_as)
+        self.sess = System.PtySession(run_as=run_as, jail=jail)
         self.sess.spawn(rows=rows, cols=cols)
         self.rows, self.cols = rows, cols
         self.buffer = bytearray()
@@ -4096,8 +4567,15 @@ async def terminal_ws(websocket: WebSocket):
     if terminal_access == panel_users.TERMINAL_NONE:
         await websocket.close(code=1008)
         return
-    run_as = perms.get("os_username") if terminal_access == panel_users.TERMINAL_LIMITED else None
+    limited = terminal_access == panel_users.TERMINAL_LIMITED
+    run_as = perms.get("os_username") if limited else None
     is_admin = perms.get("role") == "admin"
+    if limited and not System.jail_available():
+        # A limited terminal is meant to be confined to its own home directory.
+        # Install what does that rather than quietly handing out a shell that can
+        # read the whole machine; this session still starts inside their home
+        # with a cd that refuses to leave it, and the next one is contained.
+        provision.install_async(["jail"])
 
     await websocket.accept()
     qp = websocket.query_params
@@ -4118,7 +4596,8 @@ async def terminal_ws(websocket: WebSocket):
         if not sid:
             sid = secrets.token_hex(8)
         try:
-            mt = _ManagedTerm(sid, persist, rows, cols, owner=username, run_as=run_as)
+            mt = _ManagedTerm(sid, persist, rows, cols, owner=username,
+                              run_as=run_as, jail=limited)
         except Exception as e:
             logging.error(f"terminal spawn failed: {e}")
             await websocket.close(code=1011)

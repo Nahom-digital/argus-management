@@ -16,6 +16,7 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 
 import mail
+import provision
 
 INSTALL_DIR = "/opt/mailcow-dockerized"
 CONF_PATH = os.path.join(INSTALL_DIR, "mailcow.conf")
@@ -135,12 +136,21 @@ def status(conn=None):
         "last_output": _state["output"][-1500:],
     }
     out["ready"] = out["installed"] and out["smtp_listening"]
+    # What the panel would have to install before mailcow can run, so the page
+    # can offer to do it rather than print a package name at the operator.
+    out["needs"] = [c for c in ("docker", "compose") if not provision.present(c)]
+    out["can_install"] = bool(out["needs"]) and provision.escalation() is not None
+    out["install"] = provision.job_state()
     problems = []
-    if not docker_ok:
+    if out["needs"]:
+        labels = " and ".join(provision.COMPONENTS[c]["label"] for c in out["needs"])
+        problems.append(
+            f"{labels} is not installed yet, and mailcow needs it. The panel can "
+            "install it for you." if out["can_install"] else
+            f"{labels} is not installed, and this panel cannot install it: it is "
+            "not running as root and sudo would ask for a password.")
+    elif not docker_ok:
         problems.append(docker_note)
-    elif not out["compose"]:
-        problems.append("Docker Compose is missing, so the mailcow stack cannot "
-                        "be started. Install the docker-compose-plugin package.")
     if docker_ok and out["compose"] and not out["installed"]:
         problems.append("mailcow has not been set up on this server yet.")
     if out["installed"] and not out["smtp_listening"]:
@@ -194,15 +204,18 @@ def prepare(domain, timezone="UTC"):
     problem = mail.domain_problem(domain)
     if problem:
         return False, problem
-    ok, note = docker_state()
-    if not ok:
-        return False, note
-    if compose_cmd() is None:
-        return False, ("Docker Compose is missing. Install the "
-                       "docker-compose-plugin package and try again.")
     host = f"mail.{domain.strip().lower()}"
 
     def work():
+        # Docker and Compose are installed here rather than demanded up front:
+        # setting mail up is the moment the operator has said they want this, and
+        # a missing package is something the panel can fix on its own.
+        ready, detail = provision.ensure_all(["docker", "compose"])
+        if not ready:
+            return False, detail
+        ok, note = docker_state()
+        if not ok:
+            return False, note
         if not cloned():
             os.makedirs(os.path.dirname(INSTALL_DIR), exist_ok=True)
             rc, out = _run(["git", "clone", "--depth", "1", REPO, INSTALL_DIR],
@@ -222,13 +235,16 @@ def prepare(domain, timezone="UTC"):
 
 
 def start_stack():
-    cmd = compose_cmd()
-    if not cmd:
-        return False, "Docker Compose is missing."
     if not installed():
         return False, "mailcow is not set up yet."
 
     def work():
+        ready, detail = provision.ensure_all(["docker", "compose"])
+        if not ready:
+            return False, detail
+        cmd = compose_cmd()
+        if not cmd:
+            return False, "Docker Compose is still not usable on this server."
         # The first start pulls several gigabytes of images, which is why this is
         # a background job with a very long ceiling rather than a request.
         rc, out = _run(cmd + ["pull"], timeout=5400, cwd=INSTALL_DIR)
@@ -458,10 +474,21 @@ DNS_RECORDS = (
 )
 
 
-def dns_help(domain):
+def dns_help(domain, bimi_record=""):
     """What has to exist in DNS before any of this works. Shown rather than
-    hidden, because a mail server with no MX record fails silently."""
+    hidden, because a mail server with no MX record fails silently.
+
+    The BIMI row only appears once there is a logo to point at, since a record
+    naming a picture that does not exist is worse than no record at all.
+    """
     domain = (domain or "<domain>").strip().lower()
-    return [{"type": kind, "name": name.replace("<domain>", domain),
+    rows = [{"type": kind, "name": name.replace("<domain>", domain),
              "value": value.replace("<domain>", domain), "why": why}
             for kind, name, value, why in DNS_RECORDS]
+    if bimi_record:
+        rows.append({
+            "type": "TXT", "name": f"default._bimi.{domain}", "value": bimi_record,
+            "why": ("so receivers can show your logo beside your mail. The URL has "
+                    "to be reachable over HTTPS from outside"),
+        })
+    return rows

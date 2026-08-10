@@ -79,6 +79,8 @@ const CONFIG_LOADERS={
   service: loadServices,
   database: loadDbTables,
   proxy: loadProxyHosts,
+  tunnel: loadTunnel,
+  firewall: loadFirewall,
 };
 /* The drill-down already replaced the card grid rather than sitting under it.
    What made it look like it opened "at the bottom" was the scroll position:
@@ -122,11 +124,17 @@ window.addEventListener('popstate', e=>{
   if(key) configOpen(key,true); else configBack(true);
 });
 
-/* ================= ACCOUNT ================= */
+/* ================= ACCOUNT =================
+   Three things live here: who you are, your password, and, for the admin only,
+   the recovery codes. A staff member has no recovery codes at all, so the card
+   is not on their page to begin with and this code never assumes it is. */
+let ME={};
+
 async function loadAccount(){
-  const el=$('acct-codes-state'); if(!el) return;
+  loadIdentity();
   ['acct-cur','acct-new','acct-new2','acct-regen-pw'].forEach(function(id){ const i=$(id); if(i) i.value=''; });
   const out=$('acct-codes-out'); if(out){ out.hidden=true; out.innerHTML=''; }
+  const el=$('acct-codes-state'); if(!el) return;
   el.textContent='Checking…';
   try{
     const r=await api('/api/account/recovery-status'); if(!r) return;
@@ -144,6 +152,112 @@ async function loadAccount(){
         (d.generated_at?' <span style="color:var(--gray-500);">(issued '+esc(d.generated_at.slice(0,10))+')</span>':'');
     }
   }catch(e){ el.textContent='Could not reach the server.'; }
+}
+
+function avatarUrl(who){
+  return BASE+'/api/account/avatar/'+encodeURIComponent(who.username||'')
+         +'?v='+encodeURIComponent((who.avatar_hash||'').slice(0,16));
+}
+
+/* A picture always goes in an <img>, never inlined into the page. An SVG in an
+   <img> cannot run script or reach the network; the same file written into the
+   document could do both. */
+function paintFace(img, txt, who){
+  if(!img||!txt) return;
+  if(who.has_avatar){ img.src=avatarUrl(who); img.hidden=false; txt.hidden=true; }
+  else { img.hidden=true; img.removeAttribute('src'); txt.hidden=false;
+         txt.textContent=who.initials||'?'; }
+}
+
+async function loadIdentity(){
+  if(!$('acct-id-name')) return;
+  try{
+    const r=await api('/api/account/identity'); if(!r) return;
+    const d=await r.json(); if(!r.ok) return;
+    ME=d; renderIdentity();
+  }catch(e){ /* the rest of the page still works without it */ }
+}
+
+function renderIdentity(){
+  $('acct-id-name').textContent=ME.full_name||ME.username||'';
+  $('acct-id-user').textContent='@'+(ME.username||'');
+  $('acct-id-role').textContent=ME.role_label||'';
+  const input=$('acct-fullname');
+  if(input&&document.activeElement!==input) input.value=ME.full_name||'';
+  paintFace($('acct-face-img'), $('acct-face-txt'), ME);
+  cfShow('acct-pic-clear', !!ME.has_avatar);
+  const hint=$('acct-name-hint');
+  if(hint) hint.textContent=ME.mail_domain
+    ? 'Shown in the top bar, and on every message you send from '+ME.mail_domain+'.'
+    : 'Shown in the top bar, and on every message you send.';
+  const bimi=$('acct-bimi');
+  if(bimi){
+    bimi.hidden=!ME.has_avatar;
+    bimi.textContent=ME.bimi
+      ? 'As a mail logo: '+ME.bimi
+      : 'This picture can also be published as your mail logo. The record to add is under Mail settings.';
+  }
+  syncTopbar();
+}
+
+/* The top bar is rendered by the server, so after a change it is updated in
+   place rather than left showing the name you just replaced. */
+function syncTopbar(){
+  const name=$('topbar-name'); if(name) name.textContent=ME.full_name||ME.username||'';
+  const face=$('topbar-face'); if(!face) return;
+  let img=face.querySelector('img'), txt=face.querySelector('span');
+  if(!img){ img=document.createElement('img'); img.width=30; img.height=30; img.alt=''; face.appendChild(img); }
+  if(!txt){ txt=document.createElement('span'); face.appendChild(txt); }
+  paintFace(img, txt, ME);
+}
+
+async function saveFullName(){
+  const fb=$('acct-name-feedback'), input=$('acct-fullname');
+  fb.className='save-feedback info'; fb.textContent='Saving…';
+  try{
+    const r=await api('/api/account/name',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({full_name:input.value})});
+    if(!r) return;
+    const d=await r.json();
+    if(!r.ok){ fb.className='save-feedback err'; fb.textContent=d.error||'Could not save that name.'; return; }
+    fb.className='save-feedback ok'; fb.textContent='Saved.';
+    ME.full_name=d.full_name; ME.initials=(d.full_name||'').trim().split(/\s+/)
+      .map(function(p){return p[0]||'';}).join('').slice(0,2).toUpperCase()||ME.initials;
+    renderIdentity(); appToast('Name updated','ok');
+  }catch(e){ fb.className='save-feedback err'; fb.textContent='Request failed.'; }
+}
+
+async function uploadAvatar(input){
+  const file=input.files&&input.files[0]; if(!file) return;
+  const fb=$('acct-pic-feedback'), maxKb=ME.max_upload_kb||512;
+  input.value='';
+  if(file.size>maxKb*1024){
+    fb.className='save-feedback err';
+    fb.textContent='That file is '+Math.round(file.size/1024)+' KB. Use one under '+maxKb+' KB.';
+    return;
+  }
+  fb.className='save-feedback info'; fb.textContent='Checking and storing…';
+  try{
+    const r=await api('/api/account/avatar',{method:'POST',
+      headers:{'Content-Type':file.type||'application/octet-stream'}, body:file});
+    if(!r) return;
+    const d=await r.json();
+    if(!r.ok){ fb.className='save-feedback err'; fb.textContent=d.error||'Could not store that picture.'; return; }
+    fb.className='save-feedback ok'; fb.textContent='Picture updated.';
+    await loadIdentity(); appToast('Picture updated','ok');
+  }catch(e){ fb.className='save-feedback err'; fb.textContent='Upload failed.'; }
+}
+
+async function removeAvatar(){
+  if(!(await uiConfirm('Remove your picture?','Your initials are shown instead.'))) return;
+  const fb=$('acct-pic-feedback');
+  try{
+    const r=await api('/api/account/avatar',{method:'DELETE'}); if(!r) return;
+    if(!r.ok){ fb.className='save-feedback err'; fb.textContent='Could not remove it.'; return; }
+    fb.className='save-feedback ok'; fb.textContent='Removed.';
+    await loadIdentity();
+  }catch(e){ fb.className='save-feedback err'; fb.textContent='Request failed.'; }
 }
 
 async function changePassword(){
@@ -325,7 +439,11 @@ function drawLineChart(id,series,max,colors){
 }
 
 /* ---- server card drill-down ---- */
-let _srvDetailKind=null, _fbPath='/', _accessDetailId=null;
+/* The file browser starts with no path at all rather than at "/": the server
+   knows which directory this account is allowed to see, and a staff member
+   scoped to their own home was being shown "outside your permitted area"
+   because the browser asked for the root of the filesystem first. */
+let _srvDetailKind=null, _fbPath='', _accessDetailId=null;
 let _ipDetailTarget=null, _ipProfileData=null, _lineDetailObj=null, _lineDetailTitle='';
 const _SRV_TITLES={cpu:'CPU: Top Processes',mem:'Memory: Top Processes',net:'Network: Active Connections',disk:'Disk: File Browser'};
 /* Which grant each drill-down needs. The server refuses without it either way;
@@ -949,10 +1067,10 @@ async function dbAddColumn(){
 let PX_EDITING=null, PX_CERTS=[], PX_STREAM_OK=true, PX_STREAM_WHY='', PX_LOC_SEQ=0;
 
 async function loadProxyHosts(){
+  /* The firewall and Cloudflare live on their own Config pages now, each behind
+     its own grant, so this loads proxy hosts and nothing else. */
   const el=$('proxy-list'); if(!el) return;
   el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
-  loadFirewall();
-  loadTunnel();
   try{
     const d=await getJSON('/api/config/proxy/hosts'); if(!d) return;
     if(!d.installed){
@@ -1340,8 +1458,13 @@ function mailToggleSettings(){
   if(opening) el.scrollIntoView({behavior:reduceMotion()?'auto':'smooth', block:'start'});
 }
 
+/* What the panel would have to install before mail can run. Kept out of the
+   button's markup so the onclick stays a plain call. */
+let MAIL_NEEDS=[];
+
 function mailAdminHtml(d){
   const cfg=d.config||{}, inb=d.inbound||{};
+  MAIL_NEEDS=inb.needs||[];
   const boxes=d.all_boxes||[], staff=d.staff||[];
   const dns=(d.dns||[]).map(r=>`<tr><td class="mono">${esc(r.type)}</td>
       <td class="mono">${esc(r.name)}</td><td class="mono">${esc(r.value)}</td>
@@ -1392,6 +1515,7 @@ function mailAdminHtml(d){
       </div>
       ${(inb.problems||[]).map(p=>`<div class="cf-missing">${esc(p)}</div>`).join('')}
       <div class="cf-btn-row" style="margin-top:14px;">
+        ${inb.can_install?`<button class="save-btn" onclick="installMissing()">Install what is missing</button>`:''}
         ${d.configured?`<button class="save-btn" onclick="mailInbound('prepare')">${inb.installed?'Re-run setup':'Set up mailcow'}</button>`:''}
         <button class="db-action-btn" onclick="mailInbound('start')" ${inb.installed?'':'disabled'}>Start containers</button>
         <button class="db-action-btn" onclick="mailInbound('stop')" ${inb.installed?'':'disabled'}>Stop</button>
@@ -1545,6 +1669,28 @@ async function mailInbound(action){
   const d=await mailPost('/api/mail/inbound/'+action,{},'mail-inbound-feedback');
   if(d) mailWatchJob();
 }
+async function installMissing(){
+  /* apt takes minutes on a cold machine, so this starts a background job and
+     reports on it in the same place the mailcow jobs report. */
+  const components=MAIL_NEEDS.slice();
+  if(!components.length){ loadMail(); return; }
+  const d=await mailPost('/api/system/install',{components},'mail-inbound-feedback');
+  if(d) installWatchJob();
+}
+
+function installWatchJob(){
+  const tick=async()=>{
+    try{
+      const j=await getJSON('/api/system/install'); if(!j) return;
+      if(j.busy){ mailFeedback('mail-inbound-feedback',true,j.action+'… '+j.seconds+'s'); setTimeout(tick,4000); return; }
+      if(j.error) mailFeedback('mail-inbound-feedback',false,j.error);
+      else if(j.action) mailFeedback('mail-inbound-feedback',true,j.output||'Installed.');
+      loadMail();
+    }catch(e){ /* the next tick may work */ }
+  };
+  setTimeout(tick,2000);
+}
+
 function mailWatchJob(){
   /* Cloning mailcow and pulling its images take minutes, so the server runs it
      in the background and this reports on it until it finishes. */
@@ -1658,6 +1804,14 @@ function mailInitials(name, addr){
   const parts=source.split(/[\s.@_-]+/).filter(Boolean);
   return ((parts[0]||'?')[0]+((parts[1]||'')[0]||'')).toUpperCase();
 }
+/* An address on this system belongs to somebody, and if that somebody has a
+   picture it goes here. Mail from outside has no account behind it, so it gets
+   initials: an honest answer rather than a broken image. */
+function mailFace(addr, name){
+  const face=((MAIL.faces||{})[String(addr||'').toLowerCase()])||{};
+  if(face.avatar) return `<span class="mail-avatar"><img src="${escAttr(face.avatar)}" alt=""></span>`;
+  return `<span class="mail-avatar">${esc(face.initials||mailInitials(name,addr))}</span>`;
+}
 function mailOpen(index){
   const m=MAIL_MSGS[index]; if(!m) return;
   MAIL_OPEN=m.id;
@@ -1669,7 +1823,7 @@ function mailOpen(index){
   $('mail-read').innerHTML=`
     <div class="mail-read-subject">${esc(m.subject||'(no subject)')}</div>
     <div class="mail-read-meta">
-      <span class="mail-avatar">${esc(mailInitials(m.from_name,addr))}</span>
+      ${mailFace(addr, m.from_name)}
       <span><span class="mail-who-name">${esc(who||'unknown')}</span><br>
         <span class="mail-who-addr">${esc(addr||'')}</span></span>
       <span class="mail-route ${routeClass}">${esc(routeLabel)}</span>
@@ -1719,9 +1873,10 @@ async function mailSync(){
 function mailCompose(prefill){
   const boxes=MAIL.boxes||[]; if(!boxes.length) return;
   const from=boxes[0];
+  const mine=MAIL.me||{};
   $('mail-from-row').innerHTML=`
-    <span class="mail-avatar">${esc(mailInitials(from.full_name,from.address))}</span>
-    <span><span class="mail-who-name">${esc(from.full_name||MAIL.username||'')}</span><br>
+    ${mailFace(from.address, from.full_name)}
+    <span><span class="mail-who-name">${esc(from.full_name||mine.full_name||MAIL.username||'')}</span><br>
       <span class="mail-who-addr">${esc(from.address)}</span></span>`;
   $('mail-from-row').dataset.address=from.address;
   $('mail-to').value=(prefill&&prefill.to)||'';

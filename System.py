@@ -15,6 +15,7 @@ import sys
 import time
 import shlex
 import platform
+import shutil
 import subprocess
 import logging
 from datetime import datetime
@@ -267,6 +268,130 @@ def terminal_cwd():
 # login shell attached to a pseudo-terminal so the browser (xterm.js over a
 # WebSocket in Main.py) behaves like an actual terminal: streaming output, live
 # keystrokes, window resize, job control. Runs with the Main.py process privileges.
+# --- the limited terminal's boundary ---------------------------------------- #
+#
+# Dropping to the staff member's own OS account stops them writing anywhere they
+# should not, but it does not stop them looking: `cd ..` walks out of their home
+# into /home, /etc and the rest of the machine, which is not what "limited"
+# means to the person who granted it.
+#
+# Two layers answer that. The outer one is bubblewrap: the shell runs in a mount
+# namespace where the filesystem is read-only, /home holds nothing but their own
+# directory, /root and the panel's own files are not there at all, and /tmp is
+# private to the session. The inner one is a `cd` that refuses to leave their
+# home, so the boundary is a sentence they can read rather than a directory that
+# turns out to be empty.
+#
+# The inner layer alone would be decoration: `builtin cd ..` walks straight
+# through it. It is there for the message. The namespace is the boundary.
+JAIL_RC_DIR = "/run/argus"
+JAIL_RC_PATH = os.path.join(JAIL_RC_DIR, "jail.bashrc")
+JAIL_RC_IN_SANDBOX = "/tmp/.argus-jail.bashrc"
+
+_JAIL_RC = """# Written by the Argus management panel for a limited terminal.
+ARGUS_HOME="$HOME"
+
+cd() {
+  local dest
+  if [ "$#" -eq 0 ]; then builtin cd -- "$ARGUS_HOME"; return; fi
+  dest=$(builtin cd -- "$1" >/dev/null 2>&1 && pwd -P) || {
+    printf 'cd: %s: no such directory\\n' "$1" >&2; return 1; }
+  case "$dest" in
+    "$ARGUS_HOME"|"$ARGUS_HOME"/*) builtin cd -- "$dest" ;;
+    *) printf 'This terminal is limited to %s, so there is nowhere above it to go.\\n' \\
+         "$ARGUS_HOME" >&2; return 1 ;;
+  esac
+}
+readonly -f cd 2>/dev/null
+
+# `builtin cd` goes around the function above, so every prompt checks where the
+# shell actually is and walks it back. The sandbox already means there is nothing
+# out there to find; this is what makes that obvious instead of puzzling.
+argus_anchor() {
+  case "$PWD" in
+    "$ARGUS_HOME"|"$ARGUS_HOME"/*) ;;
+    *) builtin cd -- "$ARGUS_HOME" ;;
+  esac
+}
+PROMPT_COMMAND=argus_anchor
+readonly PROMPT_COMMAND 2>/dev/null
+
+PS1='\\[\\e[38;5;173m\\]\\u\\[\\e[0m\\]:\\[\\e[38;5;110m\\]\\w\\[\\e[0m\\]$ '
+builtin cd -- "$ARGUS_HOME" 2>/dev/null
+printf 'Limited terminal: %s is the top of your area.\\n' "$ARGUS_HOME"
+"""
+
+
+def jail_binary():
+    return shutil.which("bwrap") or ""
+
+
+def jail_available():
+    return bool(jail_binary())
+
+
+def write_jail_rc():
+    """Put the shell profile somewhere only root can write.
+
+    Not /tmp: the file is sourced by the jailed user's shell, so anybody who
+    could write it would be running code in their session.
+    """
+    try:
+        os.makedirs(JAIL_RC_DIR, mode=0o755, exist_ok=True)
+        with open(JAIL_RC_PATH, "w", encoding="utf-8") as fh:
+            fh.write(_JAIL_RC)
+        os.chmod(JAIL_RC_PATH, 0o644)
+        return JAIL_RC_PATH
+    except OSError as e:
+        logging.warning(f"could not write the limited shell profile: {e}")
+        return ""
+
+
+# The sandbox is built up rather than pared down: it starts empty, and the only
+# things in it are the programs a shell needs, the configuration those programs
+# read, and this person's own home directory. Nothing is bound that was not
+# named here, which is why /root, every other home, /var and /opt are simply not
+# in the filesystem the session sees.
+_JAIL_SYSTEM = ("/usr", "/etc")
+_JAIL_COMPAT = ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+
+
+def _jail_command(home, rc_path):
+    """The argv that runs a shell inside the sandbox."""
+    args = [
+        jail_binary(),
+        "--die-with-parent",
+        "--unshare-uts", "--unshare-ipc", "--unshare-pid", "--unshare-cgroup-try",
+        "--hostname", "argus",
+    ]
+    for path in _JAIL_SYSTEM:
+        args += ["--ro-bind", path, path]
+    # A usr-merged system has /bin as a symlink into /usr; an older one has a
+    # real directory. Reproduce whichever this machine is, or nothing on PATH
+    # resolves inside the sandbox.
+    for path in _JAIL_COMPAT:
+        if os.path.islink(path):
+            args += ["--symlink", os.readlink(path), path]
+        elif os.path.isdir(path):
+            args += ["--ro-bind", path, path]
+    args += [
+        "--proc", "/proc", "--dev", "/dev",
+        "--tmpfs", "/run",
+        "--tmpfs", "/tmp",                  # private, so nothing is shared out
+        "--tmpfs", "/var",
+        "--tmpfs", "/home",                 # every other home disappears
+        "--bind", home, home,               # theirs, and the only writable place
+    ]
+    if rc_path:
+        args += ["--ro-bind", rc_path, JAIL_RC_IN_SANDBOX]
+    args += ["--chdir", home, "--"]
+    if rc_path:
+        args += ["bash", "--rcfile", JAIL_RC_IN_SANDBOX, "-i"]
+    else:
+        args += ["bash", "-i"]
+    return args
+
+
 class PtySession:
     """A login shell running on its own pseudo-terminal.
 
@@ -277,10 +402,14 @@ class PtySession:
 
     SHELL = ["bash", "-il"]  # interactive login shell -> reads profile, shows prompt
 
-    def __init__(self, cwd=None, env=None, run_as=None):
+    def __init__(self, cwd=None, env=None, run_as=None, jail=False):
         self.cwd = cwd or _PROJECT_DIR
         self.env = env
         self.run_as = run_as  # OS username to drop into, or None to stay as this process's user
+        # Confine the session to run_as's home directory. Only meaningful with
+        # run_as set: there is nothing to confine an admin's own shell to.
+        self.jail = bool(jail and run_as)
+        self.jailed = False   # whether the namespace actually took
         self.pid = None
         self.fd = None
 
@@ -304,8 +433,25 @@ class PtySession:
             os._exit(126)  # setuid silently no-op'd somehow, so refuse to run as root
         return pw.pw_dir
 
+    def _jail_argv(self, home, rc_path):
+        """The shell for a limited session, sandboxed if this machine can.
+
+        Without bubblewrap the session still starts inside their own home with a
+        `cd` that will not leave it, and their OS account's permissions still
+        apply; what is missing is the part that hides the rest of the machine.
+        """
+        if jail_available():
+            return _jail_command(home, rc_path)
+        if rc_path:
+            return ["bash", "--rcfile", rc_path, "-i"]
+        return list(self.SHELL)
+
     def spawn(self, rows=24, cols=80):
         import pty
+        # The profile has to be written before the fork, because after it the
+        # child is the unprivileged user and /run/argus is root's to write.
+        rc_path = write_jail_rc() if self.jail else ""
+        self.jailed = bool(self.jail and jail_available())
         pid, fd = pty.fork()
         if pid == 0:
             # Child: this process becomes the shell. pty.fork() already made the
@@ -335,6 +481,15 @@ class PtySession:
                 env.update({"HOME": home or "/", "USER": self.run_as, "LOGNAME": self.run_as})
             if self.env:
                 env.update(self.env)
+            if self.jail:
+                # The panel's own directory is not in the sandbox, so leaving it
+                # on PATH would only produce commands that are not there.
+                env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+                argv = self._jail_argv(home or "/", rc_path)
+                try:
+                    os.execvpe(argv[0], argv, env)
+                except Exception:
+                    os._exit(127)   # never fall back to an unconfined shell
             try:
                 os.execvpe(self.SHELL[0], self.SHELL, env)
             except Exception:
@@ -546,8 +701,10 @@ def list_dir(path=None, root=None):
     try:
         names = os.listdir(base)
     except PermissionError:
+        parent = os.path.dirname(base)
         return {"error": "Permission denied", "path": base,
-                "parent": os.path.dirname(base), "entries": []}
+                "parent": parent if _within(root, parent) and base != (root or "/") else None,
+                "entries": []}
     entries = []
     for name in names:
         full = os.path.join(base, name)

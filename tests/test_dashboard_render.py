@@ -168,13 +168,17 @@ def test_firewall_settings_appear_with_the_grant(client, conn):
 
 
 def test_the_proxy_page_is_absent_without_net_proxy(client, conn):
+    """The firewall used to be a card inside the proxy page, so this grant on its
+    own led to a Config with nothing in it. It has its own page now: no proxy,
+    but the firewall the grant names is there."""
     pu.delete_user(conn, STAFF)
     pu.create_user(conn, STAFF, PASSWORD, {"firewall_manage": True}, "admin")
     panel._forget_user_epoch(STAFF)
     try:
         page = _page_as(client, STAFF)
         assert 'data-cfgsub="proxy"' not in page
-        assert 'id="px-fw-in"' not in page, \
-            "the firewall card lives inside the proxy page, so it goes with it"
+        assert 'id="proxy-list"' not in page
+        assert 'data-cfgsub="firewall"' in page
+        assert 'id="px-fw-in"' in page
     finally:
         pu.delete_user(conn, STAFF)

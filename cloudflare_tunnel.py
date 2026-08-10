@@ -75,10 +75,25 @@ def version():
 def _env():
     """cloudflared keeps its account certificate next to the config by default,
     which is the invoking user's home directory. The panel is not always the same
-    user twice, so the location is stated explicitly instead."""
+    user twice, so the location is stated explicitly instead.
+
+    HOME is pinned as well. `tunnel login` is the one subcommand that ignores
+    TUNNEL_ORIGIN_CERT and writes into its own config directory under HOME, so
+    the panel has to know which directory that will be to go and collect the
+    certificate afterwards. See _adopt_cert().
+    """
     env = dict(os.environ)
     env["TUNNEL_ORIGIN_CERT"] = CERT_PATH
+    env["HOME"] = _login_home()
     return env
+
+
+def _login_home():
+    """The HOME cloudflared will write its login certificate under."""
+    home = os.environ.get("HOME") or ""
+    if home and os.path.isdir(home):
+        return home
+    return "/root" if os.path.isdir("/root") else "/tmp"
 
 
 def _run(args, timeout=60):
@@ -102,12 +117,90 @@ def ensure_dir():
 
 
 # ------------------------------------------------------------------- account
+def _cert_is_real(path):
+    """A certificate file that is actually a certificate. cloudflared writes a
+    PEM bundle here; anything else is a half-finished or stray file."""
+    try:
+        if os.path.getsize(path) < 64:
+            return False
+        with open(path, "rb") as fh:
+            return b"-----BEGIN" in fh.read(4096)
+    except OSError:
+        return False
+
+
+# Where `cloudflared tunnel login` may have left the certificate. It writes into
+# its own config directory and ignores TUNNEL_ORIGIN_CERT, so this is not the
+# path the rest of the module uses, and the file has to be collected.
+def _login_cert_candidates():
+    homes = [_login_home(), "/root", os.path.expanduser("~")]
+    seen, out = set(), []
+    for home in homes:
+        path = os.path.join(home, ".cloudflared", "cert.pem")
+        if path not in seen and path != CERT_PATH:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _adopt_cert():
+    """Move a certificate cloudflared wrote elsewhere into the panel's own path.
+
+    This is the difference between a login that worked and a login the panel
+    could not see: the browser flow completes, cloudflared writes
+    ~/.cloudflared/cert.pem and exits happily, and every later command is told
+    to read /etc/cloudflared/cert.pem instead. Collect it, and the tunnel
+    commands that do honour TUNNEL_ORIGIN_CERT all line up again.
+
+    Returns True when a certificate is in place afterwards.
+    """
+    if _cert_is_real(CERT_PATH):
+        return True
+    for path in _login_cert_candidates():
+        if not _cert_is_real(path):
+            continue
+        try:
+            ensure_dir()
+            # O_NOFOLLOW: read the file cloudflared wrote, never wherever a
+            # symlink in its place points. A private key is not something to
+            # copy through an indirection nobody checked.
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                with os.fdopen(fd, "rb") as src:
+                    data = src.read(1024 * 1024)
+            except Exception:
+                os.close(fd)
+                continue
+            # A unique temporary name, so two requests arriving together cannot
+            # interleave into one half-written file and then publish it.
+            tmp = f"{CERT_PATH}.{os.getpid()}.{threading.get_ident()}.new"
+            with open(tmp, "wb") as dst:
+                dst.write(data)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, CERT_PATH)
+        except OSError:
+            continue
+        return True
+    return False
+
+
 def logged_in():
-    return os.path.isfile(CERT_PATH) and os.path.getsize(CERT_PATH) > 0
+    """True when this server can manage the account's tunnels.
+
+    Adopting here rather than in the caller means every path that asks the
+    question (the status endpoint, the poll the browser runs, the tunnel
+    commands themselves) picks up a fresh login without being told to look.
+    """
+    return _adopt_cert()
 
 
 _login = {"url": "", "started": 0.0, "output": "", "done": False, "error": ""}
 _login_lock = threading.Lock()
+
+# cloudflared exits the moment the browser comes back, and writes the
+# certificate just before it does. Give the file a few seconds to appear rather
+# than calling a successful login a failure by half a second.
+_CERT_WAIT = 15
 
 
 def _login_reader(proc):
@@ -127,12 +220,38 @@ def _login_reader(proc):
         with _login_lock:
             _login["error"] = str(e)
     finally:
+        deadline = time.time() + _CERT_WAIT
+        connected = logged_in()
+        while not connected and time.time() < deadline:
+            time.sleep(0.5)
+            connected = logged_in()
         with _login_lock:
             _login["output"] = "".join(lines)[-4000:]
             _login["done"] = True
-            if not logged_in() and not _login["error"]:
-                _login["error"] = ("cloudflared stopped before the account was "
-                                   "connected. Open the link again.")
+            if not connected and not _login["error"]:
+                _login["error"] = _login_failure(_login["output"])
+
+
+def _login_failure(output):
+    """Say what actually went wrong, in the words cloudflared used.
+
+    The old message blamed the operator for closing the browser too early, which
+    was usually not what happened, and left nothing to act on.
+    """
+    tail = ""
+    for line in reversed([ln.strip() for ln in output.splitlines() if ln.strip()]):
+        low = line.lower()
+        if "http" in low and "dash.cloudflare.com" in low:
+            continue
+        if any(word in low for word in ("error", "failed", "denied", "timeout",
+                                        "unable", "cannot", "refused")):
+            tail = line[:300]
+            break
+    if tail:
+        return f"cloudflared could not finish signing in: {tail}"
+    return ("cloudflared finished without leaving a certificate this server can "
+            "read. If you did authorize a domain, open the link again; if it "
+            f"keeps happening, check that {CONFIG_DIR} is writable.")
 
 
 def login_start():
@@ -202,11 +321,18 @@ def login_state():
 
 def disconnect():
     """Forget the account certificate. Tunnels themselves stay in Cloudflare;
-    this machine simply loses the right to manage them until it logs in again."""
+    this machine simply loses the right to manage them until it logs in again.
+
+    The copy cloudflared wrote under HOME goes too, or the next status check
+    would adopt it straight back and Disconnect would appear to do nothing.
+    """
     removed = []
-    for path in (CERT_PATH,):
+    for path in [CERT_PATH] + _login_cert_candidates():
         if os.path.exists(path):
-            os.remove(path)
+            try:
+                os.remove(path)
+            except OSError:
+                continue
             removed.append(path)
     with _login_lock:
         _login.update({"url": "", "started": 0.0, "output": "", "done": False,
@@ -219,6 +345,25 @@ def cred_path(name):
     return os.path.join(CONFIG_DIR, f"{name}.json")
 
 
+def _json_rows(out):
+    """(rows, problem). cloudflared mixes log lines in with its JSON, and prints
+    a bare `null` rather than an empty list when the account has no tunnels at
+    all, which is the ordinary state of a new account and not an error."""
+    text = out.strip()
+    if not text:
+        return [], ""
+    if "[" in text and "]" in text:
+        try:
+            rows = json.loads(text[text.index("["):text.rindex("]") + 1])
+        except (ValueError, json.JSONDecodeError):
+            return [], "cloudflared answered something that was not a tunnel list."
+        return (rows if isinstance(rows, list) else []), ""
+    for line in text.splitlines():
+        if line.strip() == "null":
+            return [], ""
+    return [], "cloudflared answered something that was not a tunnel list."
+
+
 def list_remote():
     """The tunnels Cloudflare knows about, or a reason it could not be asked."""
     if not logged_in():
@@ -226,10 +371,9 @@ def list_remote():
     rc, out = _run(["tunnel", "list", "--output", "json"], timeout=45)
     if rc != 0:
         return [], out.strip()[-400:] or "cloudflared could not list tunnels."
-    try:
-        rows = json.loads(out[out.index("["):out.rindex("]") + 1])
-    except (ValueError, json.JSONDecodeError):
-        return [], "cloudflared answered something that was not a tunnel list."
+    rows, problem = _json_rows(out)
+    if problem:
+        return [], problem
     out_rows = []
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):

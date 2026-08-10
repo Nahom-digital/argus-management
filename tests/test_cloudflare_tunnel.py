@@ -204,7 +204,90 @@ def test_every_tunnel_route_is_a_real_route():
 
 
 def test_the_card_only_renders_for_an_account_that_holds_the_grant():
-    with_grant = panel._config_sub_proxy({"net_proxy": True, "tunnel_manage": True})
-    without = panel._config_sub_proxy({"net_proxy": True})
-    assert "cf-card" in with_grant
-    assert "cf-card" not in without
+    """Cloudflare is its own Config page now, so the grant decides whether the
+    page is built at all rather than whether a card inside the proxy page is."""
+    perms = dict(pu.all_grants(False), role="staff", tunnel_manage=True)
+    assert "cf-card" in panel._config_pane_html(perms)
+    assert "cf-card" not in panel._config_pane_html(
+        dict(pu.all_grants(False), role="staff", net_proxy=True))
+    assert "cf-card" not in panel._config_sub_proxy(perms)
+
+
+# ------------------------------------------------- reading what cloudflared says
+def test_an_account_with_no_tunnels_is_not_reported_as_an_error(monkeypatch):
+    """cloudflared prints a bare `null` rather than an empty list when there is
+    nothing to list, which is the ordinary state of a new account. It used to
+    come out as "cloudflared answered something that was not a tunnel list"."""
+    monkeypatch.setattr(cf, "logged_in", lambda: True)
+    monkeypatch.setattr(cf, "_run", lambda *a, **k: (0, "null\n2026-08-10 WRN outdated\n"))
+    rows, problem = cf.list_remote()
+    assert rows == []
+    assert problem == ""
+
+
+def test_log_lines_around_the_json_do_not_stop_it_being_read(monkeypatch):
+    monkeypatch.setattr(cf, "logged_in", lambda: True)
+    monkeypatch.setattr(cf, "_run", lambda *a, **k: (0, (
+        'WRN something\n[{"id":"abc","name":"home","created_at":"2026-08-10T10:00:00Z",'
+        '"connections":[]}]\nWRN outdated\n')))
+    rows, problem = cf.list_remote()
+    assert problem == ""
+    assert rows[0]["name"] == "home"
+
+
+# ------------------------------------------------- collecting the certificate
+def test_a_certificate_written_where_cloudflared_puts_it_is_collected(tmp_path,
+                                                                     monkeypatch):
+    """`cloudflared tunnel login` ignores TUNNEL_ORIGIN_CERT and writes into its
+    own config directory under HOME. The panel looked at /etc/cloudflared and
+    reported a completed login as "stopped before the account was connected".
+    """
+    home = tmp_path / "home"
+    (home / ".cloudflared").mkdir(parents=True)
+    written = home / ".cloudflared" / "cert.pem"
+    written.write_bytes(b"-----BEGIN ARGO TUNNEL TOKEN-----\n" + b"x" * 200 + b"\n")
+    target = tmp_path / "etc" / "cert.pem"
+    monkeypatch.setattr(cf, "CONFIG_DIR", str(tmp_path / "etc"))
+    monkeypatch.setattr(cf, "CERT_PATH", str(target))
+    monkeypatch.setattr(cf, "_login_home", lambda: str(home))
+    monkeypatch.setenv("HOME", str(home))
+
+    assert cf.logged_in() is True
+    assert target.exists()
+    assert oct(target.stat().st_mode)[-3:] == "600"
+    assert cf.login_state()["state"] == "connected"
+
+
+def test_a_file_that_is_not_a_certificate_is_not_collected(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".cloudflared").mkdir(parents=True)
+    (home / ".cloudflared" / "cert.pem").write_bytes(b"not a certificate")
+    monkeypatch.setattr(cf, "CONFIG_DIR", str(tmp_path / "etc"))
+    monkeypatch.setattr(cf, "CERT_PATH", str(tmp_path / "etc" / "cert.pem"))
+    monkeypatch.setattr(cf, "_login_home", lambda: str(home))
+    assert cf.logged_in() is False
+
+
+def test_disconnecting_removes_the_copy_that_would_be_collected_again(tmp_path,
+                                                                     monkeypatch):
+    """Otherwise the next status check adopts it straight back and Disconnect
+    looks like it did nothing."""
+    home = tmp_path / "home"
+    (home / ".cloudflared").mkdir(parents=True)
+    (home / ".cloudflared" / "cert.pem").write_bytes(
+        b"-----BEGIN ARGO TUNNEL TOKEN-----\n" + b"x" * 200)
+    monkeypatch.setattr(cf, "CONFIG_DIR", str(tmp_path / "etc"))
+    monkeypatch.setattr(cf, "CERT_PATH", str(tmp_path / "etc" / "cert.pem"))
+    monkeypatch.setattr(cf, "_login_home", lambda: str(home))
+    assert cf.logged_in() is True
+    cf.disconnect()
+    assert cf.logged_in() is False
+
+
+def test_a_login_that_left_no_certificate_says_what_cloudflared_said():
+    detail = cf._login_failure("2026-08-10 INF Opening browser\n"
+                              "2026-08-10 ERR failed to write cert: permission denied\n")
+    assert "permission denied" in detail
+    # And the old wording, which blamed the operator for something they had
+    # usually not done, is gone.
+    assert "stopped before the account" not in detail
