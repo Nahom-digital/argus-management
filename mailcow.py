@@ -163,6 +163,11 @@ def status(conn=None):
         problems.append("mailcow is set up but nothing is listening on port 25, "
                         "so mail cannot arrive yet.")
     out["problems"] = problems
+    # If the stack is running but we do not know the admin password yet
+    # (install predates the panel), set one now so the page can show it.
+    if out["installed"] and running > 0:
+        _ensure_admin_password()
+        out["admin_password"] = _state.get("admin_password", "") or conf_value("MAILCOW_PASS")
     return out
 
 
@@ -191,6 +196,50 @@ def _background(action, fn):
 
     threading.Thread(target=work, daemon=True).start()
     return True, f"{action} started."
+
+
+def _ensure_admin_password():
+    """Make sure the admin password is known so status() can show it.
+
+    For fresh installs it was set during prepare() and written to
+    mailcow.conf.  For installs that predate the panel, or when the conf
+    has gone missing, generate one and push it into the running mailcow
+    database.
+    """
+    # Already have it in memory from a recent prepare() or a previous reset.
+    if _state.get("admin_password"):
+        return
+    # Read from the conf file (set during prepare).
+    pw = conf_value("MAILCOW_PASS")
+    if pw:
+        with _lock:
+            _state["admin_password"] = pw
+        return
+    # The stack must be running for the in-container reset to work.
+    running, _ = containers()
+    if running == 0:
+        return
+    # Don't hammer docker exec on every status poll if it failed before.
+    if _state.get("_pw_attempted"):
+        return
+    with _lock:
+        _state["_pw_attempted"] = True
+    # Existing install with no stored password — generate one and push it
+    # into mailcow via its own CLI.
+    import secrets
+    pw = secrets.token_urlsafe(12)
+    cmd = compose_cmd()
+    if not cmd:
+        return
+    # mailcow's command.php can reset the admin password from inside the
+    # php-fpm container.
+    rc, _out = _run(cmd + ["exec", "-T", "php-fpm-mailcow",
+                           "php", "/web/command.php", "reset-admin", pw],
+                    timeout=120, cwd=INSTALL_DIR)
+    if rc == 0:
+        with _lock:
+            _state["admin_password"] = pw
+            _state["_pw_attempted"] = False  # allow retry on next start if needed
 
 
 def job_state():
@@ -271,6 +320,12 @@ def start_stack():
                        env=dict(os.environ, HTTP_PORT=HTTP_PORT, HTTPS_PORT=HTTPS_PORT))
         if rc != 0:
             return False, f"the mailcow stack would not start: {out.strip()[-400:]}"
+        # Make sure we can show the admin password on the page.  For fresh
+        # installs it was set during prepare().  For existing installs, or if
+        # the conf somehow lost it, generate one and push it into mailcow.
+        with _lock:
+            _state.pop("_pw_attempted", None)  # fresh start, fresh attempt
+        _ensure_admin_password()
         return True, "the mailcow stack is up"
 
     return _background("starting mailcow", work)
