@@ -4025,7 +4025,7 @@ def _mail_overview(conn, username, is_admin, public_origin=""):
     if is_admin:
         out["config"] = cfg
         out["all_boxes"] = mail.boxes(conn)
-        out["inbound"] = mailcow.status(conn)
+        out["inbound"] = mailcow.status(conn, cfg["domain"])
         out["bimi"] = _bimi_state(conn, username, cfg["domain"], public_origin)
         out["dns"] = mailcow.dns_help(cfg["domain"], out["bimi"]["record"])
         out["staff"] = [u["username"] for u in panel_users.list_users(conn)]
@@ -4339,7 +4339,8 @@ async def api_mail_inbound_action(request: Request, action: str):
     if denied:
         return denied
     if action == "start":
-        ok, message = mailcow.start_stack()
+        domain = await DB.run(_mail_work(lambda c: mail.config(c).get("domain", "")))
+        ok, message = mailcow.start_stack(domain)
     elif action == "stop":
         ok, message = mailcow.stop_stack()
     elif action == "key":

@@ -1685,7 +1685,19 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
   font-family: var(--mono); font-size: 10.5px; cursor: pointer;
   transition: color .12s, border-color .12s;
 }
-.mc-copy:hover { color: var(--gray-900); border-color: var(--gray-400); }
+.mc-copy:hover { color: var(--black); border-color: var(--gray-400); }
+/* A value the panel is still working out. It reads as waiting rather than
+   as an answer, so nobody pastes it into a DNS panel. */
+.mc-pending { color: var(--gray-500); font-style: italic; }
+.mc-working {
+  display: flex; align-items: center; gap: 9px; margin-top: 9px;
+  font-size: 12px; color: var(--gray-600);
+}
+/* The DNS value column: the record itself, with the copy action tucked to
+   its right so the long DKIM key still wraps into the cell. */
+.dns-val { display: flex; align-items: flex-start; gap: 8px; }
+.dns-v { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.dns-val .mc-copy { flex: none; margin-top: 1px; }
 
 .cf-add-row {
   display: flex; gap: 8px; flex-wrap: wrap; align-items: center;

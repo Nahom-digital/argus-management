@@ -1466,8 +1466,16 @@ function mailAdminHtml(d){
   const cfg=d.config||{}, inb=d.inbound||{};
   MAIL_NEEDS=inb.needs||[];
   const boxes=d.all_boxes||[], staff=d.staff||[];
+  /* Every value here is the value to paste, not a description of one: the
+     A record carries this server's real address and the DKIM row carries the
+     key mailcow generated. A row still being worked out says so, rather than
+     showing an empty cell that reads as "nothing needed". */
   const dns=(d.dns||[]).map(r=>`<tr><td class="mono">${esc(r.type)}</td>
-      <td class="mono">${esc(r.name)}</td><td class="mono">${esc(r.value)}</td>
+      <td class="mono">${esc(r.name)}</td>
+      <td class="mono dns-val">${r.pending
+        ? `<span class="mc-pending">${esc(r.pending)}…</span>`
+        : `<span class="dns-v">${esc(r.value)}</span>
+           <button class="mc-copy" title="Copy value" onclick="copyVal(this.previousElementSibling.textContent,'${escAttr(r.type)} value')">copy</button>`}</td>
       <td style="color:var(--gray-600);">${esc(r.why)}</td></tr>`).join('');
 
   const inboundState=inb.ready?'<span class="cf-state cf-ok">receiving</span>'
@@ -1478,6 +1486,7 @@ function mailAdminHtml(d){
      panel, and the operator logging in tomorrow needs the same URL. */
   const mcHost=inb.hostname||'';
   const mcPw=inb.admin_password||'';
+  const mcKey=inb.api_key||'';
   const mcLogin=inb.installed&&mcHost?`
     <div class="field-label" style="margin-top:16px;">mailcow admin login</div>
     <div class="mc-creds">
@@ -1498,9 +1507,25 @@ function mailAdminHtml(d){
         <button class="mc-copy" title="Copy password" onclick="copyVal('${escAttr(mcPw)}','Password')">copy</button>
       </div>`:`<div class="mc-row">
         <span class="mc-k">Password</span>
-        <span class="mc-v" style="color:var(--gray-500);">Appears once the stack is running.</span>
+        <span class="mc-v mc-pending">${inb.setup_busy?'Being set…':'Appears once the stack is running.'}</span>
       </div>`}
-    </div>`:'';
+      <div class="mc-row">
+        <span class="mc-k">SMTP</span>
+        <span class="mc-v">port 25 in, 587 / 465 out${inb.smtp_listening?'':', nothing listening yet'}</span>
+      </div>
+      ${mcKey?`<div class="mc-row">
+        <span class="mc-k">API key</span>
+        <span class="mc-v" id="mailcow-key" data-real="${escAttr(mcKey)}">••••••••••••</span>
+        <button class="mc-copy" id="mailcow-key-toggle" title="Show or hide the API key" onclick="mailcowKeyToggle()">show</button>
+        <button class="mc-copy" title="Copy API key" onclick="copyVal('${escAttr(mcKey)}','API key')">copy</button>
+      </div>`:`<div class="mc-row">
+        <span class="mc-k">API key</span>
+        <span class="mc-v mc-pending">${inb.setup_busy?'Being created…':'Created automatically once the stack is running.'}</span>
+      </div>`}
+    </div>
+    ${inb.setup_busy?`<div class="mc-working">
+      <span class="cf-pulse"></span>Finishing setup: API key, domain, and DKIM key.
+    </div>`:''}`:'';
   const outState=cfg.relay_host?'<span class="cf-state cf-ok">configured</span>'
     :'<span class="cf-state">not set up</span>';
 
@@ -1698,15 +1723,17 @@ async function mailInbound(action){
   const d=await mailPost('/api/mail/inbound/'+action,{},'mail-inbound-feedback');
   if(d) mailWatchJob();
 }
-function mailcowPwToggle(){
-  /* The password sits masked on the card, and the real value is kept in a
-     data attribute on the same element, so showing it is a class flip that
-     never re-fetches and never disappears when the card re-renders. */
-  const el=$('mailcow-pw'), btn=$('mailcow-pw-toggle'); if(!el||!btn) return;
+function mcReveal(id){
+  /* The secret sits masked on the card, and the real value is kept in a data
+     attribute on the same element, so showing it is a class flip that never
+     re-fetches and never disappears when the card re-renders. */
+  const el=$(id), btn=$(id+'-toggle'); if(!el||!btn) return;
   const shown=el.classList.toggle('revealed');
   el.textContent=shown?(el.getAttribute('data-real')||''):'••••••••••••';
   btn.textContent=shown?'hide':'show';
 }
+function mailcowPwToggle(){ mcReveal('mailcow-pw'); }
+function mailcowKeyToggle(){ mcReveal('mailcow-key'); }
 async function installMissing(){
   /* apt takes minutes on a cold machine, so this starts a background job and
      reports on it in the same place the mailcow jobs report. */
