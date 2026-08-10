@@ -24,9 +24,11 @@ REPO = "https://github.com/mailcow/mailcow-dockerized.git"
 SMTP_PORT = 25
 IMAP_PORT = 993
 API_TIMEOUT = 30
+HTTP_PORT = "8081"
+HTTPS_PORT = "8443"
 
 _state = {"action": "", "started": 0.0, "done": True, "ok": True,
-          "output": "", "error": ""}
+          "output": "", "error": "", "admin_password": ""}
 _lock = threading.Lock()
 
 
@@ -130,6 +132,10 @@ def status(conn=None):
         "containers_running": running,
         "containers_total": total,
         "smtp_listening": port_listening(SMTP_PORT),
+        "http_port": conf_value("HTTP_PORT") or HTTP_PORT,
+        "https_port": conf_value("HTTPS_PORT") or HTTPS_PORT,
+        "admin_username": "admin",
+        "admin_password": conf_value("MAILCOW_PASS") or _state.get("admin_password", ""),
         "busy": not _state["done"],
         "action": _state["action"],
         "last_error": _state["error"],
@@ -192,7 +198,12 @@ def job_state():
         return {"action": _state["action"], "busy": not _state["done"],
                 "ok": _state["ok"], "error": _state["error"],
                 "output": _state["output"][-1500:],
-                "seconds": int(time.time() - _state["started"]) if _state["started"] else 0}
+                "seconds": int(time.time() - _state["started"]) if _state["started"] else 0,
+                "http_port": conf_value("HTTP_PORT") or HTTP_PORT,
+                "https_port": conf_value("HTTPS_PORT") or HTTPS_PORT,
+                "admin_username": "admin",
+                "admin_password": _state.get("admin_password", "") or conf_value("MAILCOW_PASS"),
+                }
 
 
 def prepare(domain, timezone="UTC"):
@@ -223,12 +234,18 @@ def prepare(domain, timezone="UTC"):
             if rc != 0:
                 return False, f"could not clone mailcow: {out.strip()[-400:]}"
         if not installed():
+            import secrets
+            admin_pw = secrets.token_urlsafe(12)
             env = dict(os.environ, MAILCOW_HOSTNAME=host, MAILCOW_TZ=timezone,
-                       MAILCOW_BRANCH="master")
+                       MAILCOW_BRANCH="master",
+                       MAILCOW_PASS=admin_pw,
+                       HTTP_PORT=HTTP_PORT, HTTPS_PORT=HTTPS_PORT)
             rc, out = _run(["./generate_config.sh"], timeout=300,
                            cwd=INSTALL_DIR, env=env)
             if rc != 0 or not installed():
                 return False, f"generate_config.sh failed: {out.strip()[-400:]}"
+            with _lock:
+                _state["admin_password"] = admin_pw
         return True, f"mailcow is set up for {host}. Start the containers next."
 
     return _background("preparing mailcow", work)
@@ -250,7 +267,8 @@ def start_stack():
         rc, out = _run(cmd + ["pull"], timeout=5400, cwd=INSTALL_DIR)
         if rc != 0:
             return False, f"could not pull the mailcow images: {out.strip()[-400:]}"
-        rc, out = _run(cmd + ["up", "-d"], timeout=3600, cwd=INSTALL_DIR)
+        rc, out = _run(cmd + ["up", "-d"], timeout=3600, cwd=INSTALL_DIR,
+                       env=dict(os.environ, HTTP_PORT=HTTP_PORT, HTTPS_PORT=HTTPS_PORT))
         if rc != 0:
             return False, f"the mailcow stack would not start: {out.strip()[-400:]}"
         return True, "the mailcow stack is up"
