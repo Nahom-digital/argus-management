@@ -198,6 +198,53 @@ def _background(action, fn):
     return True, f"{action} started."
 
 
+def _set_admin_password(pw):
+    """Push a new admin password into the running mailcow database.
+
+    The password is hashed the way mailcow itself hashes it (PHP
+    password_hash, bcrypt) by running PHP inside the same php-fpm container,
+    then written into the admin table via the mysql container.  This is the
+    same result mailcow's own admin UI produces, without needing any
+    interactive prompt.
+    """
+    cmd = compose_cmd()
+    if not cmd:
+        return False
+    # token_urlsafe output is only [A-Za-z0-9_-], safe to embed in PHP code.
+    rc, out = _run(cmd + ["exec", "-T", "php-fpm-mailcow", "php", "-r",
+                          f"echo password_hash('{pw}', PASSWORD_DEFAULT);"],
+                   timeout=60, cwd=INSTALL_DIR)
+    if rc != 0 or not out.strip():
+        return False
+    hashed = out.strip().splitlines()[-1].strip()
+    if not hashed.startswith("$2"):
+        return False
+    dbroot = conf_value("DBROOT")
+    if not dbroot:
+        return False
+    # The hash contains $ characters, which is fine: args go straight to the
+    # process, no shell is involved.
+    sql = f"UPDATE admin SET password='{hashed}' WHERE username='admin';"
+    rc, _out = _run(cmd + ["exec", "-T", "mysql-mailcow", "mysql", "-u", "root",
+                           f"-p{dbroot}", "mailcow", "-e", sql],
+                    timeout=120, cwd=INSTALL_DIR)
+    return rc == 0
+
+
+def _persist_admin_password(pw):
+    """Remember the password across panel restarts.
+
+    It is appended to mailcow.conf, the file conf_value() already reads.
+    mailcow does not use this key itself, but the panel does, and this is
+    the one durable file the panel already reads for everything else.
+    """
+    try:
+        with open(CONF_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"\nMAILCOW_PASS={pw}\n")
+    except OSError:
+        pass
+
+
 def _ensure_admin_password():
     """Make sure the admin password is known so status() can show it.
 
@@ -209,7 +256,7 @@ def _ensure_admin_password():
     # Already have it in memory from a recent prepare() or a previous reset.
     if _state.get("admin_password"):
         return
-    # Read from the conf file (set during prepare).
+    # Read from the conf file (set during prepare, or persisted later).
     pw = conf_value("MAILCOW_PASS")
     if pw:
         with _lock:
@@ -225,21 +272,14 @@ def _ensure_admin_password():
     with _lock:
         _state["_pw_attempted"] = True
     # Existing install with no stored password — generate one and push it
-    # into mailcow via its own CLI.
+    # into mailcow via its own database.
     import secrets
     pw = secrets.token_urlsafe(12)
-    cmd = compose_cmd()
-    if not cmd:
-        return
-    # mailcow's command.php can reset the admin password from inside the
-    # php-fpm container.
-    rc, _out = _run(cmd + ["exec", "-T", "php-fpm-mailcow",
-                           "php", "/web/command.php", "reset-admin", pw],
-                    timeout=120, cwd=INSTALL_DIR)
-    if rc == 0:
+    if _set_admin_password(pw):
         with _lock:
             _state["admin_password"] = pw
             _state["_pw_attempted"] = False  # allow retry on next start if needed
+        _persist_admin_password(pw)
 
 
 def job_state():
@@ -283,18 +323,13 @@ def prepare(domain, timezone="UTC"):
             if rc != 0:
                 return False, f"could not clone mailcow: {out.strip()[-400:]}"
         if not installed():
-            import secrets
-            admin_pw = secrets.token_urlsafe(12)
             env = dict(os.environ, MAILCOW_HOSTNAME=host, MAILCOW_TZ=timezone,
                        MAILCOW_BRANCH="master",
-                       MAILCOW_PASS=admin_pw,
                        HTTP_PORT=HTTP_PORT, HTTPS_PORT=HTTPS_PORT)
             rc, out = _run(["./generate_config.sh"], timeout=300,
                            cwd=INSTALL_DIR, env=env)
             if rc != 0 or not installed():
                 return False, f"generate_config.sh failed: {out.strip()[-400:]}"
-            with _lock:
-                _state["admin_password"] = admin_pw
         return True, f"mailcow is set up for {host}. Start the containers next."
 
     return _background("preparing mailcow", work)

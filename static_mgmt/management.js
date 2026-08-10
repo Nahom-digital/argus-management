@@ -1473,6 +1473,34 @@ function mailAdminHtml(d){
   const inboundState=inb.ready?'<span class="cf-state cf-ok">receiving</span>'
     :inb.installed?'<span class="cf-state cf-wait">set up, not receiving</span>'
     :'<span class="cf-state">not set up</span>';
+  /* The mailcow admin login, kept on the card so it can be found again.
+     It is not a secret that is only shown once: this is a personal server
+     panel, and the operator logging in tomorrow needs the same URL. */
+  const mcHost=inb.hostname||'';
+  const mcPw=inb.admin_password||'';
+  const mcLogin=inb.installed&&mcHost?`
+    <div class="field-label" style="margin-top:16px;">mailcow admin login</div>
+    <div class="mc-creds">
+      <div class="mc-row">
+        <span class="mc-k">Web UI</span>
+        <span class="mc-v">https://${esc(mcHost)}:${esc(inb.https_port)}</span>
+        <button class="mc-copy" title="Copy URL" onclick="copyVal('https://${escAttr(mcHost)}:${escAttr(inb.https_port)}','Web UI URL')">copy</button>
+      </div>
+      <div class="mc-row">
+        <span class="mc-k">Username</span>
+        <span class="mc-v">${esc(inb.admin_username||'admin')}</span>
+        <button class="mc-copy" title="Copy username" onclick="copyVal('${escAttr(inb.admin_username||'admin')}','Username')">copy</button>
+      </div>
+      ${mcPw?`<div class="mc-row">
+        <span class="mc-k">Password</span>
+        <span class="mc-v" id="mailcow-pw" data-real="${escAttr(mcPw)}">••••••••••••</span>
+        <button class="mc-copy" id="mailcow-pw-toggle" title="Show or hide the password" onclick="mailcowPwToggle()">show</button>
+        <button class="mc-copy" title="Copy password" onclick="copyVal('${escAttr(mcPw)}','Password')">copy</button>
+      </div>`:`<div class="mc-row">
+        <span class="mc-k">Password</span>
+        <span class="mc-v" style="color:var(--gray-500);">Appears once the stack is running.</span>
+      </div>`}
+    </div>`:'';
   const outState=cfg.relay_host?'<span class="cf-state cf-ok">configured</span>'
     :'<span class="cf-state">not set up</span>';
 
@@ -1513,6 +1541,7 @@ function mailAdminHtml(d){
         <span>Containers: ${inb.containers_running||0}/${inb.containers_total||0}</span>
         <span>Port 25: ${inb.smtp_listening?'listening':'closed'}</span>
       </div>
+      ${mcLogin}
       ${(inb.problems||[]).map(p=>`<div class="cf-missing">${esc(p)}</div>`).join('')}
       <div class="cf-btn-row" style="margin-top:14px;">
         ${inb.can_install?`<button class="save-btn" onclick="installMissing()">Install what is missing</button>`:''}
@@ -1668,6 +1697,15 @@ async function mailInbound(action){
   }
   const d=await mailPost('/api/mail/inbound/'+action,{},'mail-inbound-feedback');
   if(d) mailWatchJob();
+}
+function mailcowPwToggle(){
+  /* The password sits masked on the card, and the real value is kept in a
+     data attribute on the same element, so showing it is a class flip that
+     never re-fetches and never disappears when the card re-renders. */
+  const el=$('mailcow-pw'), btn=$('mailcow-pw-toggle'); if(!el||!btn) return;
+  const shown=el.classList.toggle('revealed');
+  el.textContent=shown?(el.getAttribute('data-real')||''):'••••••••••••';
+  btn.textContent=shown?'hide':'show';
 }
 async function installMissing(){
   /* apt takes minutes on a cold machine, so this starts a background job and
