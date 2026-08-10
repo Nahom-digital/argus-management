@@ -1493,3 +1493,153 @@ body.mgmt-desktop .mobile-tabbar { display: none; }
   text-transform: uppercase; letter-spacing: 0.6px; color: var(--gray-500);
 }
 .sec-range-row .db-action-btn { flex: none; }
+
+/* ===================================================================
+   CLOUDFLARE TUNNEL
+   A sequence, not a settings group: nothing can be created before an
+   account is connected, nothing forwarded before a tunnel exists, and
+   nothing run before something is forwarded. The steps are numbered
+   because that order is real information, and a step that is not yet
+   reachable is dimmed rather than hidden, so the whole path stays
+   visible from the first visit.
+   =================================================================== */
+.cf-version {
+  font-family: var(--mono); font-size: 11.5px; color: var(--gray-500);
+  white-space: nowrap;
+}
+.cf-missing {
+  margin-top: 14px; padding: 11px 13px; border-radius: 7px;
+  background: color-mix(in srgb, var(--warn) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 32%, transparent);
+  font-size: 12.5px; line-height: 1.5; color: var(--black);
+}
+
+.cf-steps { list-style: none; margin: 18px 0 0; padding: 0; }
+.cf-step {
+  padding: 16px 0 18px;
+  border-top: 1px solid var(--gray-200);
+}
+.cf-step:first-child { border-top: none; padding-top: 4px; }
+
+/* Not-yet-reachable steps read as unavailable rather than broken: the
+   copy stays legible, the controls do not invite a click. 0.45 was dim
+   enough that the sentence explaining what the step is for could not be
+   read, which is exactly the sentence somebody on step 1 needs. */
+.cf-step.cf-locked .cf-step-body { opacity: 0.66; pointer-events: none; }
+.cf-step.cf-locked .cf-step-n { background: var(--gray-100); color: var(--gray-500); }
+
+.cf-step-head { display: flex; align-items: center; gap: 11px; }
+.cf-step-n {
+  flex: none; width: 22px; height: 22px; border-radius: 50%;
+  display: grid; place-items: center;
+  font-family: var(--display); font-weight: 700; font-size: 11.5px;
+  background: var(--gray-100); color: var(--gray-600);
+}
+.cf-step.cf-done .cf-step-n {
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success);
+}
+.cf-step-title {
+  font-family: var(--display); font-weight: 700; font-size: 13.5px;
+  color: var(--black);
+}
+.cf-state {
+  margin-left: auto; font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.5px; color: var(--gray-500);
+  padding: 3px 9px; border-radius: 999px; background: var(--gray-100);
+  white-space: nowrap;
+}
+.cf-state.cf-ok {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 13%, transparent);
+}
+.cf-state.cf-wait {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+}
+.cf-state.cf-bad {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.cf-step-body { margin: 12px 0 0 33px; }
+
+.cf-link-note {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 12.5px; font-weight: 600; color: var(--gray-600);
+  margin-bottom: 9px;
+}
+/* The one piece of motion here, and it reports a state: something is
+   still being waited on. It stops the moment the account connects. */
+.cf-pulse {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--warn); animation: cf-pulse 1.6s ease-out infinite;
+}
+@keyframes cf-pulse {
+  0%   { opacity: 1;   transform: scale(1); }
+  70%  { opacity: 0.25; transform: scale(1.9); }
+  100% { opacity: 1;   transform: scale(1); }
+}
+.cf-link-box {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 12px; border-radius: 7px;
+  background: var(--gray-50); border: 1px solid var(--gray-200);
+}
+.cf-link {
+  flex: 1 1 320px; min-width: 0; font-family: var(--mono); font-size: 11.5px;
+  color: var(--accent); word-break: break-all; line-height: 1.45;
+}
+.cf-link-box .db-action-btn { flex: none; }
+
+.cf-add-row {
+  display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  margin-top: 12px;
+}
+.cf-add-row .field-input { flex: 1 1 260px; min-width: 180px; padding: 8px 10px; font-size: 12.5px; }
+.cf-add-row .save-btn { flex: none; }
+
+.cf-route-form {
+  display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+  margin-top: 12px;
+}
+.cf-field { display: flex; flex-direction: column; gap: 5px; flex: 1 1 200px; min-width: 150px; }
+.cf-field .field-label { margin: 0; }
+.cf-field .field-input { padding: 8px 10px; font-size: 12.5px; }
+.cf-field-port { flex: 0 0 120px; min-width: 100px; }
+.cf-route-form .save-btn { flex: none; }
+.cf-route-form + .field-hint { margin-top: 10px; }
+
+.cf-btn-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.cf-danger { border-color: var(--danger); color: var(--danger); }
+
+/* Tunnel and forward rows. A table would be four columns of which two
+   are one word, so these are rows that stack cleanly on a phone. */
+.cf-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 12px; margin-bottom: 8px; border-radius: 7px;
+  background: var(--gray-50); border: 1px solid var(--gray-200);
+}
+.cf-row-main { flex: 1 1 240px; min-width: 0; }
+.cf-row-name {
+  font-family: var(--mono); font-size: 12.5px; font-weight: 600;
+  color: var(--black); word-break: break-all;
+}
+.cf-row-sub { font-size: 11px; color: var(--gray-500); margin-top: 3px; }
+.cf-row-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.cf-badge {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.5px; padding: 2px 8px; border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+.cf-arrow { color: var(--gray-400); padding: 0 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cf-pulse { animation: none; }
+}
+@media (max-width: 720px) {
+  .cf-step-body { margin-left: 0; }
+  .cf-field-port { flex: 1 1 120px; }
+  .cf-route-form .save-btn, .cf-add-row .save-btn { width: 100%; }
+}
+
+[data-theme="dark"] .cf-missing { color: var(--white); }

@@ -946,6 +946,7 @@ async function loadProxyHosts(){
   const el=$('proxy-list'); if(!el) return;
   el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
   loadFirewall();
+  loadTunnel();
   try{
     const d=await getJSON('/api/config/proxy/hosts'); if(!d) return;
     if(!d.installed){
@@ -1255,6 +1256,273 @@ async function deleteProxyHost(filename){
     if(!r.ok){ appToast(d.error||'Delete failed','err'); return; }
     appToast('Host removed','ok'); loadProxyHosts();
   }catch(e){ appToast('Network error','err'); }
+}
+
+/* ================= CLOUDFLARE TUNNEL =================
+   Four steps, and which one you are on is decided by the server's answer
+   rather than by clicking through: no account means step 1, an account and
+   no tunnel means step 2, and so on. A step that is not reachable yet is
+   dimmed instead of hidden so the whole path is visible from the start.
+
+   While the login link is live the page polls, because the thing being
+   waited on happens in a different browser tab and cloudflared exits by
+   itself when it is done. The poll stops as soon as the account arrives,
+   or when the card is left. */
+let CF={}, _cfPoll=null;
+
+function cfStep(id, state, label){
+  const step=$('cf-step-'+id); const chip=$('cf-'+state.chip+'-state');
+  if(step){
+    step.classList.toggle('cf-locked', !!state.locked);
+    step.classList.toggle('cf-done', !!state.done);
+  }
+  if(chip){
+    chip.textContent=label;
+    chip.className='cf-state'+(state.done?' cf-ok':state.bad?' cf-bad':state.waiting?' cf-wait':'');
+  }
+}
+function cfShow(id, on){ const el=$(id); if(el) el.hidden=!on; }
+function cfDisable(id, off){ const el=$(id); if(el) el.disabled=!!off; }
+
+async function loadTunnel(){
+  if(!$('cf-card')) return;          /* the card is absent without the grant */
+  try{
+    const d=await getJSON('/api/config/tunnel'); if(!d) return;
+    CF=d;
+    renderTunnel();
+  }catch(e){
+    const fb=$('cf-account-feedback');
+    if(fb){ fb.className='save-feedback err'; fb.textContent='Could not read the tunnel state.'; }
+  }
+}
+
+function renderTunnel(){
+  const d=CF||{}, login=d.login||{}, svc=d.service||{};
+  const ver=$('cf-version');
+  if(ver) ver.textContent=d.version||'';
+
+  const miss=$('cf-missing');
+  if(miss){
+    if(!d.installed){
+      miss.hidden=false;
+      miss.textContent='cloudflared is not installed on this server, so tunnels cannot be created. '
+        +'Run the installer again, or install cloudflared by hand, and reload this page.';
+    } else { miss.hidden=true; }
+  }
+
+  /* 1. account */
+  const connected=!!d.logged_in, waiting=login.state==='waiting'&&!!login.url;
+  cfStep('account', {chip:'account', done:connected, waiting:waiting,
+                     bad:login.state==='error', locked:!d.installed},
+         connected?'connected':waiting?'waiting':login.state==='error'?'failed':'not connected');
+  cfShow('cf-account-idle', d.installed&&!connected&&!waiting);
+  cfShow('cf-link-row', waiting);
+  cfShow('cf-account-done', connected);
+  const link=$('cf-link');
+  if(link&&waiting){ link.href=login.url; link.textContent=login.url; }
+  const afb=$('cf-account-feedback');
+  if(afb&&login.error&&!connected){ afb.className='save-feedback err'; afb.textContent=login.error; }
+  else if(afb&&!login.error){ afb.textContent=''; afb.className='save-feedback'; }
+  if(waiting) cfStartPoll(); else cfStopPoll();
+
+  /* 2. tunnels */
+  const tunnels=d.tunnels||[], remote=d.remote||[], active=d.active||'';
+  const conns={}; remote.forEach(t=>{ conns[t.name]=t; });
+  cfStep('tunnel', {chip:'tunnel', done:tunnels.length>0, locked:!connected},
+         tunnels.length?(tunnels.length+' created'):'none yet');
+  const list=$('cf-tunnel-list');
+  if(list){
+    if(!tunnels.length){
+      list.innerHTML='<div class="empty-state">No tunnel yet. One tunnel can carry as many hostnames as you like, so a single one named after this server is usually enough.</div>';
+    } else {
+      list.innerHTML=tunnels.map(t=>{
+        const r=conns[t.name]||null;
+        const bits=[t.tunnel_id?t.tunnel_id:'id unknown'];
+        if(r) bits.push(r.connections?(r.connections+' live connection'+(r.connections>1?'s':'')):'not connected');
+        else if(d.remote_error) bits.push('Cloudflare could not be asked');
+        else bits.push('not at Cloudflare any more');
+        return `<div class="cf-row">
+          <div class="cf-row-main">
+            <div class="cf-row-name">${esc(t.name)}${t.name===active?' <span class="cf-badge">runs here</span>':''}</div>
+            <div class="cf-row-sub">${esc(bits.join(' · '))}</div>
+          </div>
+          <div class="cf-row-acts">
+            ${t.name===active?'':`<button class="db-action-btn" onclick="tunnelSetActive('${escAttr(t.name)}')">Run this one</button>`}
+            <button class="db-action-btn cf-danger" onclick="tunnelDelete('${escAttr(t.name)}')">Delete</button>
+          </div></div>`;
+      }).join('');
+    }
+  }
+  cfDisable('cf-tunnel-create', !connected);
+
+  /* 3. forwards */
+  const routes=d.routes||[];
+  cfStep('forward', {chip:'route', done:routes.length>0, locked:!tunnels.length},
+         routes.length?(routes.length+' forward'+(routes.length>1?'s':'')):'none yet');
+  const rlist=$('cf-route-list');
+  if(rlist){
+    if(!routes.length){
+      rlist.innerHTML='<div class="empty-state">Nothing is forwarded yet. Pick the name people will type and the port it should reach on this machine.</div>';
+    } else {
+      rlist.innerHTML=routes.map(r=>`<div class="cf-row">
+        <div class="cf-row-main">
+          <div class="cf-row-name">${esc(r.hostname)}<span class="cf-arrow"> &rarr; </span>${esc(r.local_host)}:${esc(r.local_port)}</div>
+          <div class="cf-row-sub">${esc(r.tunnel)} · ${r.dns_ok?'DNS record in place':'DNS record missing'+(r.detail?': '+r.detail:'')}</div>
+        </div>
+        <div class="cf-row-acts">
+          <button class="db-action-btn cf-danger" onclick="tunnelDeleteRoute('${escAttr(r.hostname)}')">Remove</button>
+        </div></div>`).join('');
+    }
+  }
+  cfDisable('cf-route-add', !tunnels.length);
+
+  /* 4. running */
+  const running=!!svc.active;
+  cfStep('run', {chip:'service', done:running, bad:svc.installed&&!running,
+                 locked:!routes.length},
+         running?'running':svc.installed?(svc.state||'stopped'):'not installed');
+  const note=$('cf-service-note');
+  if(note){
+    note.textContent=running
+      ? 'The tunnel is up and will come back by itself after a reboot.'
+      : svc.installed
+        ? 'The service is installed but not running right now.'
+        : 'Installed as a service, the tunnel comes back by itself after a reboot.';
+  }
+  cfDisable('cf-svc-install', !routes.length);
+  cfDisable('cf-svc-restart', !svc.installed);
+  cfDisable('cf-svc-stop', !running);
+  cfDisable('cf-svc-remove', !svc.installed);
+}
+
+function cfStartPoll(){
+  if(_cfPoll) return;
+  _cfPoll=setInterval(async()=>{
+    if(!$('cf-card')||CURRENT!=='config'){ cfStopPoll(); return; }
+    try{
+      const s=await getJSON('/api/config/tunnel/login'); if(!s) return;
+      if(s.state==='connected'){ cfStopPoll(); appToast('Cloudflare account connected','ok'); loadTunnel(); return; }
+      if(s.state!=='waiting'){ cfStopPoll(); CF.login=s; renderTunnel(); }
+    }catch(e){ /* a poll that fails is not worth a message; the next one may work */ }
+  }, 3000);
+}
+function cfStopPoll(){ if(_cfPoll){ clearInterval(_cfPoll); _cfPoll=null; } }
+
+function cfFeedback(id, ok, text){
+  const fb=$(id); if(!fb) return;
+  fb.className='save-feedback '+(ok?'ok':'err');
+  fb.textContent=text;
+}
+
+async function tunnelLogin(){
+  const btn=$('cf-login'); if(btn){ btn.disabled=true; btn.textContent='Asking Cloudflare…'; }
+  try{
+    const r=await api('/api/config/tunnel/login',{method:'POST'});
+    const d=await r.json();
+    if(!r.ok||d.error){ cfFeedback('cf-account-feedback', false, d.error||'Could not start the login.'); return; }
+    CF.login=d;
+    if(d.state==='connected'){ loadTunnel(); return; }
+    renderTunnel();
+  }catch(e){ cfFeedback('cf-account-feedback', false, 'Network error.'); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent='Create the link'; } }
+}
+
+function tunnelCopyLink(){
+  const link=$('cf-link');
+  if(link&&link.href) copyVal(link.href,'Login link');
+}
+
+async function tunnelDisconnect(){
+  if(!(await uiConfirm('Disconnect this Cloudflare account?','Tunnels stay at Cloudflare, but this server cannot manage them until it signs in again.'))) return;
+  try{
+    const r=await api('/api/config/tunnel/disconnect',{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){ cfFeedback('cf-account-feedback', false, d.error||'Could not disconnect.'); return; }
+    appToast('Account disconnected','ok'); loadTunnel();
+  }catch(e){ cfFeedback('cf-account-feedback', false, 'Network error.'); }
+}
+
+async function tunnelCreate(){
+  const input=$('cf-tunnel-name'); const name=(input?input.value:'').trim().toLowerCase();
+  if(!name){ cfFeedback('cf-tunnel-feedback', false, 'Give the tunnel a name.'); return; }
+  const btn=$('cf-tunnel-create'); if(btn) btn.disabled=true;
+  try{
+    const r=await api('/api/config/tunnel/create',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+    const d=await r.json();
+    if(!r.ok){ cfFeedback('cf-tunnel-feedback', false, d.error||'Could not create the tunnel.'); return; }
+    if(input) input.value='';
+    cfFeedback('cf-tunnel-feedback', true, d.message||'Tunnel created.');
+    loadTunnel();
+  }catch(e){ cfFeedback('cf-tunnel-feedback', false, 'Network error.'); }
+  finally{ if(btn) btn.disabled=false; }
+}
+
+async function tunnelSetActive(name){
+  try{
+    const r=await api('/api/config/tunnel/active',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+    const d=await r.json();
+    if(!r.ok){ cfFeedback('cf-tunnel-feedback', false, d.error||'Could not switch tunnel.'); return; }
+    appToast(name+' will be the one that runs','ok'); loadTunnel();
+  }catch(e){ cfFeedback('cf-tunnel-feedback', false, 'Network error.'); }
+}
+
+async function tunnelDelete(name){
+  if(!(await uiConfirm('Delete the tunnel '+name+'?','Every hostname forwarded through it stops working.'))) return;
+  try{
+    const r=await api('/api/config/tunnel/'+encodeURIComponent(name),{method:'DELETE'});
+    const d=await r.json();
+    if(!r.ok){ cfFeedback('cf-tunnel-feedback', false, d.error||'Could not delete the tunnel.'); return; }
+    appToast('Tunnel deleted','ok'); loadTunnel();
+  }catch(e){ cfFeedback('cf-tunnel-feedback', false, 'Network error.'); }
+}
+
+async function tunnelAddRoute(){
+  const tunnel=(CF.active||((CF.tunnels||[])[0]||{}).name||'');
+  const hostname=($('cf-hostname').value||'').trim().toLowerCase();
+  const local_host=($('cf-local-host').value||'').trim().toLowerCase();
+  const local_port=($('cf-local-port').value||'').trim();
+  if(!tunnel){ cfFeedback('cf-route-feedback', false, 'Create a tunnel first.'); return; }
+  if(!hostname||!local_port){ cfFeedback('cf-route-feedback', false, 'A hostname and a local port are both needed.'); return; }
+  const btn=$('cf-route-add'); if(btn){ btn.disabled=true; btn.textContent='Adding…'; }
+  try{
+    const r=await api('/api/config/tunnel/route',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tunnel, hostname, local_host:local_host||'127.0.0.1', local_port})});
+    const d=await r.json();
+    if(!r.ok){ cfFeedback('cf-route-feedback', false, d.error||'Could not add the forward.'); loadTunnel(); return; }
+    $('cf-hostname').value=''; $('cf-local-port').value='';
+    cfFeedback('cf-route-feedback', true, d.message||'Forward added.');
+    loadTunnel();
+  }catch(e){ cfFeedback('cf-route-feedback', false, 'Network error.'); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent='Add forward'; } }
+}
+
+async function tunnelDeleteRoute(hostname){
+  if(!(await uiConfirm('Stop forwarding '+hostname+'?','The DNS record at Cloudflare is left in place.'))) return;
+  try{
+    const r=await api('/api/config/tunnel/route/'+encodeURIComponent(hostname),{method:'DELETE'});
+    const d=await r.json();
+    if(!r.ok){ cfFeedback('cf-route-feedback', false, d.error||'Could not remove the forward.'); return; }
+    appToast('Forward removed','ok'); loadTunnel();
+  }catch(e){ cfFeedback('cf-route-feedback', false, 'Network error.'); }
+}
+
+async function tunnelService(action){
+  if(action==='uninstall'&&!(await uiConfirm('Remove the tunnel service?','The tunnel stops and will not come back after a reboot.'))) return;
+  const ids={install:'cf-svc-install', restart:'cf-svc-restart', stop:'cf-svc-stop', uninstall:'cf-svc-remove'};
+  const btn=$(ids[action]); const label=btn?btn.textContent:'';
+  if(btn){ btn.disabled=true; btn.textContent='Working…'; }
+  try{
+    const r=await api('/api/config/tunnel/service',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({action})});
+    const d=await r.json();
+    if(!r.ok){ cfFeedback('cf-service-feedback', false, d.error||'That did not work.'); return; }
+    cfFeedback('cf-service-feedback', true, d.message||'Done.');
+    loadTunnel();
+  }catch(e){ cfFeedback('cf-service-feedback', false, 'Network error.'); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent=label; } }
 }
 
 /* ================= FIREWALL SETTINGS ================= */

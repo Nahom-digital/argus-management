@@ -49,6 +49,7 @@ import recovery
 import panel_users
 import ssh_vault
 import vault
+import cloudflare_tunnel
 import firewall
 import web_guard
 import nginx_proxy
@@ -946,6 +947,135 @@ def _config_sub_proxy(perms):
         f'value="{value}"{" checked" if value == "http" else ""}>{label}</label>'
         for value, label in (("http", "HTTP"), ("https", "HTTPS")))
 
+    # The Cloudflare card is a sequence, not a set of independent switches: there
+    # is nothing to create until an account is connected, nothing to forward until
+    # a tunnel exists, and nothing to run until something is forwarded. The steps
+    # are numbered because the order carries that information, and each one stays
+    # closed until the step before it is satisfied.
+    tunnel_card = ""
+    if perms.get("tunnel_manage"):
+        tunnel_card = """
+    <div class="cfg-card cfg-card-wide" id="cf-card" style="margin-top:18px;">
+      <div class="px-card-head">
+        <div>
+          <div class="device-title">Cloudflare Tunnel</div>
+          <div class="settings-subtitle" style="margin-top:6px;">
+            Publish a name on the internet without opening a port. Cloudflare
+            answers HTTPS at its edge and the tunnel hands the request to a port
+            on this machine over plain HTTP, so the port stays closed.
+          </div>
+        </div>
+        <span class="cf-version" id="cf-version"></span>
+      </div>
+
+      <div class="cf-missing" id="cf-missing" hidden></div>
+
+      <ol class="cf-steps" id="cf-steps">
+        <li class="cf-step" id="cf-step-account">
+          <div class="cf-step-head">
+            <span class="cf-step-n">1</span>
+            <span class="cf-step-title">Connect a Cloudflare account</span>
+            <span class="cf-state" id="cf-account-state">checking</span>
+          </div>
+          <div class="cf-step-body">
+            <div id="cf-account-idle">
+              <div class="field-hint" style="margin-bottom:10px;">
+                Opening the link signs this server in to your account. It only
+                has to be done once.
+              </div>
+              <button class="save-btn" id="cf-login" onclick="tunnelLogin()">Create the link</button>
+            </div>
+            <div id="cf-link-row" hidden>
+              <div class="cf-link-note"><span class="cf-pulse"></span>Waiting for you to finish in the browser</div>
+              <div class="cf-link-box">
+                <a class="cf-link" id="cf-link" href="#" target="_blank" rel="noopener noreferrer"></a>
+                <button class="db-action-btn" onclick="tunnelCopyLink()">Copy link</button>
+              </div>
+            </div>
+            <div id="cf-account-done" hidden>
+              <div class="field-hint" style="margin-bottom:10px;">
+                This server can manage the tunnels on your account.
+              </div>
+              <button class="db-action-btn cf-danger" onclick="tunnelDisconnect()">Disconnect account</button>
+            </div>
+            <div class="save-feedback" id="cf-account-feedback"></div>
+          </div>
+        </li>
+
+        <li class="cf-step" id="cf-step-tunnel">
+          <div class="cf-step-head">
+            <span class="cf-step-n">2</span>
+            <span class="cf-step-title">Create a tunnel</span>
+            <span class="cf-state" id="cf-tunnel-state">waiting</span>
+          </div>
+          <div class="cf-step-body">
+            <div id="cf-tunnel-list"></div>
+            <div class="cf-add-row">
+              <input class="field-input" id="cf-tunnel-name" type="text" maxlength="62"
+                     placeholder="Tunnel name, for example home-server" autocomplete="off"
+                     spellcheck="false">
+              <button class="save-btn" id="cf-tunnel-create" onclick="tunnelCreate()">Create tunnel</button>
+            </div>
+            <div class="save-feedback" id="cf-tunnel-feedback"></div>
+          </div>
+        </li>
+
+        <li class="cf-step" id="cf-step-forward">
+          <div class="cf-step-head">
+            <span class="cf-step-n">3</span>
+            <span class="cf-step-title">Forward a hostname to a local port</span>
+            <span class="cf-state" id="cf-route-state">waiting</span>
+          </div>
+          <div class="cf-step-body">
+            <div id="cf-route-list"></div>
+            <div class="cf-route-form">
+              <div class="cf-field">
+                <label class="field-label" for="cf-hostname">Public hostname</label>
+                <input class="field-input" id="cf-hostname" type="text" maxlength="253"
+                       placeholder="app.example.com" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="cf-field">
+                <label class="field-label" for="cf-local-host">Local address</label>
+                <input class="field-input" id="cf-local-host" type="text" maxlength="255"
+                       value="127.0.0.1" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="cf-field cf-field-port">
+                <label class="field-label" for="cf-local-port">Local port</label>
+                <input class="field-input" id="cf-local-port" type="number" min="1" max="65535"
+                       placeholder="8080" inputmode="numeric" autocomplete="off">
+              </div>
+              <button class="save-btn" id="cf-route-add" onclick="tunnelAddRoute()">Add forward</button>
+            </div>
+            <div class="field-hint">
+              The DNS record is created at Cloudflare for you. The local side is
+              plain HTTP, so the service does not need a certificate of its own.
+            </div>
+            <div class="save-feedback" id="cf-route-feedback"></div>
+          </div>
+        </li>
+
+        <li class="cf-step" id="cf-step-run">
+          <div class="cf-step-head">
+            <span class="cf-step-n">4</span>
+            <span class="cf-step-title">Keep the tunnel running</span>
+            <span class="cf-state" id="cf-service-state">waiting</span>
+          </div>
+          <div class="cf-step-body">
+            <div class="field-hint" style="margin-bottom:10px;" id="cf-service-note">
+              Installed as a service, the tunnel comes back by itself after a reboot.
+            </div>
+            <div class="cf-btn-row">
+              <button class="save-btn" id="cf-svc-install" onclick="tunnelService('install')">Install and start</button>
+              <button class="db-action-btn" id="cf-svc-restart" onclick="tunnelService('restart')">Restart</button>
+              <button class="db-action-btn" id="cf-svc-stop" onclick="tunnelService('stop')">Stop</button>
+              <button class="db-action-btn cf-danger" id="cf-svc-remove" onclick="tunnelService('uninstall')">Remove service</button>
+            </div>
+            <div class="save-feedback" id="cf-service-feedback"></div>
+          </div>
+        </li>
+      </ol>
+    </div>"""
+
     firewall_card = ""
     if perms.get("firewall_manage"):
         firewall_card = f"""
@@ -1121,6 +1251,7 @@ def _config_sub_proxy(perms):
         <div class="save-feedback" id="px-feedback"></div>
       </div>
     </div>
+{tunnel_card}
 {firewall_card}
   </div>"""
 
@@ -1494,6 +1625,16 @@ _LOGIN_HTML = r"""<!DOCTYPE html><html lang="en"><head>
 def _login_html() -> str:
     return _LOGIN_HTML.replace("__BASE__", MGMT_BASE)
 
+def _ensure_tunnel_tables():
+    conn = DB.get_connection()
+    try:
+        cur = conn.cursor()
+        for statement in cloudflare_tunnel.SCHEMA:
+            cur.execute(statement)
+        cur.close()
+    finally:
+        DB.release_connection(conn)
+
 # ===========================================================================
 # FastAPI app
 # ===========================================================================
@@ -1507,6 +1648,13 @@ async def lifespan(app: FastAPI):
         ensure_management_log()
     except Exception as e:
         logging.error(f"ensure_management_log failed: {e}")
+    # The tunnel tables arrived after the first release, so a panel upgraded in
+    # place would otherwise have the page and not the tables behind it. The
+    # statements are all IF NOT EXISTS, so this costs one round trip at boot.
+    try:
+        _ensure_tunnel_tables()
+    except Exception as e:
+        logging.error(f"cloudflare tunnel tables failed: {e}")
     write_log("INFO", "SYSTEM", "Management panel started", actor="system", detail=f"pid={os.getpid()}")
     yield
     write_log("INFO", "SYSTEM", "Management panel stopped", actor="system")
@@ -3109,6 +3257,209 @@ async def api_firewall_block(request: Request):
     write_log("ACTION" if ok else "WARN", "SECURITY", "Firewall block", actor=_admin_name(request),
               ip=_client_ip(request), target=ip, detail=detail, status="ok" if ok else "failed")
     return {"status": "ok", "applied": ok, "detail": detail}
+
+# ---- Config: Cloudflare Tunnel ----
+# Cloudflare terminates HTTPS at its edge and cloudflared collects it from here
+# over plain HTTP, so a hostname can be published without opening a port at all.
+# Every one of these runs in a worker with its own connection, the way the
+# firewall endpoints do, because they all shell out to cloudflared.
+def _tunnel_work(fn, *args, **kwargs):
+    """Run one cloudflare_tunnel call in a worker with its own connection.
+    Pooled connections are autocommit, so there is nothing to commit here."""
+    def work():
+        conn = DB.get_connection()
+        try:
+            return fn(conn, *args, **kwargs)
+        finally:
+            DB.release_connection(conn)
+    return work
+
+@app.get("/api/config/tunnel")
+async def api_tunnel_get(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    return await DB.run(_tunnel_work(cloudflare_tunnel.overview))
+
+@app.post("/api/config/tunnel/login")
+async def api_tunnel_login(request: Request):
+    """Hand back the link that connects a Cloudflare account.
+
+    cloudflared waits for the browser itself, so this returns as soon as the link
+    exists and the page polls until the account shows up.
+    """
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    state = await DB.run(cloudflare_tunnel.login_start)
+    write_log("ACTION", "NETWORK", "Cloudflare account login started",
+              actor=_admin_name(request), ip=_client_ip(request),
+              detail=state.get("state", ""), status="ok" if state.get("url") else "pending")
+    return state
+
+@app.get("/api/config/tunnel/login")
+async def api_tunnel_login_state(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    return await DB.run(cloudflare_tunnel.login_state)
+
+@app.post("/api/config/tunnel/disconnect")
+async def api_tunnel_disconnect(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    try:
+        removed = await DB.run(cloudflare_tunnel.disconnect)
+    except OSError as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    write_log("ACTION", "NETWORK", "Cloudflare account disconnected",
+              actor=_admin_name(request), ip=_client_ip(request),
+              detail=", ".join(removed))
+    return {"status": "ok", "removed": removed}
+
+@app.post("/api/config/tunnel/create")
+async def api_tunnel_create(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    name = (body.get("name") or "").strip().lower()
+    actor = _admin_name(request)
+    problem = cloudflare_tunnel.name_problem(name)
+    if problem:
+        return JSONResponse(status_code=400, content={"error": problem})
+
+    ok, message = await DB.run(_tunnel_work(cloudflare_tunnel.create_tunnel, name, actor))
+    if ok:
+        await DB.run(_tunnel_work(_tunnel_activate_if_first, name))
+    write_log("ACTION" if ok else "WARN", "NETWORK", "Cloudflare tunnel created",
+              actor=actor, ip=_client_ip(request), target=name,
+              detail=message[:400], status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+def _tunnel_activate_if_first(conn, name):
+    """The first tunnel becomes the one the service runs, because a panel with
+    one tunnel and nothing selected would just be a question with one answer."""
+    if not cloudflare_tunnel.active_tunnel(conn):
+        cloudflare_tunnel.set_active(conn, name)
+    return True
+
+@app.delete("/api/config/tunnel/{name}")
+async def api_tunnel_delete(request: Request, name: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    name = (name or "").strip().lower()
+    if cloudflare_tunnel.name_problem(name):
+        return JSONResponse(status_code=400, content={"error": "That is not a tunnel name."})
+    ok, message = await DB.run(_tunnel_work(cloudflare_tunnel.delete_tunnel, name))
+    write_log("ACTION" if ok else "WARN", "NETWORK", "Cloudflare tunnel deleted",
+              actor=_admin_name(request), ip=_client_ip(request), target=name,
+              detail=message[:400], status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.post("/api/config/tunnel/active")
+async def api_tunnel_active(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    name = (body.get("name") or "").strip().lower()
+    ok, message = await DB.run(_tunnel_work(cloudflare_tunnel.set_active, name))
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    write_log("ACTION", "NETWORK", "Cloudflare tunnel selected to run",
+              actor=_admin_name(request), ip=_client_ip(request), target=name)
+    return {"status": "ok", "active": name}
+
+@app.post("/api/config/tunnel/route")
+async def api_tunnel_route(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    tunnel = (body.get("tunnel") or "").strip().lower()
+    hostname = (body.get("hostname") or "").strip().lower()
+    local_host = (body.get("local_host") or "127.0.0.1").strip().lower()
+    local_port = body.get("local_port")
+    problem = (cloudflare_tunnel.name_problem(tunnel)
+               or cloudflare_tunnel.route_problem(hostname, local_host, local_port))
+    if problem:
+        return JSONResponse(status_code=400, content={"error": problem})
+
+    actor = _admin_name(request)
+    ok, message = await DB.run(_tunnel_work(
+        cloudflare_tunnel.add_route, tunnel, hostname, local_host, local_port, actor))
+    write_log("ACTION" if ok else "WARN", "NETWORK", "Cloudflare tunnel forward",
+              actor=actor, ip=_client_ip(request), target=hostname,
+              detail=f"{local_host}:{local_port} through {tunnel}; {message}"[:400],
+              status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.delete("/api/config/tunnel/route/{hostname}")
+async def api_tunnel_route_delete(request: Request, hostname: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    ok, message = await DB.run(_tunnel_work(cloudflare_tunnel.remove_route, hostname))
+    write_log("ACTION" if ok else "WARN", "NETWORK", "Cloudflare tunnel forward removed",
+              actor=_admin_name(request), ip=_client_ip(request), target=hostname,
+              detail=message[:400], status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
+
+@app.post("/api/config/tunnel/service")
+async def api_tunnel_service(request: Request):
+    """Install, start, stop, restart or remove the service that runs the tunnel."""
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("tunnel_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    action = (body.get("action") or "").strip().lower()
+    if action == "install":
+        ok, message = await DB.run(_tunnel_work(cloudflare_tunnel.install_service))
+    elif action == "uninstall":
+        ok, message = await DB.run(cloudflare_tunnel.uninstall_service)
+    elif action in ("start", "stop", "restart"):
+        ok, message = await DB.run(cloudflare_tunnel.service_action, action)
+    else:
+        return JSONResponse(status_code=400,
+                            content={"error": "That is not something the tunnel can be asked to do."})
+    write_log("ACTION" if ok else "WARN", "NETWORK", f"Cloudflare tunnel {action}",
+              actor=_admin_name(request), ip=_client_ip(request),
+              target=cloudflare_tunnel.SERVICE_NAME, detail=message[:400],
+              status="ok" if ok else "failed")
+    if not ok:
+        return JSONResponse(status_code=400, content={"error": message})
+    return {"status": "ok", "message": message}
 
 @app.get("/api/system/ssh-status")
 async def api_ssh_status(request: Request):

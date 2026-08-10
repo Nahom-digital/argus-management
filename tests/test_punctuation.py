@@ -41,24 +41,52 @@ def _files():
     return sorted(set(out))
 
 
+# From Python 3.12 an f-string is no longer one STRING token: its literal text
+# arrives in FSTRING_MIDDLE pieces split at every replacement field. Scanning
+# only STRING meant every f-string in the project went unread, which is where
+# most of the sentences people actually see live. The pieces are glued back
+# together with a "}" where the field was, so a dash sitting right after an
+# interpolation still reads as one sentence and not as the start of a fragment.
+_FSTRING_START = getattr(tokenize, "FSTRING_START", None)
+_FSTRING_MIDDLE = getattr(tokenize, "FSTRING_MIDDLE", None)
+_FSTRING_END = getattr(tokenize, "FSTRING_END", None)
+
+
+def _python_spans(text):
+    spans, depth, group = [], 0, None
+    for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        if _FSTRING_START is not None and tok.type == _FSTRING_START:
+            depth += 1
+            if depth == 1:
+                group = [tok.start[0], []]
+        elif _FSTRING_END is not None and tok.type == _FSTRING_END:
+            depth = max(0, depth - 1)
+            if depth == 0 and group:
+                spans.append((group[0], "}".join(group[1])))
+                group = None
+        elif _FSTRING_MIDDLE is not None and tok.type == _FSTRING_MIDDLE:
+            (group[1] if group else spans).append(
+                tok.string if group else (tok.start[0], tok.string))
+        elif tok.type in (tokenize.STRING, tokenize.COMMENT):
+            spans.append((tok.start[0], tok.string))
+    return spans
+
+
 def _prose_spans(rel, text):
     """(line_number, text) pairs that are prose rather than code."""
     if rel.endswith(".py"):
-        spans = []
         try:
-            for tok in tokenize.generate_tokens(io.StringIO(text).readline):
-                if tok.type in (tokenize.STRING, tokenize.COMMENT):
-                    spans.append((tok.start[0], tok.string))
+            return _python_spans(text)
         except (tokenize.TokenError, IndentationError, SyntaxError):
             # An unparseable file is a different failure; do not mask it here.
             return [(i, l) for i, l in enumerate(text.split("\n"), 1)]
-        return spans
     return [(i, l) for i, l in enumerate(text.split("\n"), 1)
             if "calc(" not in l]
 
 
 SQL_TELL = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|WHERE|FROM|GROUP BY|HAVING|"
-                      r"CREATE TABLE|ALTER TABLE|JOIN|ORDER BY)\b")
+                      r"CREATE TABLE|ALTER TABLE|JOIN|ORDER BY|INTERVAL)\b"
+                      r"|now\(\)|COUNT\(")
 
 
 def _looks_like_sql(chunk):
@@ -107,3 +135,13 @@ def test_python_tokenizing_separates_prose_from_arithmetic():
     src = 'x = now - last\ny = "Required - issuing new codes"\n# note - a comment\n'
     found = [c for _, c in _prose_spans("thing.py", src) if SPACED_HYPHEN.search(c)]
     assert len(found) == 2, found
+
+
+def test_the_scanner_reads_inside_f_strings():
+    """From Python 3.12 an f-string is tokenized as FSTRING_MIDDLE rather than
+    STRING. A scanner that only knew STRING silently skipped every f-string,
+    which is where most of the messages people actually read live."""
+    source = 'x = 1\nprint(f"failed: {x} -- try again")\n'
+    spans = _prose_spans("sample.py", source)
+    assert any(SPACED_HYPHEN.search(chunk) for _line, chunk in spans), \
+        f"the f-string body was not scanned: {spans}"

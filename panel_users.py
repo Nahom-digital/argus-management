@@ -75,6 +75,9 @@ PERMISSIONS = (
     Grant("firewall_manage", "bool", None, False, "network",
           "Firewall settings",
           "Allow or close ports, and block addresses."),
+    Grant("tunnel_manage", "bool", None, False, "network",
+          "Cloudflare tunnels",
+          "Connect a Cloudflare account, and forward a public name to a local port."),
 )
 
 GRANT_KEYS = frozenset(g.key for g in PERMISSIONS)

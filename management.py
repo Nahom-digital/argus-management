@@ -30,6 +30,7 @@ import shutil
 import socket
 import getpass
 import hashlib
+import platform
 import secrets
 import tempfile
 import subprocess
@@ -38,6 +39,7 @@ import subprocess
 import recovery
 import ssh_vault
 import panel_users
+import cloudflare_tunnel
 import firewall
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -493,7 +495,8 @@ def install_nginx():
     else:
         rc, _, stderr = run(sudo_prefix() + ["apk", "add"] + packages, timeout=1800)
     if rc != 0:
-        warn(f"nginx install failed: {stderr.strip()[:300]} -- the proxy manager will stay unavailable")
+        warn(f"nginx install failed, so the proxy manager stays unavailable: "
+             f"{stderr.strip()[:300]}")
         return False
     run(sudo_prefix() + ["systemctl", "enable", "nginx"], timeout=60)
     run(sudo_prefix() + ["systemctl", "start", "nginx"], timeout=60)
@@ -601,6 +604,91 @@ def _write_root_file(path, text):
             os.remove(tmp)
         except OSError:
             pass
+
+CLOUDFLARED_ARCH = {
+    "x86_64": "amd64", "amd64": "amd64",
+    "aarch64": "arm64", "arm64": "arm64",
+    "armv7l": "arm", "armv6l": "arm", "i386": "386", "i686": "386",
+}
+CLOUDFLARED_BASE = "https://github.com/cloudflare/cloudflared/releases/latest/download"
+CLOUDFLARED_BIN = "/usr/local/bin/cloudflared"
+
+def cloudflared_installed():
+    return shutil.which("cloudflared") is not None
+
+def _download(url, dest):
+    """Fetch a file with whichever downloader the box has."""
+    if shutil.which("curl"):
+        rc, _, stderr = run(["curl", "-fsSL", "-o", dest, url], timeout=900)
+    elif shutil.which("wget"):
+        rc, _, stderr = run(["wget", "-q", "-O", dest, url], timeout=900)
+    else:
+        return False, "neither curl nor wget is installed"
+    if rc != 0 or not os.path.exists(dest) or os.path.getsize(dest) < 1024:
+        return False, (stderr or "").strip()[:200] or "the download produced nothing"
+    return True, ""
+
+def install_cloudflared():
+    """Install cloudflared, which is what makes the Cloudflare Tunnel page work.
+
+    Cloudflare does not ship it in the distro repositories, so this takes the
+    release package for this architecture, and falls back to the bare binary when
+    dpkg is not the way software arrives on this machine. Never fatal: the panel
+    works without it and only that one page goes unavailable.
+    """
+    if cloudflared_installed():
+        ok(f"cloudflared present: {shutil.which('cloudflared')}")
+        return True
+    machine = platform.machine().lower()
+    arch = CLOUDFLARED_ARCH.get(machine)
+    if not arch:
+        warn(f"no cloudflared build for {machine or 'this architecture'}, so the "
+             "Cloudflare Tunnel page stays unavailable")
+        return False
+    if detect_package_manager() == "brew":
+        step("installing cloudflared with brew")
+        rc, _, stderr = run(["brew", "install", "cloudflared"], timeout=1800)
+        if rc == 0:
+            ok("cloudflared installed")
+            return True
+        warn(f"brew could not install cloudflared: {stderr.strip()[:200]}")
+        return False
+
+    tmpdir = tempfile.mkdtemp(prefix="argus-cloudflared-")
+    try:
+        if shutil.which("dpkg"):
+            deb = os.path.join(tmpdir, "cloudflared.deb")
+            step(f"downloading cloudflared for {arch}")
+            got, why = _download(f"{CLOUDFLARED_BASE}/cloudflared-linux-{arch}.deb", deb)
+            if got:
+                rc, _, stderr = run(sudo_prefix() + ["dpkg", "-i", deb], timeout=600)
+                if rc == 0 and cloudflared_installed():
+                    ok("cloudflared installed")
+                    return True
+                warn(f"the cloudflared package would not install: {stderr.strip()[:200]}")
+            else:
+                warn(f"could not download the cloudflared package: {why}")
+
+        binary = os.path.join(tmpdir, "cloudflared")
+        step(f"downloading the cloudflared binary for {arch}")
+        got, why = _download(f"{CLOUDFLARED_BASE}/cloudflared-linux-{arch}", binary)
+        if not got:
+            warn(f"could not download cloudflared: {why}, so the Cloudflare "
+                 "Tunnel page stays unavailable")
+            return False
+        os.chmod(binary, 0o755)
+        rc, _, stderr = run(sudo_prefix() + ["cp", binary, CLOUDFLARED_BIN], timeout=120)
+        if rc != 0:
+            warn(f"could not put cloudflared in {CLOUDFLARED_BIN}: {stderr.strip()[:200]}")
+            return False
+        run(sudo_prefix() + ["chmod", "755", CLOUDFLARED_BIN], timeout=60)
+        if not cloudflared_installed():
+            warn(f"cloudflared was copied to {CLOUDFLARED_BIN} but is not on PATH")
+            return False
+        ok("cloudflared installed")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 def install_postgres():
     """Install a PostgreSQL server with whatever package manager is present."""
@@ -1301,6 +1389,7 @@ SCHEMA = (
     ("SSH access settings", ssh_vault.SCHEMA),
     ("panel staff accounts", panel_users.SCHEMA),
     ("firewall blocks and port rules", firewall.SCHEMA),
+    ("Cloudflare tunnels and their forwards", cloudflare_tunnel.SCHEMA),
 )
 
 # Columns added to tables that may predate this version of the schema. Each is
@@ -1320,7 +1409,7 @@ SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",
                  "management_log", "admin_action", "ssh_log", "web_login_log",
                  "web_fp_block", "web_login_block", "web_session_log",
                  "http_access_log", "ssh", "panel_user",
-                 "fw_block", "fw_rule")
+                 "fw_block", "fw_rule", "cf_tunnel", "cf_route")
 
 
 def app_connection(cfg):
@@ -1996,6 +2085,7 @@ def upgrade_mode():
     # already in place.
     if nginx_installed():
         ensure_nginx_stream()
+    install_cloudflared()
 
     cfg = load_config()
     if os.path.exists(CONFIG_PATH):
@@ -2201,6 +2291,7 @@ def wizard():
         sys.exit(1)
     if install_nginx():   # best-effort, only the Proxy page in Config needs it
         ensure_nginx_stream()
+    install_cloudflared()  # best-effort too, for the Cloudflare Tunnel card
 
     # --- 3. a privileged connection ---------------------------------------- #
     channel = obtain_admin_channel(cfg)

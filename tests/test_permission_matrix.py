@@ -33,6 +33,7 @@ PROBES = {
     "svc_stop":      ("POST", "/api/services/not%20a%20unit/stop"),
     "logs_access":   ("GET", "/api/system/log-counts"),
     "firewall_manage": ("GET", "/api/config/firewall"),
+    "tunnel_manage":   ("GET", "/api/config/tunnel"),
 }
 
 # Grants with no endpoint of their own: terminal is a websocket, disk_scope is a
@@ -174,6 +175,21 @@ FIREWALL_ROUTES = [
     ("DELETE", "/api/config/firewall/rule"),
     ("POST", "/api/config/firewall/block"),
 ]
+# The tunnel endpoints connect a Cloudflare account and publish a hostname on
+# the internet, so an account without the grant must not reach any of them,
+# not even the read that would tell it whether an account is connected.
+TUNNEL_ROUTES = [
+    ("GET", "/api/config/tunnel"),
+    ("GET", "/api/config/tunnel/login"),
+    ("POST", "/api/config/tunnel/login"),
+    ("POST", "/api/config/tunnel/disconnect"),
+    ("POST", "/api/config/tunnel/create"),
+    ("POST", "/api/config/tunnel/active"),
+    ("POST", "/api/config/tunnel/route"),
+    ("POST", "/api/config/tunnel/service"),
+    ("DELETE", "/api/config/tunnel/pytest-nothing"),
+    ("DELETE", "/api/config/tunnel/route/pytest-nothing.example.com"),
+]
 
 
 def test_every_proxy_route_is_gated_on_net_proxy(client, conn):
@@ -183,6 +199,17 @@ def test_every_proxy_route_is_gated_on_net_proxy(client, conn):
         for method, url in PROXY_ROUTES:
             assert _call(client, method, url).status_code == 403, \
                 f"{method} {url} is reachable without net_proxy"
+    finally:
+        pu.delete_user(conn, STAFF)
+
+
+def test_every_tunnel_route_is_gated_on_tunnel_manage(client, conn):
+    _staff_with(conn, {"net_proxy": True, "firewall_manage": True})
+    try:
+        _sign_in_as(client, STAFF)
+        for method, url in TUNNEL_ROUTES:
+            assert _call(client, method, url).status_code == 403, \
+                f"{method} {url} is reachable without tunnel_manage"
     finally:
         pu.delete_user(conn, STAFF)
 
@@ -205,10 +232,14 @@ def test_the_proxy_and_firewall_routes_listed_here_actually_exist():
     for route in panel.app.routes:
         for method in getattr(route, "methods", ()) or ():
             known.add((method, getattr(route, "path", "")))
-    for method, url in PROXY_ROUTES + FIREWALL_ROUTES:
+    placeholders = {"pytest-nothing.conf": "{filename}",
+                    "pytest-nothing": "{name}",
+                    "pytest-nothing.example.com": "{hostname}"}
+    for method, url in PROXY_ROUTES + FIREWALL_ROUTES + TUNNEL_ROUTES:
         path = url.split("?")[0]
-        if path.endswith("pytest-nothing.conf"):
-            path = path.rsplit("/", 1)[0] + "/{filename}"
+        last = path.rsplit("/", 1)[-1]
+        if last in placeholders:
+            path = path.rsplit("/", 1)[0] + "/" + placeholders[last]
         assert (method, path) in known, f"{method} {path} is not a real route"
 
 

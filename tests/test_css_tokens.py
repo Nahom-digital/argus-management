@@ -157,3 +157,29 @@ def test_the_segmented_control_shows_its_selection_without_javascript():
     text = _strip_comments(_sheet())
     assert re.search(r"\.grant-seg:has\(input:checked\)", text), \
         "selection must be driven by the radio, not only by a JS class"
+
+
+def test_the_only_looping_animation_reports_a_state_and_can_be_turned_off():
+    """The waiting dot in the Cloudflare card loops, which is only acceptable
+    because it says something is still being waited on. A visitor who asked for
+    less motion must still be able to read the card."""
+    text = _strip_comments(_sheet())
+    assert re.search(r"\.cf-pulse\s*\{[^}]*animation:\s*cf-pulse", text), \
+        "the waiting indicator lost its animation"
+    blocks = re.findall(r"@media\s*\(prefers-reduced-motion: reduce\)\s*\{(.*?)\n\}",
+                        text, re.S)
+    assert any("cf-pulse" in b and "animation: none" in b for b in blocks), \
+        "the looping dot needs a reduced-motion path"
+
+
+def test_a_locked_tunnel_step_is_still_readable():
+    """A step nobody can use yet is dimmed, not hidden: the sentence explaining
+    what it is for is exactly what somebody on step one needs to read."""
+    text = _strip_comments(_sheet())
+    m = re.search(r"\.cf-step\.cf-locked \.cf-step-body\s*\{([^}]*)\}", text)
+    assert m, "the locked step rule is gone"
+    body = m.group(1)
+    assert "display: none" not in body, "a locked step must stay on the page"
+    opacity = re.search(r"opacity:\s*([\d.]+)", body)
+    assert opacity and float(opacity.group(1)) >= 0.6, \
+        f"dimmer than 0.6 and the copy cannot be read: {body}"
