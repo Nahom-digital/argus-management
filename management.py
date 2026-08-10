@@ -2210,7 +2210,13 @@ def serve(cfg):
     # uvicorn logs to stderr; flush ours first so the two stay in order when
     # stdout is a pipe or the journal rather than a terminal.
     sys.stdout.flush()
-    uvicorn.run(panel.app, host=host, port=port, log_level="info")
+    # proxy_headers=False on purpose. Uvicorn otherwise rewrites the socket peer
+    # from X-Forwarded-For, and the panel's Cloudflare ingress gate rules on that
+    # peer. A tunnel or proxy forwards the visitor's own address in that header,
+    # so the gate would judge the visitor instead of the hop and answer 403 to
+    # every request. panel._hop_ip reads X-Real-IP itself, from a local hop only.
+    uvicorn.run(panel.app, host=host, port=port, log_level="info",
+                proxy_headers=False)
 
 
 def show_status():

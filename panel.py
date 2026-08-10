@@ -4687,9 +4687,14 @@ if __name__ == "__main__":
         HOST, PORT = "0.0.0.0", 80
     SERVER_RUNTIME["host"], SERVER_RUNTIME["port"] = HOST, PORT
     FALLBACK_PORT = 4042
+    # proxy_headers=False on purpose: see _hop_ip. Uvicorn would otherwise take
+    # X-Forwarded-For as the socket peer, which is the visitor's address behind a
+    # tunnel, and the ingress gate would refuse every forwarded request.
     try:
-        uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+        uvicorn.run(app, host=HOST, port=PORT, log_level="info",
+                    proxy_headers=False)
     except (PermissionError, OSError) as e:
         logging.error(f"Bind {HOST}:{PORT} failed ({e}); falling back to :{FALLBACK_PORT}")
         SERVER_RUNTIME["port"] = FALLBACK_PORT
-        uvicorn.run(app, host=HOST, port=FALLBACK_PORT, log_level="info")
+        uvicorn.run(app, host=HOST, port=FALLBACK_PORT, log_level="info",
+                    proxy_headers=False)
