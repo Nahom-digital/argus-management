@@ -19,6 +19,7 @@ CARDS = {
     "proxy":    ("net_proxy", "proxy-list"),
     "tunnel":   ("tunnel_manage", "cf-card"),
     "firewall": ("firewall_manage", "px-fw-add"),
+    "telegram": ("telegram_manage", "tg-state"),
 }
 
 

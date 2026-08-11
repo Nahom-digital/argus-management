@@ -34,6 +34,7 @@ PROBES = {
     "logs_access":   ("GET", "/api/system/log-counts"),
     "firewall_manage": ("GET", "/api/config/firewall"),
     "tunnel_manage":   ("GET", "/api/config/tunnel"),
+    "telegram_manage": ("GET", "/api/config/telegram"),
 }
 
 # Grants with no endpoint of their own: terminal is a websocket, disk_scope is a

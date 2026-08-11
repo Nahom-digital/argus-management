@@ -81,6 +81,7 @@ const CONFIG_LOADERS={
   proxy: loadProxyHosts,
   tunnel: loadTunnel,
   firewall: loadFirewall,
+  telegram: loadTelegram,
 };
 /* The drill-down already replaced the card grid rather than sitting under it.
    What made it look like it opened "at the bottom" was the scroll position:
@@ -2765,6 +2766,163 @@ window.addEventListener('resize',()=>{ if(CURRENT==='terminal') termFitActive();
 window.addEventListener('orientationchange',()=>{ if(CURRENT==='terminal') setTimeout(termFitActive,60); });
 
 /* ================= boot ================= */
+/* ================= TELEGRAM BOT =================
+   Three things live on this page and they are deliberately in this order: the
+   connection, who is allowed, and the log. The log is last because it is what
+   you read to answer the middle one: a stranger's numeric ID only ever appears
+   because they wrote in, so the Allow buttons sit on that row rather than
+   asking anyone to copy a number into a form. */
+let TG={};
+
+async function loadTelegram(){
+  if(!$('tg-state')) return;   /* the card is absent without the grant */
+  try{
+    const d=await getJSON('/api/config/telegram'); if(!d) return;
+    TG=d;
+    const dom=$('tg-domain'); if(dom && document.activeElement!==dom) dom.value=d.domain||'';
+    const nt=$('tg-notify'); if(nt && document.activeElement!==nt) nt.value=d.notify_email||'';
+    const hint=$('tg-token-hint');
+    if(hint) hint.innerHTML = d.token_set
+      ? `A token ending ${esc(d.token_hint)} is stored. Type a new one only to replace it.`
+      : 'Stored in this panel’s settings and never shown again after saving.';
+    tgRenderState(d);
+    tgRenderUsers(d.users||[]);
+    tgRenderPending(d.pending||[]);
+    tgRenderLog(d.log||[]);
+  }catch(e){ $('tg-state').textContent='Could not read the bot settings.'; }
+}
+
+function tgRenderState(d){
+  const el=$('tg-state'); if(!el) return;
+  const who=d.identity||{}, hook=d.webhook||{};
+  if(!d.token_set){ el.innerHTML='No bot token yet. Paste one above to begin.'; return; }
+  const bits=[];
+  bits.push(who.ok ? `Connected to <b>@${esc(who.username)}</b>`
+                   : `Telegram would not confirm the token: ${esc(who.detail||'')}`);
+  if(d.enabled && hook.ok && hook.url) bits.push(`Delivering to <code>${esc(hook.url)}</code>`);
+  else if(d.suggested_url) bits.push(`Not receiving anything yet. Connect it to deliver to <code>${esc(d.suggested_url)}</code>`);
+  if(hook.pending) bits.push(`${hook.pending} update(s) waiting`);
+  if(hook.last_error) bits.push(`Telegram’s last error: ${esc(hook.last_error)}`);
+  el.innerHTML=bits.join('<br>');
+}
+
+function tgRenderUsers(rows){
+  const el=$('tg-users'); if(!el) return;
+  if(!rows.length){ el.innerHTML='<div class="empty-state">Nobody may use the bot yet. Anyone who writes to it shows up in the log below.</div>'; return; }
+  el.innerHTML=rows.map(r=>{
+    const name=r.tg_username?('@'+r.tg_username):(r.display_name||'unnamed');
+    const bound=r.panel_user?` as ${esc(r.panel_user)}`:'';
+    return `<div class="px-fw-rule">
+      <div class="px-fw-rule-info">
+        <div class="px-fw-rule-port">${esc(name)}</div>
+        <div class="px-fw-rule-note">${r.telegram_id} &middot; ${esc(r.role)}${bound}${r.last_seen?' &middot; last seen '+esc(r.last_seen):''}</div>
+      </div>
+      <select class="field-input" style="max-width:130px;" onchange="setTelegramRole('${r.telegram_id}',this.value)">
+        ${['admin','user','blocked'].map(x=>`<option value="${x}"${x===r.role?' selected':''}>${x}</option>`).join('')}
+      </select>
+      <button class="db-action-btn" style="color:var(--danger);" title="Remove from the bot"
+              onclick="revokeTelegramId('${r.telegram_id}')">
+        <svg class="ic"><use href="#ic-trash-2"/></svg></button>
+    </div>`;
+  }).join('');
+}
+
+function tgRenderPending(rows){
+  const el=$('tg-pending'); if(!el) return;
+  if(!rows.length){ el.innerHTML=''; return; }
+  el.innerHTML='<div class="px-fw-legend">Waiting for a decision</div>'+rows.map(r=>{
+    const name=r.tg_username?('@'+r.tg_username):(r.display_name||'unnamed');
+    return `<div class="px-fw-rule">
+      <div class="px-fw-rule-info">
+        <div class="px-fw-rule-port">${esc(name)}</div>
+        <div class="px-fw-rule-note">${r.telegram_id} &middot; ${r.messages} message(s) &middot; last ${esc(r.last_seen)}</div>
+      </div>
+      <button class="db-action-btn" onclick="setTelegramRole('${r.telegram_id}','user')">Allow as user</button>
+      <button class="save-btn" onclick="setTelegramRole('${r.telegram_id}','admin')">Allow as admin</button>
+      <button class="db-action-btn" onclick="setTelegramRole('${r.telegram_id}','blocked')">Block</button>
+    </div>`;
+  }).join('');
+}
+
+function tgRenderLog(rows){
+  const el=$('tg-log'); if(!el) return;
+  if(!rows.length){ el.innerHTML='<div class="empty-state">The bot has not been written to yet.</div>'; return; }
+  el.innerHTML=rows.map(r=>{
+    const name=r.tg_username?('@'+r.tg_username):(r.display_name||'unnamed');
+    const dir=r.direction==='in'?'received':'sent';
+    const allow=(r.direction==='in'&&!r.allowed)
+      ? `<button class="db-action-btn" onclick="setTelegramRole('${r.telegram_id}','user')">Allow</button>
+         <button class="save-btn" onclick="setTelegramRole('${r.telegram_id}','admin')">Allow as admin</button>` : '';
+    return `<div class="px-fw-rule">
+      <div class="px-fw-rule-info">
+        <div class="px-fw-rule-note">${esc(r.ts)} &middot; ${dir} &middot; ${esc(name)} &middot; <code>${r.telegram_id}</code>${r.allowed?'':' &middot; not allowed'}</div>
+        <div class="px-fw-rule-port" style="font-weight:400;white-space:pre-wrap;">${esc((r.text||'').slice(0,400))}</div>
+      </div>
+      ${allow}
+    </div>`;
+  }).join('');
+}
+
+async function saveTelegram(){
+  const fb=$('tg-feedback'); fb.textContent='Saving…';
+  const r=await api('/api/config/telegram',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token:$('tg-token').value, domain:$('tg-domain').value, notify_email:$('tg-notify').value})});
+  if(!r) return;
+  const d=await r.json();
+  fb.textContent=d.detail||''; fb.className='save-feedback '+(d.ok?'ok':'err');
+  if(d.ok){ $('tg-token').value=''; loadTelegram(); }
+}
+
+async function connectTelegram(){
+  const fb=$('tg-feedback'); fb.textContent='Telling Telegram where to deliver…';
+  const r=await api('/api/config/telegram/connect',{method:'POST'}); if(!r) return;
+  const d=await r.json();
+  fb.textContent=d.detail||''; fb.className='save-feedback '+(d.ok?'ok':'err');
+  loadTelegram();
+}
+
+async function disconnectTelegram(){
+  if(!confirm('Stop the bot from receiving anything?')) return;
+  const r=await api('/api/config/telegram/disconnect',{method:'POST'}); if(!r) return;
+  const d=await r.json();
+  const fb=$('tg-feedback'); fb.textContent=d.detail||''; fb.className='save-feedback '+(d.ok?'ok':'err');
+  loadTelegram();
+}
+
+async function setTelegramRole(id, role, panelUser){
+  const fb=$('tg-users-feedback');
+  const r=await api('/api/config/telegram/allow',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({telegram_id:id, role:role, panel_user:panelUser||''})});
+  if(!r) return;
+  const d=await r.json();
+  if(fb){ fb.textContent=d.detail||''; fb.className='save-feedback '+(d.ok?'ok':'err'); }
+  loadTelegram();
+}
+
+async function allowTelegramId(){
+  const id=$('tg-add-id').value.trim();
+  if(!id){ appToast('Enter the Telegram ID','err'); return; }
+  await setTelegramRole(id, $('tg-add-role').value, $('tg-add-user').value.trim());
+  $('tg-add-id').value=''; $('tg-add-user').value='';
+}
+
+async function revokeTelegramId(id){
+  if(!confirm('Remove '+id+' from the bot?')) return;
+  const r=await api('/api/config/telegram/revoke',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({telegram_id:id})});
+  if(!r) return;
+  const d=await r.json();
+  const fb=$('tg-users-feedback'); if(fb){ fb.textContent=d.detail||''; fb.className='save-feedback '+(d.ok?'ok':'err'); }
+  loadTelegram();
+}
+
+async function clearTelegramLog(){
+  if(!confirm('Clear the conversation log? Pending IDs disappear with it.')) return;
+  const r=await api('/api/config/telegram/log/clear',{method:'POST'}); if(!r) return;
+  loadTelegram();
+}
+
+
 (function init(){
   applyTheme(localStorage.getItem('theme')==='dark');
   document.querySelectorAll('[data-nav]').forEach(b=>b.addEventListener('click',()=>switchSection(b.dataset.nav)));

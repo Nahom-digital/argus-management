@@ -78,6 +78,9 @@ PERMISSIONS = (
     Grant("tunnel_manage", "bool", None, False, "network",
           "Cloudflare tunnels",
           "Connect a Cloudflare account, and forward a public name to a local port."),
+    Grant("telegram_manage", "bool", None, False, "network",
+          "Telegram bot",
+          "Set the bot token, read its conversation log, and decide which Telegram accounts may use it."),
 )
 
 GRANT_KEYS = frozenset(g.key for g in PERMISSIONS)

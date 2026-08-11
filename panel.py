@@ -54,6 +54,7 @@ import firewall
 import mail
 import mailcow
 import identity
+import telegram_bot
 import branding
 import provision
 import web_guard
@@ -768,11 +769,12 @@ def _config_cards(perms: dict):
     """
     if perms.get("role") == "admin":
         return ["users", "server", "service", "database", "proxy", "tunnel",
-                "firewall"]
+                "firewall", "telegram"]
     cards = ["account"]
     for grant, key in (("svc_status", "service"), ("db_read", "database"),
                        ("net_proxy", "proxy"), ("tunnel_manage", "tunnel"),
-                       ("firewall_manage", "firewall")):
+                       ("firewall_manage", "firewall"),
+                       ("telegram_manage", "telegram")):
         if perms.get(grant):
             cards.append(key)
     return cards
@@ -794,6 +796,8 @@ _CONFIG_CARD_META = {
                  "Publish a name on the internet without opening a port."),
     "firewall": ("Firewall", "ic-shield-alert",
                  "Which ports this server accepts, and which addresses are blocked."),
+    "telegram": ("Telegram Bot", "ic-send",
+                 "Run this panel from a chat, and decide who is allowed to."),
 }
 
 _CONFIG_BACK = (
@@ -1281,6 +1285,81 @@ def _config_sub_firewall(perms):
     </div>
   </div>"""
 
+def _config_sub_telegram(perms):
+    """The bot, on its own page: the token, the endpoint Telegram delivers to,
+    who is allowed to use it, and the conversation log every allow decision is
+    made from."""
+    return """
+  <div class="config-sub" data-cfgsub="telegram" hidden>
+    """ + _CONFIG_BACK + """
+    <div class="mgmt-h2">Telegram Bot</div>
+
+    <div class="cfg-card cfg-card-wide">
+      <div class="device-title">Bot connection</div>
+      <div class="settings-subtitle" style="margin:6px 0 16px;">
+        BotFather gives you a token. Paste it here with the domain this panel is
+        already reachable on, and Telegram is told to deliver every message to
+        <code>/bot</code> on that domain. Nothing new is opened on the firewall.
+      </div>
+      <div class="field-group"><label class="field-label" for="tg-token">Bot token</label>
+        <div class="field-hint" id="tg-token-hint">Stored encrypted at rest and never shown again after saving.</div>
+        <input class="field-input" id="tg-token" type="password" autocomplete="off" spellcheck="false"
+               placeholder="123456789:AA..."></div>
+      <div class="field-group"><label class="field-label" for="tg-domain">Domain</label>
+        <div class="field-hint">The name you already use to reach this panel, without <code>https://</code>.</div>
+        <input class="field-input" id="tg-domain" type="text" autocomplete="off" spellcheck="false"
+               placeholder="panel.example.com"></div>
+      <div class="field-group"><label class="field-label" for="tg-notify">Notification email</label>
+        <div class="field-hint">Where the bot reports what it did: strangers writing in, access granted, commands run. Leave empty for no email.</div>
+        <input class="field-input" id="tg-notify" type="text" autocomplete="off" spellcheck="false"
+               placeholder="you@example.com"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <button class="save-btn" id="tg-save" onclick="saveTelegram()">Save</button>
+        <button class="save-btn" id="tg-connect" onclick="connectTelegram()">Connect the bot</button>
+        <button class="db-action-btn" id="tg-disconnect" onclick="disconnectTelegram()">Disconnect</button>
+        <button class="db-action-btn" onclick="loadTelegram()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
+      </div>
+      <div class="save-feedback" id="tg-feedback"></div>
+      <div class="cfg-running" id="tg-state" style="margin-top:12px;">Loading&hellip;</div>
+    </div>
+
+    <div class="cfg-card cfg-card-wide" style="margin-top:18px;">
+      <div class="device-title">Who may use the bot</div>
+      <div class="settings-subtitle" style="margin:6px 0 14px;">
+        An admin gets everything this panel can do. A user gets exactly what
+        their panel account is allowed, and nothing more.
+      </div>
+      <div id="tg-users"><div class="empty-state">Loading&hellip;</div></div>
+      <div class="px-fw-add" style="margin-top:14px;">
+        <input class="field-input" id="tg-add-id" type="text" inputmode="numeric"
+               placeholder="Telegram ID" autocomplete="off">
+        <select class="field-input" id="tg-add-role" aria-label="Role">
+          <option value="user">User</option>
+          <option value="admin">Admin</option>
+          <option value="blocked">Blocked</option>
+        </select>
+        <input class="field-input" id="tg-add-user" type="text"
+               placeholder="Panel account (users only)" autocomplete="off">
+        <button class="save-btn" onclick="allowTelegramId()">Allow</button>
+      </div>
+      <div class="save-feedback" id="tg-users-feedback"></div>
+    </div>
+
+    <div class="cfg-card cfg-card-wide" style="margin-top:18px;">
+      <div class="device-title">Conversation log</div>
+      <div class="settings-subtitle" style="margin:6px 0 14px;">
+        Every message the bot has received, whoever sent it. This is where an
+        unknown Telegram ID becomes an allowed one.
+      </div>
+      <div id="tg-pending"></div>
+      <div class="px-fw-legend" style="margin-top:16px;">All messages</div>
+      <div id="tg-log"><div class="empty-state">Loading&hellip;</div></div>
+      <div style="margin-top:12px;">
+        <button class="db-action-btn" onclick="clearTelegramLog()"><svg class="ic"><use href="#ic-trash-2"/></svg>Clear the log</button>
+      </div>
+    </div>
+  </div>"""
+
 _CONFIG_SUB_BUILDERS = {
     "account": _config_sub_account,
     "users": lambda perms: _config_sub_users(),
@@ -1290,6 +1369,7 @@ _CONFIG_SUB_BUILDERS = {
     "proxy": lambda perms: _config_sub_proxy(perms),
     "tunnel": lambda perms: _config_sub_tunnel(perms),
     "firewall": lambda perms: _config_sub_firewall(perms),
+    "telegram": lambda perms: _config_sub_telegram(perms),
 }
 
 def _config_pane_html(perms: dict) -> str:
@@ -1843,7 +1923,7 @@ def _ensure_feature_tables():
     try:
         cur = conn.cursor()
         for statement in (cloudflare_tunnel.SCHEMA + mail.SCHEMA
-                          + identity.SCHEMA):
+                          + identity.SCHEMA + telegram_bot.SCHEMA):
             cur.execute(statement)
         cur.close()
     finally:
@@ -4469,6 +4549,186 @@ async def api_ssh_toggle(request: Request):
 # ---- terminal: PTY WebSocket (ported from Main.py) ----
 _TERMS = {}
 _TERM_BUF_MAX = 256 * 1024
+
+# ---------------------------------------------------------------------------
+# Telegram bot.
+#
+# One public endpoint and a handful of admin ones. The public endpoint is the
+# only route in this file that answers without a session, so it authenticates
+# the caller a different way: Telegram is told a secret when the webhook is
+# installed, sends it back on every delivery, and a POST arriving without it is
+# dropped before the body is even read as an update.
+# ---------------------------------------------------------------------------
+def _tg_work(fn, *args, **kwargs):
+    def work():
+        conn = DB.get_connection()
+        try:
+            return fn(conn, *args, **kwargs)
+        finally:
+            DB.release_connection(conn)
+    return work
+
+@app.get("/api/config/telegram")
+async def api_telegram_get(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("telegram_manage"))
+    if denied:
+        return denied
+    return await DB.run(_tg_work(telegram_bot.status))
+
+@app.post("/api/config/telegram")
+async def api_telegram_set(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("telegram_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    actor = _admin_name(request)
+    ok, detail = await DB.run(_tg_work(
+        telegram_bot.set_config,
+        bot_token=body.get("token", ""),
+        domain=body.get("domain"),
+        notify_email=body.get("notify_email"),
+        actor=actor))
+    write_log("ACTION" if ok else "WARN", "NETWORK", "Telegram bot settings saved",
+              actor=actor, ip=_client_ip(request), detail=detail,
+              status="ok" if ok else "failed")
+    return JSONResponse(status_code=200 if ok else 400,
+                        content={"ok": ok, "detail": detail})
+
+@app.post("/api/config/telegram/connect")
+async def api_telegram_connect(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("telegram_manage"))
+    if denied:
+        return denied
+    actor = _admin_name(request)
+    ok, detail = await DB.run(_tg_work(telegram_bot.install_webhook, actor=actor))
+    write_log("ACTION" if ok else "ERROR", "NETWORK", "Telegram webhook installed",
+              actor=actor, ip=_client_ip(request), detail=detail,
+              status="ok" if ok else "failed")
+    return JSONResponse(status_code=200 if ok else 400,
+                        content={"ok": ok, "detail": detail})
+
+@app.post("/api/config/telegram/disconnect")
+async def api_telegram_disconnect(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("telegram_manage"))
+    if denied:
+        return denied
+    actor = _admin_name(request)
+    ok, detail = await DB.run(_tg_work(telegram_bot.remove_webhook, actor=actor))
+    write_log("ACTION", "NETWORK", "Telegram webhook removed", actor=actor,
+              ip=_client_ip(request), detail=detail,
+              status="ok" if ok else "failed")
+    return JSONResponse(status_code=200 if ok else 400,
+                        content={"ok": ok, "detail": detail})
+
+@app.post("/api/config/telegram/allow")
+async def api_telegram_allow(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("telegram_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    actor = _admin_name(request)
+    ok, detail = await DB.run(_tg_work(
+        telegram_bot.allow, body.get("telegram_id"),
+        (body.get("role") or telegram_bot.ROLE_USER),
+        body.get("panel_user", ""), actor))
+    write_log("ACTION" if ok else "WARN", "SECURITY", "Telegram access changed",
+              actor=actor, ip=_client_ip(request),
+              target=str(body.get("telegram_id", "")), detail=detail,
+              status="ok" if ok else "failed")
+    return JSONResponse(status_code=200 if ok else 400,
+                        content={"ok": ok, "detail": detail})
+
+@app.post("/api/config/telegram/revoke")
+async def api_telegram_revoke(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("telegram_manage"))
+    if denied:
+        return denied
+    body = await _json_body(request)
+    actor = _admin_name(request)
+    ok, detail = await DB.run(_tg_work(telegram_bot.revoke,
+                                       body.get("telegram_id"), actor))
+    write_log("ACTION" if ok else "WARN", "SECURITY", "Telegram access revoked",
+              actor=actor, ip=_client_ip(request),
+              target=str(body.get("telegram_id", "")), detail=detail,
+              status="ok" if ok else "failed")
+    return JSONResponse(status_code=200 if ok else 400,
+                        content={"ok": ok, "detail": detail})
+
+@app.get("/api/config/telegram/log")
+async def api_telegram_log(request: Request, limit: int = 200, telegram_id: str = ""):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("telegram_manage"))
+    if denied:
+        return denied
+    who = telegram_id if telegram_id.strip().lstrip("-").isdigit() else None
+    rows = await DB.run(_tg_work(telegram_bot.recent, limit, who))
+    return {"log": rows}
+
+@app.post("/api/config/telegram/log/clear")
+async def api_telegram_log_clear(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _grant("telegram_manage"))
+    if denied:
+        return denied
+    ok, detail = await DB.run(_tg_work(telegram_bot.clear_log))
+    write_log("ACTION", "NETWORK", "Telegram conversation log cleared",
+              actor=_admin_name(request), ip=_client_ip(request))
+    return {"ok": ok, "detail": detail}
+
+@app.post("/bot")
+async def telegram_webhook(request: Request):
+    """Where Telegram delivers. Public by necessity, guarded by the secret it
+    was given when the webhook was installed.
+
+    It always answers 200 once the secret checks out. Telegram retries anything
+    else, so a command that raised would otherwise be replayed forever.
+    """
+    def gate():
+        conn = DB.get_connection()
+        try:
+            return telegram_bot.enabled(conn), telegram_bot.webhook_secret(conn)
+        finally:
+            DB.release_connection(conn)
+
+    on, secret = await DB.run(gate)
+    if not on or not secret:
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    sent = request.headers.get("x-telegram-bot-api-secret-token", "")
+    if not hmac.compare_digest(sent, secret):
+        write_log("WARN", "SECURITY", "Telegram webhook called without the secret",
+                  actor="unknown", ip=_client_ip(request), status="blocked")
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    ip = _client_ip(request)
+
+    def audit(person, perms, text):
+        write_log("ACTION", "SYSTEM", "Telegram command",
+                  actor=f"tg:{person['telegram_id']}", ip=ip,
+                  target=perms.get("username", ""), detail=(text or "")[:200])
+
+    try:
+        await DB.run(_tg_work(telegram_bot.handle_update, update, audit))
+    except Exception as e:
+        logging.error(f"telegram update failed: {e}")
+    return {"ok": True}
 
 def _safe_int(v, default):
     try:
