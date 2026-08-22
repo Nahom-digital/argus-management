@@ -156,6 +156,18 @@ def _bad_port(value):
     return ""
 
 
+def _listen_port(spec, default):
+    """The port a host answers on. Any scheme may name one; a value outside
+    the valid range falls back to the scheme default, which for a web host
+    is 443 for HTTPS and 80 otherwise. Stream hosts must pass validation
+    first, so their value always comes through unchanged."""
+    try:
+        port = int(spec.get("listen_port") or default)
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
 def resolves(host):
     """True when nginx will be able to resolve this name at config load.
 
@@ -216,12 +228,16 @@ def validate(spec):
     if listen == "https":
         cert = (spec.get("cert_path") or "").strip()
         key = (spec.get("cert_key_path") or "").strip()
+        # A certificate is optional. Hosts behind a TLS terminating tunnel are
+        # served as plain HTTP, so HTTPS never hard requires one. When a cert
+        # is supplied it still has to be real, because a broken ssl directive
+        # makes nginx refuse to load and takes every other host down with it.
+        if bool(cert) != bool(key):
+            problems.append("A certificate and its key are both needed, or neither.")
         for label, path in (("certificate", cert), ("certificate key", key)):
-            if not path:
-                problems.append(f"An HTTPS host needs a {label} path.")
-            elif not os.path.isabs(path):
+            if path and not os.path.isabs(path):
                 problems.append(f"The {label} path must be absolute.")
-            elif not os.path.isfile(path):
+            elif path and not os.path.isfile(path):
                 problems.append(f"No {label} file at {path}.")
 
     for i, loc in enumerate(spec.get("locations") or [], 1):
@@ -247,10 +263,15 @@ def validate(spec):
 def normalize(spec):
     """A stored, validated spec with every key present and nothing extra."""
     listen = (spec.get("listen_scheme") or "https").lower()
+    # The scheme default port is 443 only when TLS actually happens on this
+    # box. A certless HTTPS host is served as plain HTTP, so its default is 80
+    # and the stored port always matches the rendered listen line.
+    tls = listen == "https" and bool((spec.get("cert_path") or "").strip()) \
+        and bool((spec.get("cert_key_path") or "").strip())
     out = {
         "domain": (spec.get("domain") or "").strip().lower(),
         "listen_scheme": listen if listen in LISTEN_SCHEMES else "https",
-        "listen_port": int(spec.get("listen_port") or (443 if listen == "https" else 80)),
+        "listen_port": _listen_port(spec, 443 if tls else 80),
         "forward_scheme": (spec.get("forward_scheme") or "http").lower(),
         "forward_host": (spec.get("forward_host") or "").strip(),
         "forward_port": int(spec.get("forward_port") or 80),
@@ -351,39 +372,47 @@ def render(spec):
     domain = spec["domain"]
     upstream = f"{spec['forward_scheme']}://{spec['forward_host']}:{spec['forward_port']}"
     https = spec["listen_scheme"] == "https"
+    tls = https and bool(spec["cert_path"]) and bool(spec["cert_key_path"])
 
     parts = [MANAGED_MARKER, META_PREFIX + json.dumps(spec, sort_keys=True)]
 
     # A plain-HTTP server block exists either as the whole host, or purely to
-    # redirect to HTTPS when Force SSL is on.
-    if https and spec["force_ssl"]:
+    # redirect to HTTPS when Force SSL is on. TLS behaviour only applies when a
+    # certificate is present. A certless HTTPS host is served as plain HTTP so
+    # it can sit behind a tunnel that terminates TLS at its own edge.
+    if tls and spec["force_ssl"]:
+        # The redirect catches plaintext on 80 and sends it to the port the
+        # host actually answers on, which is 443 unless one was set.
+        target = "https://$host$request_uri"
+        if spec["listen_port"] != 443:
+            target = f"https://$host:{spec['listen_port']}$request_uri"
         parts.append(f"""server {{
     listen 80;
     listen [::]:80;
     server_name {domain};
-    return 301 https://$host$request_uri;
+    return 301 {target};
 }}""")
 
     listen_lines, extra = [], []
-    if https:
+    if tls:
         if spec["http2"] and _http2_as_directive():
-            listen_lines.append("    listen 443 ssl;")
-            listen_lines.append("    listen [::]:443 ssl;")
+            listen_lines.append(f"    listen {spec['listen_port']} ssl;")
+            listen_lines.append(f"    listen [::]:{spec['listen_port']} ssl;")
             extra.append("    http2 on;")
         else:
             http2 = " http2" if spec["http2"] else ""
-            listen_lines.append(f"    listen 443 ssl{http2};")
-            listen_lines.append(f"    listen [::]:443 ssl{http2};")
+            listen_lines.append(f"    listen {spec['listen_port']} ssl{http2};")
+            listen_lines.append(f"    listen [::]:{spec['listen_port']} ssl{http2};")
     else:
-        listen_lines.append("    listen 80;")
-        listen_lines.append("    listen [::]:80;")
+        listen_lines.append(f"    listen {spec['listen_port']};")
+        listen_lines.append(f"    listen [::]:{spec['listen_port']};")
 
     block = ["server {"]
     block += listen_lines
     block += extra
     block.append(f"    server_name {domain};")
 
-    if https:
+    if tls:
         block.append(f"    ssl_certificate {spec['cert_path']};")
         block.append(f"    ssl_certificate_key {spec['cert_key_path']};")
         block.append("    ssl_protocols TLSv1.2 TLSv1.3;")
@@ -610,39 +639,3 @@ def delete_host(filename):
         return True
     raise ValueError("no such host")
 
-
-# ---------------------------------------------------------------------------
-# Certificate discovery, for the file picker in the form
-# ---------------------------------------------------------------------------
-_CERT_ROOTS = ("/etc/letsencrypt/live", "/etc/ssl/certs", "/etc/nginx/ssl",
-               "/etc/ssl/private", "/etc/pki/tls/certs")
-_CERT_SUFFIXES = (".pem", ".crt", ".cer", ".key")
-
-
-def list_certificates():
-    """Certificate and key files already on the box, so the operator picks one
-    instead of typing a path. Only names are returned, never contents."""
-    found = []
-    for root in _CERT_ROOTS:
-        if not os.path.isdir(root):
-            continue
-        for dirpath, _dirnames, filenames in os.walk(root):
-            if dirpath.count(os.sep) - root.count(os.sep) > 2:
-                continue
-            for name in sorted(filenames):
-                if not name.endswith(_CERT_SUFFIXES):
-                    continue
-                full = os.path.join(dirpath, name)
-                try:
-                    size = os.path.getsize(full)
-                except OSError:
-                    continue
-                found.append({
-                    "path": full,
-                    "name": name,
-                    "is_key": "privkey" in name or name.endswith(".key"),
-                    "size": size,
-                })
-            if len(found) > 400:
-                return found
-    return found

@@ -119,6 +119,14 @@ def test_the_proxy_form_offers_every_incoming_scheme(client):
         assert f'name="px-listen" value="{value}"' in page, value
 
 
+def test_the_proxy_form_always_asks_for_a_listen_port(client):
+    """Every incoming scheme asks for a port. Stream hosts always needed one;
+    a web host gets the same field, with the scheme default when it is empty."""
+    page = _page_as(client, "admin")
+    assert 'id="px-listen-port"' in page
+    assert 'id="px-listen-port-row" hidden' not in page
+
+
 def test_the_proxy_form_carries_every_flag_the_renderer_knows(client):
     """The form and nginx_proxy have to agree on the field names, or a toggle
     silently does nothing. Reading the list from the module makes drift a
@@ -129,10 +137,23 @@ def test_the_proxy_form_carries_every_flag_the_renderer_knows(client):
         assert f'data-px="{flag}"' in page, flag
 
 
-def test_the_proxy_form_has_a_certificate_picker_and_a_manual_path(client):
+def test_the_proxy_form_does_not_ask_for_a_certificate(client):
+    """The certificate pickers are gone, but the HTTPS toggles stay."""
     page = _page_as(client, "admin")
     for el in ("px-cert-pick", "px-cert-path", "px-key-pick", "px-key-path"):
-        assert f'id="{el}"' in page, el
+        assert f'id="{el}"' not in page, el
+    for flag in ("force_ssl", "http2", "hsts", "hsts_subdomains"):
+        assert f'data-px="{flag}"' in page, flag
+
+
+def test_the_apps_own_assets_always_revalidate(client):
+    """The app's js and css are served with no-cache. A cached copy from before
+    a release silently pairs with new markup, and that pairing once made the
+    Add proxy host button do nothing."""
+    for fname in ("management.js", "dash.css"):
+        r = client.get(f"/static/{fname}")
+        assert r.status_code == 200, fname
+        assert r.headers.get("cache-control") == "no-cache", fname
 
 
 def test_the_proxy_form_has_somewhere_to_put_custom_locations(client):

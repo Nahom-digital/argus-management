@@ -165,7 +165,6 @@ def test_signed_out_requests_are_not_merely_unpermitted(client):
 # its grant already has a probe.
 PROXY_ROUTES = [
     ("GET", "/api/config/proxy/hosts"),
-    ("GET", "/api/config/proxy/certificates"),
     ("POST", "/api/config/proxy/hosts"),
     ("PUT", "/api/config/proxy/hosts/pytest-nothing.conf"),
     ("DELETE", "/api/config/proxy/hosts/pytest-nothing.conf"),

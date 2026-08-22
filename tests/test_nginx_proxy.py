@@ -13,8 +13,8 @@ import pytest
 
 import nginx_proxy as np
 
-# validate() only asks whether the certificate is a file that exists, so two
-# stand-ins are enough and the suite does not depend on the host having certs.
+# validate() only asks whether a supplied certificate is a file that exists, so
+# two stand-ins are enough and the suite does not depend on the host having certs.
 _CERT_DIR = tempfile.mkdtemp(prefix="pytest-nginx-certs-")
 CERT = os.path.join(_CERT_DIR, "fullchain.pem")
 CERT_KEY = os.path.join(_CERT_DIR, "privkey.pem")
@@ -47,8 +47,14 @@ def test_a_plain_http_host_needs_no_certificate():
     assert np.validate(spec(listen_scheme="http", cert_path="", cert_key_path="")) == []
 
 
-def test_an_https_host_without_a_certificate_is_refused():
-    assert problems_matching(spec(cert_path="", cert_key_path=""), "certificate")
+def test_an_https_host_without_a_certificate_is_accepted():
+    """Hosts behind a TLS terminating tunnel are served as plain HTTP, so an
+    HTTPS host with no certificate is a valid choice, not a mistake."""
+    assert np.validate(spec(cert_path="", cert_key_path="")) == []
+
+
+def test_a_certificate_without_its_key_is_refused():
+    assert problems_matching(spec(cert_path=CERT, cert_key_path=""), "both needed")
 
 
 def test_a_certificate_path_that_is_not_absolute_is_refused():
@@ -221,6 +227,36 @@ def test_without_force_ssl_there_is_no_redirect():
     assert "return 301" not in text
 
 
+def test_a_certless_https_host_renders_as_plain_http():
+    """No certificate means no TLS on the box: the host is served on port 80,
+    which is exactly what sits behind a tunnel that terminates TLS at its edge.
+    Emitting ssl directives without cert files would make nginx refuse to load."""
+    text = np.render(np.normalize(spec(cert_path="", cert_key_path="")))
+    assert "listen 80;" in text
+    assert "listen 443" not in text
+    assert "ssl_certificate" not in text
+
+
+def test_a_certless_https_host_ignores_the_tls_toggles():
+    """Force SSL, HSTS and HTTP/2 all describe TLS that is not there. Without a
+    certificate they must not leak directives nginx cannot honour."""
+    text = np.render(np.normalize(spec(cert_path="", cert_key_path="",
+                                       force_ssl=True, hsts=True, http2=True)))
+    assert "return 301 https://" not in text
+    assert "Strict-Transport-Security" not in text
+    assert "http2 on;" not in text
+    assert "ssl http2" not in text
+
+
+def test_an_https_host_with_a_certificate_keeps_its_tls():
+    """A host that already carries a certificate renders TLS exactly as before,
+    so editing an existing TLS host never downgrades it to plain HTTP."""
+    text = np.render(np.normalize(spec(force_ssl=True)))
+    assert "listen 443 ssl" in text
+    assert "ssl_certificate" in text
+    assert "return 301 https://" in text
+
+
 def test_hsts_subdomains_only_appears_with_hsts():
     with_sub = np.render(np.normalize(spec(hsts=True, hsts_subdomains=True)))
     assert "includeSubDomains" in with_sub
@@ -262,6 +298,49 @@ def test_a_udp_stream_says_udp_on_the_listen_line():
     text = np.render(np.normalize(spec(listen_scheme="udp", listen_port=15353,
                                        forward_port=53)))
     assert "listen 15353 udp;" in text
+
+
+def test_a_web_host_can_listen_on_a_custom_port():
+    """A web host answers on whatever port the spec names, not only 80 and
+    443. Custom ports are how a host sits on 8080 behind a tunnel."""
+    text = np.render(np.normalize(spec(listen_scheme="http", listen_port=8080)))
+    assert "listen 8080;" in text
+    assert "listen [::]:8080;" in text
+    assert "listen 80;" not in text
+
+
+def test_an_https_host_with_a_certificate_can_listen_on_a_custom_port():
+    text = np.render(np.normalize(spec(listen_port=8443)))
+    assert "listen 8443 ssl;" in text
+    assert "listen [::]:8443 ssl;" in text
+
+
+def test_normalize_keeps_a_custom_web_port_and_defaults_an_empty_one():
+    assert np.normalize(spec(listen_scheme="http", listen_port=8080))["listen_port"] == 8080
+    assert np.normalize(spec(listen_scheme="http"))["listen_port"] == 80
+    assert np.normalize(spec())["listen_port"] == 443
+    assert np.normalize(spec(listen_scheme="http", listen_port=99999))["listen_port"] == 80
+    assert np.normalize(spec(listen_scheme="http", listen_port="abc"))["listen_port"] == 80
+
+
+def test_force_ssl_redirect_points_at_a_custom_https_port():
+    text = np.render(np.normalize(spec(listen_port=8443, force_ssl=True)))
+    assert "return 301 https://$host:8443$request_uri;" in text
+
+
+def test_force_ssl_redirect_targets_the_default_port_when_none_was_set():
+    text = np.render(np.normalize(spec(force_ssl=True)))
+    assert "return 301 https://$host$request_uri;" in text
+
+
+def test_the_firewall_opens_the_port_a_web_host_listens_on():
+    from panel import _proxy_port_for_firewall
+    assert _proxy_port_for_firewall(spec(listen_scheme="http", listen_port=8080)) == 8080
+    assert _proxy_port_for_firewall(spec(listen_port=8443)) == 8443
+    assert _proxy_port_for_firewall(spec(listen_scheme="http")) == 80
+    assert _proxy_port_for_firewall(spec()) == 443
+    assert _proxy_port_for_firewall(spec(cert_path="", cert_key_path="")) == 80
+    assert _proxy_port_for_firewall(spec(listen_scheme="http", listen_port=0)) == 80
 
 
 def test_the_embedded_spec_is_a_single_comment_line_so_nginx_ignores_it():

@@ -196,7 +196,7 @@ Add Proxy Host form:
 
 - Domain name, with an incoming scheme selector (HTTP, HTTPS, TCP, UDP)
 - Forward scheme, forward hostname or IP, forward port
-- HTTPS listeners prompt for a certificate path, chosen from a server file picker
+- HTTPS listeners never ask for a certificate; without one they are served as plain HTTP
 - HTTPS toggles: Force SSL, HSTS Enabled, HTTP/2 Support, HSTS Subdomains
 - Behaviour toggles: Cache Assets, Block Common Exploits, Websockets Support
 - Custom locations: any number of subdomain or endpoint rules, each with its own

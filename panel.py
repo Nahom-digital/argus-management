@@ -981,7 +981,7 @@ def _config_sub_proxy(perms):
           <div class="device-title">Reverse proxy hosts</div>
           <div class="settings-subtitle" style="margin-top:6px;">Every server block nginx loads. Hosts added here can be edited; hand-written ones are left alone.</div>
         </div>
-        <button class="save-btn" id="px-new" onclick="openProxyForm(null)">Add proxy host</button>
+        <button class="save-btn" id="px-new" type="button" onclick="openProxyForm(null)">Add proxy host</button>
       </div>
       <div id="proxy-list" style="margin-top:16px;"><div class="empty-state">Loading&hellip;</div></div>
     </div>
@@ -1005,10 +1005,10 @@ def _config_sub_proxy(perms):
                    spellcheck="false" autocomplete="off">
           </div>
         </div>
-        <div class="px-row" id="px-listen-port-row" hidden>
+        <div class="px-row" id="px-listen-port-row">
           <div class="px-field">
             <label class="field-label" for="px-listen-port">Listen port</label>
-            <div class="field-hint">The port on this server that TCP or UDP clients connect to.</div>
+            <div class="field-hint">The port on this server the host answers on. Empty means the scheme default.</div>
             <input class="field-input" id="px-listen-port" type="number" min="1" max="65535"
                    placeholder="15432" inputmode="numeric" autocomplete="off">
           </div>
@@ -1037,39 +1037,7 @@ def _config_sub_proxy(perms):
       </div>
 
       <div class="grant-group" id="px-tls-group" hidden>
-        <div class="grant-legend">Certificate</div>
-        <div class="px-row">
-          <div class="px-field px-field-grow">
-            <label class="field-label" for="px-cert-pick">Certificate found on this server</label>
-            <select class="field-input" id="px-cert-pick" onchange="proxyPickCert('cert')">
-              <option value="">Choose a certificate&hellip;</option>
-            </select>
-          </div>
-        </div>
-        <div class="px-row">
-          <div class="px-field px-field-grow">
-            <label class="field-label" for="px-cert-path">Or a certificate path not in that list</label>
-            <input class="field-input" id="px-cert-path" type="text" spellcheck="false"
-                   placeholder="/etc/letsencrypt/live/example.com/fullchain.pem" autocomplete="off"
-                   oninput="proxyTypedCert('cert')">
-          </div>
-        </div>
-        <div class="px-row">
-          <div class="px-field px-field-grow">
-            <label class="field-label" for="px-key-pick">Matching private key</label>
-            <select class="field-input" id="px-key-pick" onchange="proxyPickCert('key')">
-              <option value="">Choose a key&hellip;</option>
-            </select>
-          </div>
-        </div>
-        <div class="px-row">
-          <div class="px-field px-field-grow">
-            <label class="field-label" for="px-key-path">Or a key path not in that list</label>
-            <input class="field-input" id="px-key-path" type="text" spellcheck="false"
-                   placeholder="/etc/letsencrypt/live/example.com/privkey.pem" autocomplete="off"
-                   oninput="proxyTypedCert('key')">
-          </div>
-        </div>
+        <div class="grant-legend">HTTPS</div>
         <div class="px-check-grid">
           {_px_check("force_ssl", "Force SSL", "Send anyone arriving on HTTP to HTTPS instead.")}
           {_px_check("http2", "HTTP/2 support", "Fewer round trips for browsers that speak it.")}
@@ -1976,7 +1944,14 @@ async def serve_static(fname: str):
     path = os.path.join(_STATIC_DIR, fname)
     if not ctype or not os.path.isfile(path):
         return JSONResponse(status_code=404, content={"error": "not found"})
-    return FileResponse(path, media_type=ctype)
+    # no-cache, not no-store: a store-and-revalidate policy means every change
+    # to the app's own js or css is picked up on the next visit, instead of a
+    # cached copy from before a release silently pairing with new markup and
+    # killing buttons. Without a Cache-Control at all, browsers heuristically
+    # cache FileResponse assets for a slice of their file age, which can be
+    # hours, and that stale js was once the entire panel's frontend.
+    return FileResponse(path, media_type=ctype,
+                        headers={"Cache-Control": "no-cache"})
 
 @app.get("/assets/fonts/{fname}")
 async def serve_font(fname: str):
@@ -3309,11 +3284,22 @@ def _proxy_spec_from_body(body):
 
 def _proxy_port_for_firewall(spec):
     """The port the outside world connects to, which is the one the firewall
-    has to let in. For http and https that is the standard port."""
+    has to let in. A web host honours its listen port when one was set, and
+    a certless HTTPS host is served as plain HTTP, so it listens on 80."""
     scheme = spec.get("listen_scheme")
     if scheme in ("tcp", "udp"):
         return int(spec.get("listen_port") or 0)
-    return 443 if scheme == "https" else 80
+    port = 80
+    if scheme == "https":
+        cert = (spec.get("cert_path") or "").strip()
+        key = (spec.get("cert_key_path") or "").strip()
+        if cert and key:
+            port = 443
+    try:
+        custom = int(spec.get("listen_port"))
+    except (TypeError, ValueError):
+        custom = 0
+    return custom if 1 <= custom <= 65535 else port
 
 @app.get("/api/config/proxy/hosts")
 async def api_proxy_list(request: Request):
@@ -3326,15 +3312,6 @@ async def api_proxy_list(request: Request):
             "stream_supported": nginx_proxy.stream_supported(),
             "stream_problem": nginx_proxy.stream_problem(),
             "hosts": await DB.run(nginx_proxy.list_hosts)}
-
-@app.get("/api/config/proxy/certificates")
-async def api_proxy_certificates(request: Request):
-    if not _authed(request):
-        return _need_auth()
-    perms, denied = await _require(request, _grant("net_proxy"))
-    if denied:
-        return denied
-    return {"certificates": await DB.run(nginx_proxy.list_certificates)}
 
 @app.post("/api/config/proxy/hosts")
 async def api_proxy_create(request: Request):

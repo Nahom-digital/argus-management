@@ -132,12 +132,13 @@ unlock.
   staff account can be given any combination of them.
 - **Proxy.** Detects every nginx server block on the box and manages the ones
   this panel wrote. A host is described by its incoming scheme (HTTP, HTTPS,
-  TCP or UDP), the domain, and where it forwards to. An HTTPS host picks a
-  certificate and key from the files already on the server, with Force SSL,
-  HSTS, HSTS subdomains and HTTP/2 as separate switches. Cache assets, block
-  common exploits and websocket support are per-host toggles, and any number of
-  custom locations can send a path under the domain somewhere else with their
-  own toggles. Hosts written by hand are shown but never edited or deleted.
+  TCP or UDP), the domain, and where it forwards to. HTTPS never asks for a
+  certificate: a host without one is served as plain HTTP, which is exactly
+  what a tunnel already fronts with TLS. Force SSL, HSTS, HSTS subdomains and
+  HTTP/2 stay as separate switches. Cache assets, block common exploits and
+  websocket support are per-host toggles, and any number of custom locations
+  can send a path under the domain somewhere else with their own toggles.
+  Hosts written by hand are shown but never edited or deleted.
   A saved host can be reopened and changed: the generated file carries its own
   settings, so editing shows what was saved rather than a guess.
 - **Firewall settings.** Inbound and outbound port rules, each one on or off,

@@ -1065,7 +1065,7 @@ async function dbAddColumn(){
    place and read back from the same place. PX_EDITING carries which file
    is being edited (null means a new host), which is the only difference
    between the create and the edit path. */
-let PX_EDITING=null, PX_CERTS=[], PX_STREAM_OK=true, PX_STREAM_WHY='', PX_LOC_SEQ=0;
+let PX_EDITING=null, PX_EDITING_CERT='', PX_EDITING_KEY='', PX_STREAM_OK=true, PX_STREAM_WHY='', PX_LOC_SEQ=0;
 
 async function loadProxyHosts(){
   /* The firewall and Cloudflare live on their own Config pages now, each behind
@@ -1136,7 +1136,6 @@ function pxSyncScheme(){
   const stream=(listen==='tcp'||listen==='udp');
   const show=(id,on)=>{ const el=$(id); if(el) el.hidden=!on; };
   show('px-tls-group', listen==='https');
-  show('px-listen-port-row', stream);
   show('px-behaviour-group', !stream);
   show('px-locations-group', !stream);
   const fs=$('px-forward-scheme-field'); if(fs) fs.hidden=stream;
@@ -1158,56 +1157,6 @@ function pxSyncHsts(){
   if(!hsts||!sub) return;
   sub.disabled=!hsts.checked;
   if(!hsts.checked) sub.checked=false;
-}
-
-async function pxLoadCerts(){
-  const pick=$('px-cert-pick'), keyPick=$('px-key-pick');
-  if(!pick||!keyPick) return;
-  if(!PX_CERTS.length){
-    try{
-      const d=await getJSON('/api/config/proxy/certificates');
-      PX_CERTS=(d&&d.certificates)||[];
-    }catch(e){ PX_CERTS=[]; }
-  }
-  pxFillCertSelects();
-  pxSyncCertSelects();
-}
-/* Exactly one of the two controls holds the path: the dropdown when the file is
-   one this server found, the text field when it is not. Showing the same long
-   path in both is noise, and it leaves no way to tell which one would win. */
-function pxSyncCertSelects(){
-  const match=(selId, pathId)=>{
-    const sel=$(selId), path=$(pathId);
-    if(!sel||!path) return;
-    if(path.value&&Array.from(sel.options).some(o=>o.value===path.value)){
-      sel.value=path.value; path.value='';
-    }else{ sel.value=''; }
-  };
-  match('px-cert-pick','px-cert-path');
-  match('px-key-pick','px-key-path');
-}
-function pxCertValue(which){
-  const typed=($(which==='key'?'px-key-path':'px-cert-path')?.value||'').trim();
-  return typed||($(which==='key'?'px-key-pick':'px-cert-pick')?.value||'');
-}
-function pxFillCertSelects(){
-  const fill=(el, want, label)=>{
-    if(!el) return;
-    const rows=PX_CERTS.filter(c=>c.is_key===want);
-    el.innerHTML=`<option value="">${label}</option>`+
-      rows.map(c=>`<option value="${escAttr(c.path)}">${esc(c.path)}</option>`).join('');
-    if(!rows.length) el.innerHTML=`<option value="">Nothing found on this server, type a path below</option>`;
-  };
-  fill($('px-cert-pick'), false, 'Choose a certificate…');
-  fill($('px-key-pick'), true, 'Choose a key…');
-}
-function proxyPickCert(which){
-  const path=$(which==='key'?'px-key-path':'px-cert-path');
-  if(path) path.value='';
-}
-function proxyTypedCert(which){
-  const sel=$(which==='key'?'px-key-pick':'px-cert-pick');
-  if(sel) sel.value='';
 }
 
 function pxLocationHtml(values){
@@ -1291,31 +1240,32 @@ async function openProxyForm(spec, filename){
   if(title) title.textContent=PX_EDITING?'Edit proxy host':'Add a proxy host';
   const save=$('px-save'); if(save) save.textContent=PX_EDITING?'Save changes':'Add host';
   const fb=$('px-feedback'); if(fb){ fb.textContent=''; fb.className='save-feedback'; }
+  /* The card comes up before its fields are filled: an error while filling
+     must never swallow the open. Worst case the form shows with a value
+     missing, and Cancel recovers from that. */
+  card.hidden=false;
 
   const s=spec||{listen_scheme:'https',forward_scheme:'http',websockets:true,locations:[]};
   pxSetRadio('px-listen', s.listen_scheme||'https');
   pxSetRadio('px-forward-scheme', s.forward_scheme||'http');
   $('px-domain').value=s.domain||'';
-  $('px-listen-port').value=s.listen_port&&(s.listen_scheme==='tcp'||s.listen_scheme==='udp')?s.listen_port:'';
+  $('px-listen-port').value=s.listen_port||'';
   $('px-forward-host').value=s.forward_host||'';
   $('px-forward-port').value=s.forward_port||'';
-  $('px-cert-path').value=s.cert_path||'';
-  $('px-key-path').value=s.cert_key_path||'';
+  PX_EDITING_CERT=s.cert_path||'';
+  PX_EDITING_KEY=s.cert_key_path||'';
   ['force_ssl','hsts','hsts_subdomains','http2','cache_assets','block_exploits','websockets']
     .forEach(f=>pxSetFlag(f, s[f]));
   const wrap=$('px-locations'); if(wrap) wrap.innerHTML='';
   (s.locations||[]).forEach(loc=>addProxyLocation(loc));
 
   pxSyncScheme();
-  card.hidden=false;
   card.scrollIntoView({behavior:'smooth', block:'start'});
-  /* Awaited after the card is on screen, so a slow certificate scan does not
-     hold the form back. It only moves a saved path into the dropdown. */
-  await pxLoadCerts();
 }
 function closeProxyForm(){
   const card=$('px-form-card'); if(card) card.hidden=true;
   PX_EDITING=null;
+  PX_EDITING_CERT=''; PX_EDITING_KEY='';
 }
 function editProxyHost(filename){
   const host=PX_HOSTS.find(h=>h.file===filename);
@@ -1334,12 +1284,12 @@ function pxReadForm(){
   const body={
     domain:$('px-domain').value.trim(),
     listen_scheme:listen,
-    listen_port:stream?(parseInt($('px-listen-port').value||'0',10)||0):0,
+    listen_port:parseInt($('px-listen-port').value||'0',10)||0,
     forward_scheme:stream?'http':pxRadio('px-forward-scheme'),
     forward_host:$('px-forward-host').value.trim(),
     forward_port:parseInt($('px-forward-port').value||'0',10)||0,
-    cert_path:listen==='https'?pxCertValue('cert'):'',
-    cert_key_path:listen==='https'?pxCertValue('key'):'',
+    cert_path:listen==='https'?PX_EDITING_CERT:'',
+    cert_key_path:listen==='https'?PX_EDITING_KEY:'',
     locations:stream?[]:pxReadLocations(),
   };
   ['force_ssl','hsts','hsts_subdomains','http2'].forEach(f=>{ body[f]=listen==='https'&&pxFlag(f); });
@@ -2927,6 +2877,14 @@ async function clearTelegramLog(){
   applyTheme(localStorage.getItem('theme')==='dark');
   document.querySelectorAll('[data-nav]').forEach(b=>b.addEventListener('click',()=>switchSection(b.dataset.nav)));
   const ss=$('svc-search'); if(ss) ss.addEventListener('input',renderServices);
+  /* The Add proxy host button opens the form from an inline onclick. The
+     delegated listener below is the same open through a second mechanism,
+     so the button survives a click even when the attribute is lost,
+     stripped, or never bound. */
+  document.addEventListener('click', ev=>{
+    const hit=ev.target && ev.target.closest ? ev.target.closest('#px-new') : null;
+    if(hit) openProxyForm(null);
+  });
   /* The proxy form reshapes itself around the chosen scheme, and HSTS
      subdomains only mean anything with HSTS on. Bound once here rather than
      inline so the markup stays readable. */
