@@ -26,6 +26,7 @@ import json
 import time
 import stat
 import errno
+import shlex
 import shutil
 import socket
 import getpass
@@ -950,32 +951,47 @@ class PsqlChannel(SQLChannel):
     """Shell out to psql, the route that works when TCP auth does not.
 
     On Debian-likes the postgres superuser is reachable only as the `postgres`
-    OS user over the local socket (peer authentication), so `sudo -u postgres
-    psql` is the canonical bootstrap path and psycopg2 simply cannot get there.
+    OS user over the local socket (peer authentication), so running psql as
+    that user is the canonical bootstrap path and psycopg2 simply cannot get
+    there. That drop can go through sudo, or, when running as root without
+    sudo installed, through runuser or su.
     """
 
     def __init__(self, psql, port, user="postgres", host=None, sudo_user=None,
-                 maintenance_db="postgres"):
+                 runas=None, maintenance_db="postgres"):
         self.psql, self.port = psql, int(port)
         self.user, self.host = user, host
         self.sudo_user = sudo_user
+        self.runas = runas          # ("runuser"|"su", target_os_user)
         self.maintenance_db = maintenance_db
-        via = f"sudo -u {sudo_user} " if sudo_user else ""
+        if sudo_user:
+            via = f"sudo -u {sudo_user} "
+        elif runas:
+            runner, target = runas
+            via = f"{runner} -u {target} " if runner == "runuser" else f"su {target} "
+        else:
+            via = ""
         self.label = f"{via}psql as {user}"
 
     def _full_cmd(self, sql, db=None):
-        cmd = []
+        psql_argv = [self.psql, "-X", "-q", "-A", "-t", "-F", SEP,
+                     "-v", "ON_ERROR_STOP=1"]
+        if self.host:
+            psql_argv += ["-h", self.host]
+        psql_argv += ["-p", str(self.port), "-U", self.user,
+                      "-d", db or self.maintenance_db, "-c", sql]
         if self.sudo_user:
             # -n so a missing sudo ticket fails immediately instead of blocking
             # the wizard on a hidden password prompt.
-            cmd += ["sudo", "-n", "-u", self.sudo_user]
-        cmd += [self.psql, "-X", "-q", "-A", "-t", "-F", SEP,
-                "-v", "ON_ERROR_STOP=1"]
-        if self.host:
-            cmd += ["-h", self.host]
-        cmd += ["-p", str(self.port), "-U", self.user, "-d", db or self.maintenance_db,
-                "-c", sql]
-        return cmd
+            return ["sudo", "-n", "-u", self.sudo_user] + psql_argv
+        if self.runas:
+            runner, target = self.runas
+            if runner == "runuser":
+                return ["runuser", "-u", target, "--"] + psql_argv
+            # su takes one shell string, and busybox su has no runuser
+            return ["su", "-s", "/bin/sh", target, "-c",
+                    " ".join(shlex.quote(a) for a in psql_argv)]
+        return psql_argv
 
     def _run(self, sql, db=None):
         env = dict(os.environ, PGCONNECT_TIMEOUT=str(CONNECT_TIMEOUT))
@@ -1038,6 +1054,14 @@ def _candidate_channels(cfg):
     if psql:
         if sudo_is_cached():
             add(PsqlChannel(psql, port, "postgres", sudo_user="postgres"))
+        # 3b. as root without sudo, runuser/su still drops to the postgres OS
+        #     user, and peer auth does the rest.
+        if is_root():
+            for runner in ("runuser", "su"):
+                if shutil.which(runner):
+                    add(PsqlChannel(psql, port, "postgres",
+                                    runas=(runner, "postgres")))
+                    break
         add(PsqlChannel(psql, port, "postgres"))
         add(PsqlChannel(psql, port, os_user))
     return channels
