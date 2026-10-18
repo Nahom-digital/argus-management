@@ -5,8 +5,7 @@ and temperature, fan speed, battery, RAM, disk, network, private and public IP),
 an in-browser terminal, process/connection views, systemd service control, and a
 security/activity log. It ships as **one easy-to-deploy app**: clone it, run one
 command, answer a few questions, and it's live.
-
-Published at **https://argus.welinkp2p.digital** (nginx → `127.0.0.1:8080`).
+ (nginx → `127.0.0.1:8080`).
 
 ## Quick start
 
