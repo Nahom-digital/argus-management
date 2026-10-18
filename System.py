@@ -2,6 +2,7 @@
 #
 # Supplies the "Server" section of the Main.py control panel:
 #   * static device / OS information (hostname, kernel, CPU model, RAM, boot time…)
+#   * hardware sensors and network identity (CPU temperature, fans, battery, IPs)
 #   * live telemetry (CPU %, per-core, RAM, swap, disk, network in/out bandwidth)
 #   * a root terminal (shell command execution with a persistent working dir)
 #   * the FastAPI launch configuration (host / port) persisted in system_settings
@@ -81,6 +82,11 @@ def static_info():
     except Exception:
         disk_total = 0
 
+    temp = cpu_temp()
+    fans, fan_not_reported = fan_speeds()
+    batt = battery()
+    priv = private_ip() or {}
+
     # Best-effort human-readable CPU model name.
     cpu_model = uname.processor or platform.processor() or ""
     if not cpu_model and os.path.exists("/proc/cpuinfo"):
@@ -104,10 +110,18 @@ def static_info():
         "cpu_cores_physical": psutil.cpu_count(logical=False) or 0,
         "cpu_cores_logical": psutil.cpu_count(logical=True) or 0,
         "cpu_max_mhz": max_mhz,
+        "cpu_temp_c": round(temp["c"], 1) if temp else None,
+        "cpu_temp_label": temp["label"] if temp else "",
         "ram_total": vm.total,
         "ram_total_h": _human_bytes(vm.total),
         "disk_total": disk_total,
         "disk_total_h": _human_bytes(disk_total),
+        "fans": fans,
+        "fan_not_reported": fan_not_reported,
+        "battery": batt,
+        "private_ip": priv.get("ip", ""),
+        "private_ip_iface": priv.get("iface", ""),
+        "public_ip": public_ip(),
         "python": platform.python_version(),
         "boot_time": datetime.fromtimestamp(boot).strftime("%Y-%m-%d %H:%M:%S"),
         "uptime_seconds": int(time.time() - boot),
@@ -144,6 +158,271 @@ def _is_root():
         return os.geteuid() == 0
     except AttributeError:
         return False
+
+
+# --- Hardware sensors and network identity ------------------------------------
+# Laptop-class facts the Server card can show when the machine has them, and
+# stays quiet about when it does not: CPU temperature, fan tachometers,
+# battery charge, and the two addresses the box answers to. Everything here is
+# a read of sysfs, /proc or the routing table, so it never changes state and
+# degrades to None on hardware that does not publish it.
+
+FAN_NOT_REPORTED = 0xFFFF   # a ThinkPad EC reports this when the tach is unreadable
+
+_CACHE_PUBLIC_IP_TTL = 600  # seconds an answer stays fresh; the address rarely moves
+_public_ip = {"value": "", "t": 0.0, "busy": False}
+
+
+def _read_int(path):
+    """Integer contents of a sysfs file, or None when unreadable or not a number."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def cpu_temp(hwmon="/sys/class/hwmon", thermal="/sys/class/thermal"):
+    """Best available CPU temperature as {"c": celsius, "label": source}.
+
+    hwmon chips that sit on the CPU itself (coretemp, k10temp, zenpower,
+    cpu_thermal) win over acpitz, the generic ACPI zone that reads a little
+    off the die. thermal_zone entries are the last resort for boards that
+    publish nothing in hwmon. None when no sensor is readable.
+    """
+    try:
+        chips = sorted(os.listdir(hwmon))
+    except OSError:
+        chips = []
+    ranked = []
+    for chip in chips:
+        root = os.path.join(hwmon, chip)
+        name = ""
+        try:
+            with open(os.path.join(root, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            pass
+        low = name.lower()
+        if low in ("coretemp", "k10temp", "zenpower", "cpu_thermal"):
+            ranked.append((0, root, name))
+        elif low == "acpitz":
+            ranked.append((1, root, name))
+    for _, root, name in sorted(ranked):
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not (entry.startswith("temp") and entry.endswith("_input")):
+                continue
+            val = _read_int(os.path.join(root, entry))
+            if val is not None and 0 < val < 150000:
+                return {"c": val / 1000.0, "label": name or entry}
+    try:
+        zones = sorted(os.listdir(thermal))
+    except OSError:
+        zones = []
+    for zone in zones:
+        if not zone.startswith("thermal_zone"):
+            continue
+        val = _read_int(os.path.join(thermal, zone, "temp"))
+        if val is not None and 0 < val < 150000:
+            label = ""
+            try:
+                with open(os.path.join(thermal, zone, "type")) as f:
+                    label = f.read().strip()
+            except OSError:
+                pass
+            return {"c": val / 1000.0, "label": label or zone}
+    return None
+
+
+def _thinkpad_fan_rpm(path="/proc/acpi/ibm/fan"):
+    """Fan speed in RPM from the ThinkPad ACPI interface, or None."""
+    try:
+        with open(path) as f:
+            for line in f:
+                key, _, val = line.partition(":")
+                if key.strip() == "speed" and val.strip().isdigit():
+                    return int(val.strip())
+    except OSError:
+        pass
+    return None
+
+
+def fan_speeds(hwmon="/sys/class/hwmon", thinkpad="/proc/acpi/ibm/fan"):
+    """([{"rpm", "label", "percent"}, ...], not_reported) for every fan.
+
+    Every fan*_input in hwmon is used; its fan*_label names it and its
+    fan*_max turns the reading into a percent when the sensor publishes one.
+    The ThinkPad ACPI tachometer is the fallback for models without a hwmon
+    fan attribute. not_reported is True when a sensor is present but answers
+    only with the 0xFFFF sentinel, which is a hardware fault, not a speed.
+    """
+    readings = []
+    not_reported = False
+    try:
+        chips = sorted(os.listdir(hwmon))
+    except OSError:
+        chips = []
+    for chip in chips:
+        root = os.path.join(hwmon, chip)
+        name = ""
+        try:
+            with open(os.path.join(root, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            pass
+        try:
+            entries = [e for e in sorted(os.listdir(root))
+                       if e.startswith("fan") and e.endswith("_input")]
+        except OSError:
+            entries = []
+        for entry in entries:
+            rpm = _read_int(os.path.join(root, entry))
+            if rpm is None:
+                continue
+            if rpm == FAN_NOT_REPORTED:
+                not_reported = True
+                continue
+            stem = entry[: -len("_input")]          # fan1_input -> fan1
+            label = name or "fan"
+            try:
+                with open(os.path.join(root, stem + "_label")) as f:
+                    label = f.read().strip() or label
+            except OSError:
+                pass
+            percent = None
+            max_rpm = _read_int(os.path.join(root, stem + "_max"))
+            if max_rpm is not None and max_rpm > 0:
+                percent = min(100, round(100.0 * rpm / max_rpm))
+            readings.append({"rpm": rpm, "label": label, "percent": percent})
+    if not readings:
+        rpm = _thinkpad_fan_rpm(thinkpad)
+        if rpm is not None:
+            if rpm == FAN_NOT_REPORTED:
+                not_reported = True
+            else:
+                readings.append({"rpm": rpm, "label": "thinkpad", "percent": None})
+    return readings, not_reported
+
+
+def battery(base="/sys/class/power_supply"):
+    """{"percent": int, "state": str} of the first battery, or None."""
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.upper().startswith("BAT"):
+            continue
+        root = os.path.join(base, entry)
+        cap = _read_int(os.path.join(root, "capacity"))
+        if cap is None:
+            continue
+        state = ""
+        try:
+            with open(os.path.join(root, "status")) as f:
+                state = f.read().strip()
+        except OSError:
+            pass
+        return {"percent": cap, "state": state}
+    return None
+
+
+def private_ip():
+    """{"ip": str, "iface": str} the default route would carry, or None.
+
+    No packet is sent: the UDP connect only asks the kernel which local
+    address a route to the outside would use, which is the one a remote peer
+    sees as the source. The interface name is looked up through psutil when
+    it is available.
+    """
+    import socket
+    ip = None
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("1.1.1.1", 80))
+        ip = sock.getsockname()[0]
+    except OSError:
+        ip = None
+    finally:
+        if sock:
+            sock.close()
+    if not ip:
+        return None
+    iface = ""
+    try:
+        import psutil
+        for name, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if getattr(addr, "family", None) == socket.AF_INET and addr.address == ip:
+                    iface = name
+                    break
+            if iface:
+                break
+    except Exception:
+        pass
+    return {"ip": ip, "iface": iface}
+
+
+def _fetch_public_ip(timeout=7):
+    """Ask an outside service for this server's public address, or None.
+
+    Behind NAT the local interfaces cannot answer this, so it has to come
+    from beyond the router. Cloudflare's trace echo is tried first, then two
+    plain IP echoes, and the first parseable answer wins.
+    """
+    import urllib.request
+    attempts = (
+        ("https://cloudflare.com/cdn-cgi/trace", True),
+        ("https://api.ipify.org", False),
+        ("https://ifconfig.me/ip", False),
+    )
+    for url, parse_trace in attempts:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "argus-management"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                text = resp.read(4096).decode("utf-8", "replace")
+        except Exception:
+            continue
+        if parse_trace:
+            for line in text.splitlines():
+                if line.startswith("ip="):
+                    return line[3:].strip() or None
+            continue
+        text = text.strip()
+        if text:
+            return text
+    return None
+
+
+def public_ip():
+    """Last known public IP, refreshed in the background when it goes stale.
+
+    The lookup leaves the machine and can take seconds, far too long to sit
+    inside a request handler, so a request only ever reads the cache and the
+    first caller after the TTL kicks off a daemon thread to refill it.
+    """
+    import threading
+    cache = _public_ip
+    fresh = cache["value"] and time.time() - cache["t"] < _CACHE_PUBLIC_IP_TTL
+    if not fresh and not cache["busy"]:
+        cache["busy"] = True
+
+        def refresh():
+            try:
+                found = _fetch_public_ip()
+                if found:
+                    cache["value"] = found
+                    cache["t"] = time.time()
+            finally:
+                cache["busy"] = False
+
+        threading.Thread(target=refresh, daemon=True).start()
+    return cache["value"]
 
 
 def live_stats():

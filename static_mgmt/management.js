@@ -337,16 +337,32 @@ function renderRecoveryCodes(codes){
 /* ================= SERVER ================= */
 const HIST_LEN=40;
 let cpuHist=[],ramHist=[],netInHist=[],netOutHist=[];
-let serverPollTimer=null, serverStaticLoaded=false;
+let serverPollTimer=null, serverStaticTimer=null, serverStaticLoaded=false;
 
 function startServerPolling(){
   if(!serverStaticLoaded) loadServerStatic();
   pollServerStats();
   if(serverPollTimer) clearInterval(serverPollTimer);
   serverPollTimer=setInterval(pollServerStats,1500);
+  // Temperature, fan, battery and the IPs move, so the grid is re-read on a
+  // slow clock. One request feeds both the static rows and the moving ones.
+  if(serverStaticTimer) clearInterval(serverStaticTimer);
+  serverStaticTimer=setInterval(loadServerStatic,15000);
 }
-function stopServerPolling(){ if(serverPollTimer){ clearInterval(serverPollTimer); serverPollTimer=null; } }
+function stopServerPolling(){
+  if(serverPollTimer){ clearInterval(serverPollTimer); serverPollTimer=null; }
+  if(serverStaticTimer){ clearInterval(serverStaticTimer); serverStaticTimer=null; }
+}
 
+function fanText(d){
+  if(d.fans&&d.fans.length){
+    return d.fans.map(function(f){
+      return f.percent!=null?f.rpm+' RPM ('+f.percent+'% of max, '+f.label+')':f.rpm+' RPM ('+f.label+')';
+    }).join(' · ');
+  }
+  if(d.fan_not_reported) return 'n/a (sensor hardware fault)';
+  return 'no sensor';
+}
 async function loadServerStatic(){
   try{
     const r=await api('/api/system/static'); if(!r||!r.ok) return; const d=await r.json();
@@ -354,7 +370,13 @@ async function loadServerStatic(){
       ['Hostname',d.hostname],['Operating System',d.distro],['OS Detail',d.os_full],
       ['Kernel',d.kernel],['Architecture',d.arch],['CPU',d.cpu_model],
       ['CPU Cores',`${d.cpu_cores_physical} physical / ${d.cpu_cores_logical} logical`+(d.cpu_max_mhz?` @ ${(d.cpu_max_mhz/1000).toFixed(2)} GHz`:'')],
-      ['Total RAM',d.ram_total_h],['Total Disk',d.disk_total_h],['Python',d.python],
+      ['CPU Temp',d.cpu_temp_c!=null?`${d.cpu_temp_c.toFixed(0)}°C (${d.cpu_temp_label||'sensor'})`:'no sensor'],
+      ['Fan',fanText(d)],
+      ['Total RAM',d.ram_total_h],['Total Disk',d.disk_total_h],
+      ['Battery',d.battery?`${d.battery.percent}% (${d.battery.state||'unknown'})`:'none present'],
+      ['IP Private',d.private_ip?d.private_ip+(d.private_ip_iface?` (${d.private_ip_iface})`:''):'none'],
+      ['IP Public',d.public_ip||'checking'],
+      ['Python',d.python],
       ['Booted',d.boot_time],['Uptime',fmtUptime(d.uptime_seconds)],
       ['Process',`pid ${d.process_pid} as ${d.process_user}`+(d.is_root?' (root)':'')],
     ];
