@@ -2459,6 +2459,8 @@ USAGE = """
     python3 management.py             run the setup wizard, then start the panel
     python3 management.py --service   install + start the systemd service, then exit
     python3 management.py --upgrade   git pull the latest code, then restart the service
+    python3 management.py --update    re-check and update the system structure: dependencies,
+                                      database tables, config, service
     python3 management.py --serve     run in the foreground from deploy.json
     python3 management.py --status    show configuration / database / service status
     python3 management.py --recovery-codes
@@ -2480,6 +2482,12 @@ def main():
         sys.exit(recovery_codes_mode())
     if "--upgrade" in args:
         sys.exit(upgrade_mode())
+    if "--update" in args:
+        # The structural refresh the wizard performs: dependencies, PostgreSQL
+        # reachability, database tables, config files, and the service. It never
+        # touches the code or the data itself.
+        wizard()
+        return
     if "--service" in args:
         service_mode()
         return

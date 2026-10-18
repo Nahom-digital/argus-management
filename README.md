@@ -51,6 +51,7 @@ wizard over an existing install is safe, every step is idempotent.
 python3 management.py             # setup wizard, then run
 python3 management.py --service   # install + start the systemd service, then exit
 python3 management.py --upgrade   # git pull the latest code, then restart the service
+python3 management.py --update    # re-check and update the system structure: dependencies, tables, config, service
 python3 management.py --serve     # run in the foreground from deploy.json
 python3 management.py --status    # config / dependency / database / service report
 python3 management.py --recovery-codes   # mint new single-use recovery codes
