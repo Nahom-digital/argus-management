@@ -233,7 +233,7 @@ Environment variables (`DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`
 
 ## Reverse proxy
 
-nginx serves the panel at the root of `argus.welinkp2p.digital` and proxies to the
+nginx serves the panel at the root of `domain.com` and proxies to the
 loopback port, forwarding websocket upgrades for the in-browser terminal. Set
 `base_path` to `""` when serving from a subdomain root, or to e.g. `/management` when
 mounting under a path on a shared host.
