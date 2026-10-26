@@ -467,6 +467,8 @@ function drawLineChart(id,series,max,colors){
    scoped to their own home was being shown "outside your permitted area"
    because the browser asked for the root of the filesystem first. */
 let _srvDetailKind=null, _fbPath='', _accessDetailId=null;
+let _uploadQueue=[], _uploadActive=false, _uploadCancelled=false, _uploadXhr=null;
+let _uploadFolder='', _uploadStopResolve=null;
 let _ipDetailTarget=null, _ipProfileData=null, _lineDetailObj=null, _lineDetailTitle='';
 const _SRV_TITLES={cpu:'CPU: Top Processes',mem:'Memory: Top Processes',net:'Network: Active Connections',disk:'Disk: File Browser'};
 /* Which grant each drill-down needs. The server refuses without it either way;
@@ -581,6 +583,11 @@ function fileBrowserName(e){
   }
   return `<span class="fb-name" title="${escAttr(name)}"><svg class="ic" style="color:var(--gray-400)"><use href="#ic-file-text"/></svg>${label}</span>`;
 }
+function fileFormat(e){
+  if(e.is_dir) return 'Folder';
+  const name=String(e.name==null?'':e.name);
+  return fileNameParts(name)[1] || 'No ext';
+}
 async function browseDir(path){
   _fbPath=path; const b=$('srv-detail-body'); b.innerHTML='<div class="empty-state">Loading folder…</div>';
   try{
@@ -593,10 +600,11 @@ async function browseDir(path){
     const up=d.parent?`<div class="fb-row"><span class="fb-name dir" data-path="${escAttr(d.parent)}" onclick="browseDir(this.dataset.path)">↩ ..</span></div>`:'';
     const rows=(d.entries||[]).map(e=>{
       const name=fileBrowserName(e);
+      const format=fileFormat(e);
       const dl=e.is_dir?'':(e.downloadable?`<a class="fb-dl" href="${BASE}/api/system/download?path=${encodeURIComponent(e.path)}" style="display:inline-flex;align-items:center;gap:4px;"><svg class="ic"><use href="#ic-download"/></svg> Download</a>`:`<span class="fb-locked">protected</span>`);
       const canDelete=!!(window.MGMT_PERMS&&MGMT_PERMS.disk_delete)&&!e.is_dir&&e.deletable;
       const del=canDelete?`<button class="db-action-btn" style="color:var(--danger);" onclick="deleteFile('${escAttr(e.path)}')"><svg class="ic"><use href="#ic-trash-2"/></svg></button>`:'';
-      return `<div class="fb-row">${name}<span class="fb-size">${esc(e.size_h)}</span><span class="fb-dl" style="display:inline-flex;gap:8px;align-items:center;">${dl}${del}</span></div>`;
+      return `<div class="fb-row">${name}<span class="fb-size">${esc(e.size_h)}</span><span class="fb-format${e.is_dir?' dir':''}">${esc(format)}</span><span class="fb-dl" style="display:inline-flex;gap:8px;align-items:center;">${dl}${del}</span></div>`;
     }).join('');
     b.innerHTML=`<div class="fb-crumbs">${esc(d.path)}</div>${up}${rows||'<div class="empty-state">Empty folder.</div>'}`;
   }catch(e){ b.innerHTML=`<div class="empty-state">Failed: ${esc(String(e))}</div>`; }
@@ -614,32 +622,252 @@ function pickUploadFile(){
   const input=$('fb-upload-input');
   if(input) input.click();
 }
-async function uploadFile(input){
-  const file=input.files&&input.files[0];
-  input.value='';
-  if(!file) return;
-  const btn=$('srv-upload-btn');
-  const original=btn?btn.innerHTML:'';
-  if(btn){
-    btn.disabled=true;
-    btn.innerHTML='<svg class="ic"><use href="#ic-upload"/></svg>Uploading…';
+function fmtBytes(n){
+  n=Number(n)||0;
+  if(n<1024) return Math.round(n)+' B';
+  const units=['KB','MB','GB','TB'];
+  let i=-1;
+  do{ n/=1024; i++; }while(n>=1024 && i<units.length-1);
+  return n.toFixed(1)+' '+units[i];
+}
+function uploadStatusText(item){
+  if(item.status==='waiting') return 'Waiting';
+  if(item.status==='uploading') return item.progress>=100?'Saving…':'Uploading '+(item.progress||0)+'%';
+  if(item.status==='uploaded') return 'Uploaded';
+  if(item.status==='failed') return 'Failed';
+  if(item.status==='stopped') return 'Stopped';
+  return '';
+}
+function updateUploadRow(item){
+  const row=$('upload-row-'+item.id);
+  if(!row) return;
+  row.dataset.status=item.status;
+  const pct=Math.max(0,Math.min(100,item.progress||0));
+  const bar=$('upload-bar-'+item.id);
+  if(bar) bar.style.width=pct+'%';
+  const track=$('upload-track-'+item.id);
+  if(track) track.setAttribute('aria-valuenow',String(Math.round(pct)));
+  const status=$('upload-status-'+item.id);
+  if(status) status.textContent=uploadStatusText(item);
+  const err=$('upload-error-'+item.id);
+  if(err){
+    err.textContent=item.status==='failed'&&item.error?item.error:'';
+    err.hidden=!err.textContent;
   }
-  try{
-    const r=await api('/api/system/upload?path='+encodeURIComponent(_fbPath||'')+
-      '&name='+encodeURIComponent(file.name),{method:'POST',body:file});
-    if(!r) return;
-    const d=await r.json().catch(()=>({}));
-    if(!r.ok){
-      const fallback=r.status===413?'That file is larger than the server allows.':'Upload failed';
-      appToast(d.error||fallback,'err');
-      return;
+  row.title=item.error||'';
+}
+function updateUploadSummary(){
+  if(!_uploadQueue.length) return;
+  const total=_uploadQueue.length;
+  const done=_uploadQueue.filter(i=>i.status==='uploaded').length;
+  const failed=_uploadQueue.filter(i=>i.status==='failed').length;
+  const stopped=_uploadQueue.filter(i=>i.status==='stopped').length;
+  const totalBytes=_uploadQueue.reduce((s,i)=>s+(i.size||0),0);
+  const moved=_uploadQueue.reduce((s,i)=>s+(i.status==='uploaded'?(i.size||0):(i.loaded||0)),0);
+  const pct=totalBytes?Math.min(100,Math.round(moved/totalBytes*100)):Math.round(done/total*100);
+  const bar=$('upload-overall-bar');
+  if(bar) bar.style.width=pct+'%';
+  const meter=$('upload-overall-meter');
+  if(meter) meter.setAttribute('aria-valuenow',String(pct));
+  let text=`${done} of ${total} uploaded`;
+  if(failed) text+=`, ${failed} failed`;
+  if(stopped) text+=`, ${stopped} stopped`;
+  const summary=$('upload-overall-text');
+  if(summary) summary.textContent=text;
+  const title=$('upload-title');
+  if(title){
+    if(_uploadActive) title.textContent=total===1?'Uploading file':`Uploading ${total} files`;
+    else if(failed) title.textContent='Uploads finished with errors';
+    else if(stopped) title.textContent='Uploads stopped';
+    else title.textContent='Uploads finished';
+  }
+  const sub=$('upload-sub');
+  if(sub){
+    if(_uploadActive){
+      const current=_uploadQueue.find(i=>i.status==='uploading');
+      sub.textContent=current?(current.progress>=100?`Saving ${current.name}`:`Uploading ${current.name}`):'Preparing…';
+    }else if(failed){
+      sub.textContent='Some files did not upload.';
+    }else if(stopped){
+      sub.textContent='The remaining uploads were stopped.';
+    }else{
+      sub.textContent='All uploads finished.';
     }
-    appToast('Uploaded '+file.name,'ok');
-    await browseDir(_fbPath);
-  }catch(e){ appToast('Upload failed: '+e,'err'); }
-  finally{
-    if(btn){ btn.disabled=false; btn.innerHTML=original; }
   }
+  const overall=$('upload-overall');
+  if(overall) overall.dataset.state=_uploadActive?'active':failed?'failed':stopped?'stopped':'done';
+  const note=$('upload-foot-note');
+  if(note) note.textContent=_uploadActive
+    ?'Keep this panel open while files upload. Closing it asks before stopping the queue.'
+    :'Files that finished uploading stay on the server.';
+}
+function renderUploadList(){
+  const list=$('upload-list');
+  if(!list) return;
+  list.innerHTML=_uploadQueue.map((item,i)=>{
+    const parts=fileNameParts(item.name);
+    return `<div class="upload-row" id="upload-row-${i}" data-status="waiting">
+      <div class="upload-file">
+        <svg class="ic"><use href="#ic-file-text"/></svg>
+        <div class="upload-copy">
+          <div class="upload-name" title="${escAttr(item.name)}"><span class="fb-stem">${esc(parts[0])}</span>${parts[1]?`<span class="fb-ext">${esc(parts[1])}</span>`:''}</div>
+          <div class="upload-size">${esc(fmtBytes(item.size))}</div>
+          <div class="upload-error" id="upload-error-${i}" hidden></div>
+        </div>
+      </div>
+      <div class="upload-track" id="upload-track-${i}" role="progressbar" aria-label="Upload progress for ${escAttr(item.name)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="upload-bar" id="upload-bar-${i}"></div></div>
+      <div class="upload-status" id="upload-status-${i}">Waiting</div>
+    </div>`;
+  }).join('');
+}
+function startUploads(files, folder){
+  if(_uploadActive){ appToast('An upload is already running.','err'); return; }
+  const chosen=Array.from(files||[]);
+  if(!chosen.length) return;
+  const overlay=$('upload-overlay');
+  if(!overlay){ appToast('The upload panel is missing. Reload the page.','err'); return; }
+  _uploadQueue=chosen.map((file,i)=>({
+    id:i, file, name:file.name, size:file.size,
+    status:'waiting', progress:0, loaded:0, error:''
+  }));
+  _uploadFolder=folder||'';
+  _uploadCancelled=false;
+  _uploadActive=true;
+  $('upload-title').textContent=chosen.length===1?'Uploading file':`Uploading ${chosen.length} files`;
+  $('upload-sub').textContent='Preparing…';
+  $('upload-overall-bar').style.width='0%';
+  $('upload-overall-meter').setAttribute('aria-valuenow','0');
+  $('upload-overall-text').textContent=`0 of ${chosen.length} uploaded`;
+  $('upload-overall').dataset.state='active';
+  renderUploadList();
+  overlay.classList.add('open');
+  overlay.setAttribute('aria-hidden','false');
+  updateUploadSummary();
+  setTimeout(()=>{ const b=$('upload-close-btn'); if(b) b.focus(); },0);
+  runUploadQueue();
+}
+function uploadOne(item, folder, onProgress){
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();
+    _uploadXhr=xhr;
+    xhr.open('POST', BASE+'/api/system/upload?path='+encodeURIComponent(folder||'')+
+      '&name='+encodeURIComponent(item.name));
+    xhr.upload.onprogress=(e)=>{
+      if(!e.lengthComputable) return;
+      const total=e.total||item.size||1;
+      item.loaded=e.loaded;
+      item.progress=Math.min(100,Math.round(e.loaded/total*100));
+      onProgress();
+    };
+    xhr.onload=()=>{
+      let data={};
+      try{ data=JSON.parse(xhr.responseText||'{}'); }catch(_){ }
+      if(xhr.status>=200&&xhr.status<300){ resolve(data); return; }
+      if(xhr.status===401) location.href=BASE+'/login';
+      reject({status:xhr.status,error:data.error||''});
+    };
+    xhr.onerror=()=>reject({status:0,error:'Network error. Check your connection.'});
+    xhr.onabort=()=>reject({aborted:true});
+    xhr.onloadend=()=>{ if(_uploadXhr===xhr) _uploadXhr=null; };
+    try{ xhr.send(item.file); }
+    catch(e){ if(_uploadXhr===xhr) _uploadXhr=null; reject(e); }
+  });
+}
+async function runUploadQueue(){
+  for(const item of _uploadQueue){
+    if(_uploadCancelled) break;
+    if(item.status!=='waiting') continue;
+    item.status='uploading';
+    item.progress=0;
+    item.loaded=0;
+    item.error='';
+    updateUploadRow(item);
+    updateUploadSummary();
+    try{
+      await uploadOne(item, _uploadFolder, ()=>{ updateUploadRow(item); updateUploadSummary(); });
+      item.status='uploaded';
+      item.progress=100;
+      item.loaded=item.size;
+    }catch(e){
+      if(e&&e.aborted){ item.status='stopped'; }
+      else{
+        let message=(e&&e.error)||'';
+        if(!message&&e&&e.status===413) message='That file is larger than the server allows.';
+        if(!message&&e&&e.status===409) message='A file with that name already exists.';
+        if(!message&&e&&e.status===403) message='You do not have permission to upload here.';
+        item.status='failed';
+        item.error=message||'Upload failed';
+      }
+    }
+    updateUploadRow(item);
+    updateUploadSummary();
+  }
+  if(_uploadCancelled){
+    _uploadQueue.forEach(i=>{
+      if(i.status==='waiting'){ i.status='stopped'; updateUploadRow(i); }
+    });
+  }
+  const wasCancelled=_uploadCancelled;
+  _uploadActive=false;
+  _uploadCancelled=false;
+  _uploadXhr=null;
+  updateUploadSummary();
+  if(_srvDetailKind==='disk') await browseDir(_uploadFolder||_fbPath);
+  const done=_uploadQueue.filter(i=>i.status==='uploaded').length;
+  const failed=_uploadQueue.filter(i=>i.status==='failed').length;
+  if(wasCancelled) appToast('Upload stopped','info');
+  else if(done&&!failed) appToast(done===1?'File uploaded':`${done} files uploaded`,'ok');
+  else if(done&&failed) appToast(`${done} uploaded, ${failed} failed`,'info');
+  else if(failed) appToast('Upload failed','err');
+}
+function stopUploads(){
+  _uploadCancelled=true;
+  if(_uploadXhr){ try{ _uploadXhr.abort(); }catch(_){ } }
+}
+function confirmStopUpload(){
+  if(_uploadStopResolve) return Promise.resolve(false);
+  const waiting=_uploadQueue.filter(i=>i.status==='waiting'||i.status==='uploading').length;
+  const done=_uploadQueue.filter(i=>i.status==='uploaded').length;
+  const msg=$('upload-stop-msg');
+  if(msg){
+    let text=waiting===1?'1 file is still uploading or waiting.':`${waiting} files are still uploading or waiting.`;
+    if(done) text+=done===1?' 1 file has already uploaded and will stay on the server.':` ${done} files have already uploaded and will stay on the server.`;
+    msg.textContent=text+'\n\nStop the remaining uploads?';
+  }
+  const overlay=$('upload-stop-overlay');
+  if(overlay){ overlay.classList.add('open'); overlay.setAttribute('aria-hidden','false'); }
+  return new Promise(resolve=>{
+    _uploadStopResolve=resolve;
+    setTimeout(()=>{ const b=document.querySelector('#upload-stop-overlay .app-modal-btn'); if(b) b.focus(); },0);
+  });
+}
+function resolveUploadStop(yes){
+  const overlay=$('upload-stop-overlay');
+  if(overlay){ overlay.classList.remove('open'); overlay.setAttribute('aria-hidden','true'); }
+  const resolve=_uploadStopResolve;
+  _uploadStopResolve=null;
+  if(resolve) resolve(!!yes);
+  if(!yes) setTimeout(()=>{ const b=$('upload-close-btn'); if(b) b.focus(); },0);
+}
+function hideUploadPanel(){
+  const overlay=$('upload-overlay');
+  if(overlay){ overlay.classList.remove('open'); overlay.setAttribute('aria-hidden','true'); }
+  const btn=$('srv-upload-btn');
+  if(btn&&!btn.hidden) btn.focus();
+}
+async function closeUploadPanel(){
+  if(_uploadActive){
+    const stop=await confirmStopUpload();
+    if(!stop) return;
+    stopUploads();
+  }
+  hideUploadPanel();
+}
+function uploadFile(input){
+  const files=Array.from(input.files||[]);
+  input.value='';
+  if(!files.length) return;
+  startUploads(files, _fbPath||'');
 }
 function openAccessDetail(id){ _srvDetailKind='access'; _accessDetailId=id;
   $('srv-detail-title').textContent='Request / Response'; $('srv-detail-overlay').classList.add('open'); renderAccessDetail(); }

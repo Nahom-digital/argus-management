@@ -181,8 +181,11 @@ Four things worth knowing about how this is enforced:
   hidden temporary file in the browsed folder, then given its real name only
   after the whole body has arrived. An existing name is refused. Staff
   accounts cannot upload into root's home or the protected system trees,
-  because the panel writes as root. A single upload is capped at 1 GB, and any
-  proxy in front of the panel needs a matching request-body limit.
+  because the panel writes as root. The browser can queue several files at
+  once and shows each one's progress in a panel that closes only after a
+  confirmation while work remains. The file list prints the format beside the
+  size. A single upload is capped at 1 GB, and any proxy in front of the panel
+  needs a matching request-body limit.
 - **Revocation is per account.** Resetting one staff password, or taking a grant
   away, signs out that person on their next request and nobody else.
 

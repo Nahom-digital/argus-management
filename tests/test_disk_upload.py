@@ -176,7 +176,7 @@ def test_the_dashboard_has_an_upload_button_left_of_refresh(client):
         page.index('onclick="refreshServerDetail()"')
 
 
-def test_the_file_browser_keeps_the_suffix_visible():
+def test_the_file_browser_keeps_the_suffix_visible_and_shows_its_format():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, "static_mgmt", "management.js"),
               encoding="utf-8") as fh:
@@ -186,3 +186,31 @@ def test_the_file_browser_keeps_the_suffix_visible():
         css = fh.read()
     assert "fb-stem" in js and "fb-ext" in js
     assert ".fb-stem" in css and "text-overflow:ellipsis" in css
+    assert "function fileFormat" in js
+    row = next(line for line in js.splitlines()
+               if '<div class="fb-row">${name}' in line)
+    assert row.index("fb-size") < row.index("fb-format") < row.index("fb-dl")
+    assert ".fb-format" in css
+
+
+def test_the_dashboard_has_a_multi_file_upload_queue(client):
+    _sign_in(client, "admin")
+    page = client.get("/").text
+    assert 'id="fb-upload-input" hidden multiple' in page
+    assert 'id="upload-overlay"' in page
+    assert 'id="upload-list"' in page
+    assert 'id="upload-stop-overlay"' in page
+    assert "Yes, stop upload" in page
+
+
+def test_the_upload_panel_uses_real_progress_and_can_abort():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static_mgmt", "management.js"),
+              encoding="utf-8") as fh:
+        js = fh.read()
+    assert "XMLHttpRequest" in js
+    assert "xhr.upload.onprogress" in js
+    assert "_uploadXhr.abort()" in js
+    assert "function runUploadQueue" in js
+    assert "function confirmStopUpload" in js
+    assert "function closeUploadPanel" in js

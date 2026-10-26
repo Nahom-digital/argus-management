@@ -1556,10 +1556,41 @@ _PANES_TEMPLATE = """
     <div id="srv-detail-head"><span id="srv-detail-title">Detail</span>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
         <button class="db-action-btn" id="srv-upload-btn" onclick="pickUploadFile()" hidden><svg class="ic"><use href="#ic-upload"/></svg>Upload</button>
-        <input type="file" id="fb-upload-input" hidden onchange="uploadFile(this)">
+        <input type="file" id="fb-upload-input" hidden multiple onchange="uploadFile(this)">
         <button class="db-action-btn" onclick="refreshServerDetail()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
         <button class="db-action-btn" onclick="closeServerDetail()"><svg class="ic"><use href="#ic-x"/></svg>Close</button></div></div>
     <div id="srv-detail-body"></div>
+  </div>
+</div>
+
+<div id="upload-overlay" aria-hidden="true">
+  <div id="upload-modal" role="dialog" aria-modal="true" aria-labelledby="upload-title">
+    <div id="upload-head">
+      <div id="upload-head-copy">
+        <div id="upload-title">Uploads</div>
+        <div id="upload-sub">Preparing&hellip;</div>
+      </div>
+      <button class="db-action-btn" id="upload-close-btn" onclick="closeUploadPanel()"><svg class="ic"><use href="#ic-x"/></svg>Close</button>
+    </div>
+    <div id="upload-overall" data-state="active">
+      <div class="upload-meter" id="upload-overall-meter" role="progressbar" aria-label="Overall upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="upload-overall-bar"></div>
+      </div>
+      <div id="upload-overall-text">0 of 0 uploaded</div>
+    </div>
+    <div id="upload-list"></div>
+    <div id="upload-foot"><span id="upload-foot-note">Keep this panel open while files upload. Closing it asks before stopping the queue.</span></div>
+  </div>
+</div>
+
+<div id="upload-stop-overlay" class="app-modal-overlay" aria-hidden="true">
+  <div class="app-modal" role="alertdialog" aria-modal="true" aria-labelledby="upload-stop-title">
+    <div class="app-modal-title" id="upload-stop-title">Stop uploading?</div>
+    <div class="app-modal-msg" id="upload-stop-msg">Some files are still uploading.</div>
+    <div class="app-modal-btns">
+      <button class="app-modal-btn" onclick="resolveUploadStop(false)">Keep uploading</button>
+      <button class="app-modal-btn danger" onclick="resolveUploadStop(true)">Yes, stop upload</button>
+    </div>
   </div>
 </div>
 """
