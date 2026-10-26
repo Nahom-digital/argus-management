@@ -1554,7 +1554,7 @@ _PANES_TEMPLATE = """
 <div id="srv-detail-overlay" onclick="if(event.target===this)closeServerDetail()">
   <div id="srv-detail-modal">
     <div id="srv-detail-head"><span id="srv-detail-title">Detail</span>
-      <div style="display:flex;gap:8px;align-items:center;">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
         <button class="db-action-btn" id="srv-upload-btn" onclick="pickUploadFile()" hidden><svg class="ic"><use href="#ic-upload"/></svg>Upload</button>
         <input type="file" id="fb-upload-input" hidden onchange="uploadFile(this)">
         <button class="db-action-btn" onclick="refreshServerDetail()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
