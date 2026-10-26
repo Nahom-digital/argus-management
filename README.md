@@ -148,7 +148,7 @@ unlock.
 
 ### Permissions
 
-There are fifteen grants, defined in one place: the `PERMISSIONS` registry in
+There are eighteen grants, defined in one place: the `PERMISSIONS` registry in
 `panel_users.py`. That registry is what validates a submitted permission set,
 what the request path reads when it decides whether to answer, and what the
 admin's form is generated from. Building the form from the same definition the
@@ -158,7 +158,7 @@ endpoint honours, or an endpoint gated on something the admin cannot grant.
 | group | grants |
 |-------|--------|
 | Terminal | none, own account only, or root |
-| Disk | reach nothing / their own files / the whole filesystem, plus download and delete as separate switches |
+| Disk | reach nothing / their own files / the whole filesystem, plus download, upload and delete as separate switches |
 | Database | read tables, change rows, view the change log |
 | Network | connection detail in the Server section, manage proxy hosts, manage firewall settings |
 | CPU and memory | the top-process lists behind both meters |
@@ -169,7 +169,7 @@ Adding a permission means adding one line to the registry and one check at its
 endpoint. Nothing else needs a migration, because grants are stored as a single
 normalized JSON object per account.
 
-Three things worth knowing about how this is enforced:
+Four things worth knowing about how this is enforced:
 
 - **Hiding is a courtesy, refusing is the boundary.** Every grant is checked
   server-side on every request. The copy sent to the browser only decides which
@@ -177,6 +177,12 @@ Three things worth knowing about how this is enforced:
 - **Files are confined by resolved path.** A staff account scoped to its own
   files has every requested path passed through `realpath` before the prefix
   comparison, so a symlink planted inside the sandbox cannot point out of it.
+- **Uploads are staged and never overwrite.** A new file is streamed into a
+  hidden temporary file in the browsed folder, then given its real name only
+  after the whole body has arrived. An existing name is refused. Staff
+  accounts cannot upload into root's home or the protected system trees,
+  because the panel writes as root. A single upload is capped at 1 GB, and any
+  proxy in front of the panel needs a matching request-body limit.
 - **Revocation is per account.** Resetting one staff password, or taking a grant
   away, signs out that person on their next request and nobody else.
 

@@ -491,6 +491,9 @@ function openServerDetail(kind){
   _srvDetailKind=kind;
   $('srv-detail-title').textContent=_SRV_TITLES[kind]||'Detail';
   $('srv-detail-overlay').classList.add('open');
+  const uploadBtn=$('srv-upload-btn');
+  if(uploadBtn) uploadBtn.hidden=!(kind==='disk' && _mayOpenDetail(kind) &&
+    (window.MGMT_PERMS||{}).disk_upload);
   if(!_mayOpenDetail(kind)){
     $('srv-detail-body').innerHTML=`<div class="detail-denied">
       <svg class="ic ic-lg"><use href="#ic-shield-alert"/></svg>
@@ -514,7 +517,12 @@ function applyMetricPermissions(){
     if(!allowed) card.title=_SRV_DENIED[m[1]]||'Not permitted';
   });
 }
-function closeServerDetail(){ $('srv-detail-overlay').classList.remove('open'); _srvDetailKind=null; }
+function closeServerDetail(){
+  $('srv-detail-overlay').classList.remove('open');
+  _srvDetailKind=null;
+  const uploadBtn=$('srv-upload-btn');
+  if(uploadBtn) uploadBtn.hidden=true;
+}
 function refreshServerDetail(){ loadServerDetail(); }
 async function loadServerDetail(){
   if(_srvDetailKind==='cpu'||_srvDetailKind==='mem') return renderProcDetail(_srvDetailKind);
@@ -556,6 +564,23 @@ async function renderNetDetail(){
       <tbody>${rows||'<tr><td colspan="6">No connections.</td></tr>'}</tbody></table>`;
   }catch(e){ b.innerHTML=`<div class="empty-state">Failed: ${esc(String(e))}</div>`; }
 }
+/* A long name must not eat the extension. The last dot splits the base from
+   the suffix, so the base can ellipsize while the suffix stays fully visible.
+   A dotfile has no suffix because its leading dot is part of the name. */
+function fileNameParts(name){
+  const dot=name.lastIndexOf('.');
+  if(dot>0 && dot<name.length-1) return [name.slice(0,dot),name.slice(dot)];
+  return [name,''];
+}
+function fileBrowserName(e){
+  const name=String(e.name==null?'':e.name);
+  const parts=e.is_dir?[name,'']:fileNameParts(name);
+  const label=`<span class="fb-label"><span class="fb-stem">${esc(parts[0])}</span>${parts[1]?`<span class="fb-ext">${esc(parts[1])}</span>`:''}</span>`;
+  if(e.is_dir){
+    return `<span class="fb-name dir" data-path="${escAttr(e.path)}" onclick="browseDir(this.dataset.path)" title="${escAttr(name)}"><svg class="ic" style="color:var(--accent)"><use href="#ic-folder"/></svg>${label}</span>`;
+  }
+  return `<span class="fb-name" title="${escAttr(name)}"><svg class="ic" style="color:var(--gray-400)"><use href="#ic-file-text"/></svg>${label}</span>`;
+}
 async function browseDir(path){
   _fbPath=path; const b=$('srv-detail-body'); b.innerHTML='<div class="empty-state">Loading folder…</div>';
   try{
@@ -567,8 +592,7 @@ async function browseDir(path){
     _fbPath=d.path;
     const up=d.parent?`<div class="fb-row"><span class="fb-name dir" data-path="${escAttr(d.parent)}" onclick="browseDir(this.dataset.path)">↩ ..</span></div>`:'';
     const rows=(d.entries||[]).map(e=>{
-      const name=e.is_dir?`<span class="fb-name dir" data-path="${escAttr(e.path)}" onclick="browseDir(this.dataset.path)"><svg class="ic" style="color:var(--accent)"><use href="#ic-folder"/></svg> ${esc(e.name)}</span>`
-        :`<span class="fb-name"><svg class="ic" style="color:var(--gray-400)"><use href="#ic-file-text"/></svg> ${esc(e.name)}</span>`;
+      const name=fileBrowserName(e);
       const dl=e.is_dir?'':(e.downloadable?`<a class="fb-dl" href="${BASE}/api/system/download?path=${encodeURIComponent(e.path)}" style="display:inline-flex;align-items:center;gap:4px;"><svg class="ic"><use href="#ic-download"/></svg> Download</a>`:`<span class="fb-locked">protected</span>`);
       const canDelete=!!(window.MGMT_PERMS&&MGMT_PERMS.disk_delete)&&!e.is_dir&&e.deletable;
       const del=canDelete?`<button class="db-action-btn" style="color:var(--danger);" onclick="deleteFile('${escAttr(e.path)}')"><svg class="ic"><use href="#ic-trash-2"/></svg></button>`:'';
@@ -585,6 +609,37 @@ async function deleteFile(path){
     if(!r.ok){ appToast(d.error||'Delete failed','err'); return; }
     appToast('Deleted','ok'); browseDir(_fbPath);
   }catch(e){ appToast('Network error','err'); }
+}
+function pickUploadFile(){
+  const input=$('fb-upload-input');
+  if(input) input.click();
+}
+async function uploadFile(input){
+  const file=input.files&&input.files[0];
+  input.value='';
+  if(!file) return;
+  const btn=$('srv-upload-btn');
+  const original=btn?btn.innerHTML:'';
+  if(btn){
+    btn.disabled=true;
+    btn.innerHTML='<svg class="ic"><use href="#ic-upload"/></svg>Uploading…';
+  }
+  try{
+    const r=await api('/api/system/upload?path='+encodeURIComponent(_fbPath||'')+
+      '&name='+encodeURIComponent(file.name),{method:'POST',body:file});
+    if(!r) return;
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){
+      const fallback=r.status===413?'That file is larger than the server allows.':'Upload failed';
+      appToast(d.error||fallback,'err');
+      return;
+    }
+    appToast('Uploaded '+file.name,'ok');
+    await browseDir(_fbPath);
+  }catch(e){ appToast('Upload failed: '+e,'err'); }
+  finally{
+    if(btn){ btn.disabled=false; btn.innerHTML=original; }
+  }
 }
 function openAccessDetail(id){ _srvDetailKind='access'; _accessDetailId=id;
   $('srv-detail-title').textContent='Request / Response'; $('srv-detail-overlay').classList.add('open'); renderAccessDetail(); }

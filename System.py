@@ -1062,6 +1062,84 @@ def delete_file(path, root=None):
         return False, str(e)
 
 
+# --- file uploads ------------------------------------------------------------
+# A file arrives as the raw request body, is streamed into a hidden temporary
+# file in the destination directory, and is then hard-linked under its real
+# name. Streaming keeps a large upload out of memory, and the hard link means
+# the name appears only after the whole file is safely on disk.
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
+
+# The panel writes as root, so a staff account must not be able to aim an upload
+# at a place where root or a service would later execute it. The admin already
+# has a root terminal, so these extra destinations are refused for staff only.
+_UPLOAD_STAFF_DENY_PREFIXES = _DELETE_DENY_PREFIXES + (
+    "/root", "/var/spool/cron", "/var/spool/at",
+)
+
+
+def _upload_staff_blocked(path):
+    for prefix in _UPLOAD_STAFF_DENY_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def resolve_upload(path, name, root=None, staff=False):
+    """Validate an upload destination.
+
+    Returns (directory, destination, None) when the name may be written into
+    the requested directory, or (None, None, reason). The destination has to be
+    a new file directly inside that directory and inside the sandbox. Existing
+    names are refused rather than overwritten: choosing a file to upload is not
+    the same decision as replacing one that is already there.
+    """
+    root = _sandbox_root(root)
+    directory = os.path.realpath(os.path.expanduser(path or root or "/"))
+    if not _within(root, directory):
+        return None, None, "blocked"
+    if staff and _upload_staff_blocked(directory):
+        return None, None, "blocked"
+    if not os.path.isdir(directory):
+        return None, None, "not_a_directory"
+    if (not name or name in (".", "..") or "\x00" in name
+            or "/" in name or "\\" in name):
+        return None, None, "bad_name"
+    if len(os.fsencode(name)) > 255:
+        return None, None, "name_too_long"
+    dest = os.path.join(directory, name)
+    if os.path.lexists(dest):
+        return None, None, "exists"
+    real_dest = os.path.realpath(dest)
+    if not _within(root, real_dest) or os.path.dirname(real_dest) != directory:
+        return None, None, "blocked"
+    return directory, dest, None
+
+
+def finish_upload(temp_path, dest, owner=None):
+    """Give a completed temporary upload its real name, never overwriting it.
+
+    A staff member's upload into their own home is chowned to their system
+    account before it becomes visible, so it is theirs to manage from their own
+    shell and is not left owned by root. Returns (True, None) or (False, reason).
+    """
+    try:
+        os.chmod(temp_path, 0o644)
+        if owner:
+            import pwd
+            pw = pwd.getpwnam(owner)
+            os.chown(temp_path, pw.pw_uid, pw.pw_gid)
+        os.link(temp_path, dest)
+        return True, None
+    except FileExistsError:
+        return False, "exists"
+    except KeyError:
+        return False, "no_owner"
+    except OSError as e:
+        if getattr(e, "errno", None) == 17:  # EEXIST
+            return False, "exists"
+        return False, str(e)
+
+
 # --- Server launch configuration ---------------------------------------------
 def get_server_config():
     """Return the (host, port) Main.py should bind, read from system_settings

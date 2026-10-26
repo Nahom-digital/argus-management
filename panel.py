@@ -35,6 +35,7 @@ import secrets
 import asyncio
 import logging
 import subprocess
+import tempfile
 import ipaddress
 from contextlib import asynccontextmanager
 
@@ -1385,7 +1386,7 @@ _PANES_TEMPLATE = """
         <canvas class="metric-chart" id="chart-net" height="70"></canvas>
         <div class="metric-foot" id="m-net-foot">-</div>
       </div>
-      <div class="metric-card metric-clickable" onclick="openServerDetail('disk')" title="Browse & download files">
+      <div class="metric-card metric-clickable" onclick="openServerDetail('disk')" title="Browse, upload and download files">
         <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-hard-drive"/></svg>Disk</span><span class="metric-now" id="m-disk-now">0%</span></div>
         <div class="disk-bar"><div class="disk-fill" id="disk-fill"></div></div>
         <div class="metric-foot" id="m-disk-foot">-</div>
@@ -1554,6 +1555,8 @@ _PANES_TEMPLATE = """
   <div id="srv-detail-modal">
     <div id="srv-detail-head"><span id="srv-detail-title">Detail</span>
       <div style="display:flex;gap:8px;align-items:center;">
+        <button class="db-action-btn" id="srv-upload-btn" onclick="pickUploadFile()" hidden><svg class="ic"><use href="#ic-upload"/></svg>Upload</button>
+        <input type="file" id="fb-upload-input" hidden onchange="uploadFile(this)">
         <button class="db-action-btn" onclick="refreshServerDetail()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
         <button class="db-action-btn" onclick="closeServerDetail()"><svg class="ic"><use href="#ic-x"/></svg>Close</button></div></div>
     <div id="srv-detail-body"></div>
@@ -2696,6 +2699,90 @@ async def api_delete_file(request: Request):
     write_log("ACTION", "SYSTEM", "File deleted", actor=_admin_name(request),
               ip=_client_ip(request), target=path[:200])
     return {"status": "ok"}
+
+_UPLOAD_ERRORS = {
+    "blocked": "Uploads are not allowed in that folder.",
+    "not_a_directory": "That is not a folder.",
+    "bad_name": "That file name is not allowed.",
+    "name_too_long": "That file name is too long.",
+    "exists": "A file with that name already exists in this folder.",
+    "no_owner": "The system account for this folder no longer exists.",
+}
+
+def _upload_limit_text():
+    limit = System.MAX_UPLOAD_BYTES
+    if limit and limit % (1024 ** 3) == 0:
+        return f"{limit // (1024 ** 3)} GB"
+    return f"{max(1, limit // (1024 ** 2))} MB"
+
+@app.post("/api/system/upload")
+async def api_upload_file(request: Request, path: str = "", name: str = ""):
+    """Stream one file from the browser into the folder being browsed.
+
+    The name and folder arrive as query parameters and the file is the raw
+    request body, the same shape the avatar upload uses, so no multipart parser
+    sits in the request path. Nothing is written under the real name until the
+    whole body has arrived, and an existing name is never replaced.
+    """
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(
+        request, lambda p: _can_browse(p) and p.get("disk_upload"))
+    if denied:
+        return denied
+    root = _disk_root(perms)
+    directory, dest, reason = System.resolve_upload(
+        path, name, root, staff=perms.get("role") != "admin")
+    if reason:
+        code = 409 if reason == "exists" else 403 if reason == "blocked" else 400
+        return JSONResponse(status_code=code, content={
+            "error": _UPLOAD_ERRORS.get(reason, "Upload refused.")})
+
+    limit = System.MAX_UPLOAD_BYTES
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return JSONResponse(status_code=413, content={
+            "error": f"Use a file under {_upload_limit_text()}."})
+
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".argus-upload-", dir=directory)
+    except OSError as e:
+        logging.error(f"could not create an upload staging file: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not save the upload."})
+
+    total = 0
+    too_large = False
+    try:
+        with os.fdopen(fd, "wb") as out:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    too_large = True
+                    break
+                out.write(chunk)
+        if too_large:
+            return JSONResponse(status_code=413, content={
+                "error": f"Use a file under {_upload_limit_text()}."})
+        owner = (perms.get("os_username")
+                 if perms.get("disk_scope") == panel_users.DISK_OWN else None)
+        ok, detail = await DB.run(System.finish_upload, temp_path, dest, owner)
+        if not ok:
+            code = 409 if detail == "exists" else 403 if detail == "blocked" else 500
+            return JSONResponse(status_code=code, content={
+                "error": _UPLOAD_ERRORS.get(detail, "Could not save the upload.")})
+    except Exception as e:
+        logging.error(f"upload failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not save the upload."})
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+    write_log("ACTION", "SYSTEM", "File uploaded", actor=_admin_name(request),
+              ip=_client_ip(request), target=dest[:200], detail=f"{total} bytes")
+    return {"status": "ok", "name": name, "path": dest, "size": total}
 
 # ---- management bind config ----
 @app.get("/api/system/config")

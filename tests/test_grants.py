@@ -10,7 +10,7 @@ def test_registry_covers_all_seven_groups():
     groups = {g.group for g in pu.PERMISSIONS}
     assert groups == {"terminal", "disk", "database", "network",
                       "compute", "services", "logs"}
-    assert len(pu.PERMISSIONS) == 17
+    assert len(pu.PERMISSIONS) == 18
 
 
 def test_group_order_lists_every_group_once():
@@ -24,6 +24,7 @@ def test_normalize_fills_every_key_with_defaults():
     assert set(out) == set(pu.GRANT_KEYS)
     assert out["terminal"] == "none"
     assert out["disk_scope"] == "none"
+    assert out["disk_upload"] is False
     assert out["db_read"] is False
 
 

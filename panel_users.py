@@ -43,6 +43,8 @@ PERMISSIONS = (
           "Nothing, only their own home directory, or the whole filesystem."),
     Grant("disk_download", "bool", None, False, "disk",
           "Download files", "Copy files off the server."),
+    Grant("disk_upload", "bool", None, False, "disk",
+          "Upload files", "Copy files from this device into the folder you are viewing."),
     Grant("disk_delete", "bool", None, False, "disk",
           "Delete files", "Remove files permanently. There is no undo."),
 
@@ -142,7 +144,7 @@ def describe_grants():
     renders in a stable, meaningful sequence."""
     order = {name: i for i, name in enumerate(GROUP_ORDER)}
     # Stable sort, so registry order survives inside each group. That keeps
-    # disk_scope ahead of the download and delete switches it governs.
+    # disk_scope ahead of the download, upload and delete switches it governs.
     ordered = sorted(PERMISSIONS, key=lambda g: order.get(g.group, 99))
     return [
         {
@@ -192,8 +194,9 @@ def _backfill_legacy_grants(conn):
     """Translate pre-v2 rows into the registry, once.
 
     Deliberately conservative: disk_access became browse plus download, never
-    delete, and database_access became read, never write. Nobody gains a
-    destructive permission from a migration they did not ask for.
+    upload or delete, and database_access became read, never write. Nobody
+    gains a write or a destructive permission from a migration they did not
+    ask for.
     """
     cur = conn.cursor()
     cur.execute(_BACKFILL_SENTINEL)
@@ -205,6 +208,7 @@ def _backfill_legacy_grants(conn):
             "logs_access": bool(logs_access),
             "disk_scope": DISK_FULL if disk_access else DISK_NONE,
             "disk_download": bool(disk_access),
+            "disk_upload": False,
             "disk_delete": False,
         })
         cur.execute("UPDATE panel_user SET grants = %s WHERE username = %s",

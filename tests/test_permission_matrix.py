@@ -21,6 +21,10 @@ PROBES = {
     "cpumem_detail": ("GET", "/api/system/processes"),
     "net_detail":    ("GET", "/api/system/connections"),
     "disk_download": ("GET", "/api/system/download?path=/etc/hostname"),
+    # No name or path is supplied, so a holder reaches the validation branch and
+    # is refused with 400 before anything is written. The grant check is what
+    # this probe is meant to exercise.
+    "disk_upload":   ("POST", "/api/system/upload"),
     "disk_delete":   ("DELETE", "/api/system/delete"),
     "db_read":       ("GET", "/api/config/db/tables"),
     "db_write":      ("POST", "/api/config/db/table/system_settings/column"),
