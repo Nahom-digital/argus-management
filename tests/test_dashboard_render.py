@@ -286,27 +286,37 @@ def test_the_live_network_metric_never_moves_its_chart(client):
 def test_the_network_detail_has_live_per_socket_rates():
     """The overview card shows interface totals; the detail adds a direction for
     each established socket. These names tie the JS renderer to the backend
-    fields and to the two-second sampler it relies on."""
+    fields and to the one-second sampler it relies on."""
     js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
     start = js.index("function netRateCell(")
     end = js.index("/* A long name must not eat the extension.", start)
     block = js[start:end]
     for text in ("rate_in", "rate_out", "bytes_in", "bytes_out",
-                 "Established only", "Live every 2s", "sampling…",
+                 "Established only", "sampled every second", "sampling…",
                  "?established=1", "setNetEstablishedOnly", "staleCounters",
-                 "pre-update process", "sudo systemctl restart argus-management"):
+                 "pre-update process", "sudo systemctl restart argus-management",
+                 "isSampling", "_netSamplingKeys", "netConnKey", "promoted",
+                 "samplingHead", "net-sampling-sep"):
         assert text in block, text
     assert "hasOwnProperty.call(c,'bytes_in')" in block
+    assert "Live every 2s" not in block
+    assert "net-live" not in block
     assert "function renderNetDetail(silent)" in js
     assert "renderNetDetail(true)" in js
     assert "stopNetDetailPoll()" in js
     assert "setInterval(" in js
     assert "function fmtRate(" in js
+    poll_start = js.index("function startNetDetailPoll")
+    poll_block = js[poll_start:js.index("function stopNetDetailPoll", poll_start)]
+    assert "},1000);" in poll_block
+    assert "},2000);" not in poll_block
 
     css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
-    for cls in (".net-tools", ".net-filter", ".net-live", ".net-intro",
-                ".net-warn", ".net-warn code", ".net-legend", ".net-rate"):
+    for cls in (".net-tools", ".net-filter", ".net-intro",
+                ".net-warn", ".net-warn code", ".net-legend", ".net-rate",
+                ".net-sampling-sep"):
         assert cls in css, cls
+    assert ".net-live" not in css
 
 
 def test_the_terminal_has_a_fullscreen_toggle():
