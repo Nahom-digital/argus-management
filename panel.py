@@ -1382,7 +1382,7 @@ _PANES_TEMPLATE = """
         <div class="metric-foot" id="m-ram-foot">-</div>
       </div>
       <div class="metric-card metric-clickable" onclick="openServerDetail('net')" title="Active connections">
-        <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-wifi"/></svg>Network</span><span class="metric-now" id="m-net-now">&darr;0 &uarr;0</span></div>
+        <div class="metric-head net-head"><span class="metric-title"><svg class="ic"><use href="#ic-wifi"/></svg>Network</span><span class="metric-now net-now" id="m-net-now"><span>&darr;0B/s</span><span>&uarr;0B/s</span></span></div>
         <canvas class="metric-chart" id="chart-net" height="70"></canvas>
         <div class="metric-foot" id="m-net-foot">-</div>
       </div>

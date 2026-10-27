@@ -627,11 +627,14 @@
   .ch-action { color:var(--gray-600); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
   /* ---- SERVER PANE ---- */
-  .metric-clickable { cursor:pointer; transition:transform .08s, box-shadow .08s; }
+  .metric-clickable { cursor:pointer; transition:box-shadow .12s, border-color .12s; }
   @media (hover: hover) and (pointer: fine) {
-    .metric-clickable:hover { transform:translateY(-2px); box-shadow:0 4px 14px rgba(0,0,0,.10); }
+    /* A hover lift moved the card under the pointer at its bottom edge and
+       made the card jitter. Keep the clickable affordance, but never move
+       the box itself. */
+    .metric-clickable:hover { border-color:var(--gray-300); box-shadow:0 4px 14px rgba(0,0,0,.10); }
   }
-  .metric-clickable:active { transform:translateY(0) scale(0.995); }
+  .metric-clickable:active { box-shadow:var(--shadow-sm); }
   /* A meter nobody may drill into stops offering to be drilled into. */
   .metric-locked { cursor:default; }
 
@@ -809,12 +812,19 @@
     border:1px solid var(--gray-200); border-radius:12px; padding:16px 18px; background:var(--white);
     box-shadow: var(--shadow-sm);
   }
-  .metric-head { display:flex; align-items:baseline; justify-content:space-between; }
+  /* The head and foot reserve their line height. The live values change size
+     as traffic changes; without this the network card grew a line whenever a
+     rate got longer, shoving its chart down and pulling it back on the next
+     poll. */
+  .metric-head { display:flex; align-items:baseline; justify-content:space-between; min-height:30px; }
   .metric-title { font-size:10px; font-weight:700; letter-spacing:0.9px; text-transform:uppercase; color:var(--gray-600); font-family:var(--display); display:inline-flex; align-items:center; gap:5px; }
   .metric-title .ic { width:13px; height:13px; color:var(--accent); }
-  .metric-now { font-size:25px; font-weight:700; font-family:var(--display); color:var(--black); letter-spacing:0px; }
-  .metric-chart { width:100%; display:block; margin-top:6px; }
-  .metric-foot { font-size:11px; color:var(--gray-600); font-family:var(--mono); margin-top:6px; }
+  .metric-now { font-size:25px; font-weight:700; font-family:var(--display); color:var(--black); letter-spacing:0px; line-height:1.15; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .metric-head.net-head { min-height:44px; align-items:flex-start; }
+  .metric-now.net-now { display:flex; flex-direction:column; align-items:flex-end; gap:0; font-size:19px; line-height:1.1; }
+  .metric-now.net-now > span { display:block; }
+  .metric-chart { width:100%; height:70px; display:block; margin-top:6px; }
+  .metric-foot { font-size:11px; color:var(--gray-600); font-family:var(--mono); margin-top:6px; min-height:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   /* align-items must stay stretch. The fill is absolutely positioned, so a
      core cell has no intrinsic height, and flex-end collapsed every cell to
      its 3px minimum: the meters could never show more than a hairline. */

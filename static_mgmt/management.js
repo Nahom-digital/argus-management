@@ -512,8 +512,15 @@ async function pollServerStats(){
     $('m-cpu-foot').textContent=`${d.processes} procs · uptime ${fmtUptime(d.uptime_seconds)}`;
     $('m-ram-now').textContent=d.ram.percent.toFixed(0)+'%';
     $('m-ram-foot').textContent=`${d.ram.used_h} / ${d.ram.total_h}`+(d.swap.total?` · swap ${d.swap.used_h}`:'');
-    $('m-net-now').innerHTML=`&darr;${d.net.rate_in_h} &uarr;${d.net.rate_out_h}`;
-    $('m-net-foot').textContent=`total ↓${d.net.total_in_h} ↑${d.net.total_out_h}`;
+    const netNow=$('m-net-now');
+    netNow.classList.add('net-now');
+    const netHead=netNow.closest('.metric-head');
+    if(netHead) netHead.classList.add('net-head');
+    netNow.innerHTML=`<span>&darr;${esc(compactRate(d.net.rate_in_h))}</span><span>&uarr;${esc(compactRate(d.net.rate_out_h))}</span>`;
+    netNow.title=`In ${d.net.rate_in_h} · Out ${d.net.rate_out_h}`;
+    const netFoot=`total ↓${d.net.total_in_h} ↑${d.net.total_out_h}`;
+    $('m-net-foot').textContent=netFoot;
+    $('m-net-foot').title=netFoot;
     $('m-disk-now').textContent=d.disk.percent.toFixed(0)+'%';
     $('m-disk-foot').textContent=`${d.disk.used_h} / ${d.disk.total_h}`;
     // scaleX rather than width: same picture, no layout pass on every sample.
@@ -561,9 +568,16 @@ function barColor(p){
 }
 function drawLineChart(id,series,max,colors){
   const canvas=$(id); if(!canvas) return;
-  const w=canvas.clientWidth||canvas.parentElement.clientWidth; const dpr=window.devicePixelRatio||1; const h=canvas.height;
-  if(canvas.width!==Math.round(w*dpr)) canvas.width=Math.round(w*dpr);
-  const ctx=canvas.getContext('2d'); ctx.setTransform(dpr,0,0,1,0,0); ctx.clearRect(0,0,w,h);
+  const w=canvas.clientWidth||canvas.parentElement.clientWidth;
+  const h=canvas.clientHeight||70;
+  const dpr=window.devicePixelRatio||1;
+  const pw=Math.round(w*dpr), ph=Math.round(h*dpr);
+  /* The CSS height is fixed. Resize the backing store in both directions;
+     changing only width changed the canvas's intrinsic aspect ratio, which
+     made the chart box grow or shrink between polls. */
+  if(canvas.width!==pw) canvas.width=pw;
+  if(canvas.height!==ph) canvas.height=ph;
+  const ctx=canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
   const grid=getComputedStyle(document.documentElement).getPropertyValue('--gray-100').trim();
   ctx.strokeStyle=grid; ctx.lineWidth=1;
   for(let i=1;i<=2;i++){ const y=(h/3)*i; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
@@ -803,6 +817,10 @@ function fmtBytes(n){
   do{ n/=1024; i++; }while(n>=1024 && i<units.length-1);
   return n.toFixed(1)+' '+units[i];
 }
+/* The dashboard's network value changes every second. Removing the spaces
+   keeps both directions on their own fixed lines instead of letting a longer
+   "1.2 MB/s" wrap the header and move the chart. */
+function compactRate(s){ return String(s||'0 B/s').replace(/\s+/g,''); }
 function uploadStatusText(item){
   if(item.status==='waiting') return 'Waiting';
   if(item.status==='uploading') return item.progress>=100?'Saving…':'Uploading '+(item.progress||0)+'%';

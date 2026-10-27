@@ -251,6 +251,38 @@ def test_the_device_card_is_grouped_for_reading(client):
     assert "font-weight:400" in core_rule
 
 
+def test_the_live_network_metric_never_moves_its_chart(client):
+    """The Server network card updates every second. Its rate string must not
+    wrap the header or make the whole card jump when a value gets longer, and
+    the clickable hover treatment must not translate the card under the
+    pointer."""
+    page = _page_as(client, "admin")
+    assert 'class="metric-head net-head"' in page
+    assert 'class="metric-now net-now" id="m-net-now"' in page
+    assert '<span>&darr;0B/s</span><span>&uarr;0B/s</span>' in page
+
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    assert "function compactRate(" in js
+    assert "compactRate(d.net.rate_in_h)" in js
+    assert "netNow.classList.add('net-now')" in js
+    assert "netHead.classList.add('net-head')" in js
+    assert "netNow.innerHTML=" in js
+    assert "netNow.title=" in js
+    assert "canvas.clientHeight||70" in js
+    assert "canvas.height!==ph" in js
+    assert "setTransform(dpr,0,0,dpr,0,0)" in js
+
+    css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
+    for text in (".metric-head.net-head", ".metric-now.net-now",
+                 "min-height:30px", "min-height:44px", "height:70px",
+                 "white-space:nowrap", "font-variant-numeric:tabular-nums",
+                 "text-overflow:ellipsis"):
+        assert text in css, text
+    start = css.index(".metric-clickable:hover {")
+    hover_rule = css[start:css.index("}", start)]
+    assert "transform" not in hover_rule
+
+
 def test_the_network_detail_has_live_per_socket_rates():
     """The overview card shows interface totals; the detail adds a direction for
     each established socket. These names tie the JS renderer to the backend
