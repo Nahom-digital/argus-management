@@ -3477,6 +3477,14 @@ async function clearTelegramLog(){
   document.querySelectorAll('input[name="mail-route"]')
     .forEach(r=>r.addEventListener('change', mailSyncRouteHint));
   applyMetricPermissions();
+  /* Put the stable network layout in place before the first stats poll, so an
+     already-rendered older template does not reflow once when rates arrive. */
+  const netNow=$('m-net-now');
+  if(netNow){
+    netNow.classList.add('net-now');
+    const netHead=netNow.closest('.metric-head');
+    if(netHead) netHead.classList.add('net-head');
+  }
   startMailBadgePolling();
   switchSection('server');
 })();
