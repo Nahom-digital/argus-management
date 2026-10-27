@@ -245,6 +245,10 @@ def test_the_device_card_is_grouped_for_reading(client):
                 ".dev-group", ".dev-details", ".dev-fact", ".dev-ip",
                 ".dev-fact.cores", ".dev-fact.clock"):
         assert cls in css, cls
+    core_rule_start = css.index(".dev-fact.cores .dev-fact-value")
+    core_rule = css[core_rule_start:css.index("}", core_rule_start)]
+    assert "font-weight:600" not in core_rule
+    assert "font-weight:400" in core_rule
 
 
 def test_the_network_detail_has_live_per_socket_rates():
@@ -257,8 +261,10 @@ def test_the_network_detail_has_live_per_socket_rates():
     block = js[start:end]
     for text in ("rate_in", "rate_out", "bytes_in", "bytes_out",
                  "Established only", "Live every 2s", "sampling…",
-                 "?established=1", "setNetEstablishedOnly"):
+                 "?established=1", "setNetEstablishedOnly", "staleCounters",
+                 "pre-update process", "sudo systemctl restart argus-management"):
         assert text in block, text
+    assert "hasOwnProperty.call(c,'bytes_in')" in block
     assert "function renderNetDetail(silent)" in js
     assert "renderNetDetail(true)" in js
     assert "stopNetDetailPoll()" in js
@@ -267,7 +273,7 @@ def test_the_network_detail_has_live_per_socket_rates():
 
     css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
     for cls in (".net-tools", ".net-filter", ".net-live", ".net-intro",
-                ".net-warn", ".net-legend", ".net-rate"):
+                ".net-warn", ".net-warn code", ".net-legend", ".net-rate"):
         assert cls in css, cls
 
 

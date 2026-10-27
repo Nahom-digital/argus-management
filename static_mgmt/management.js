@@ -686,6 +686,8 @@ async function renderProcDetail(by){
 function fmtRate(n){ return fmtBytes(n)+'/s'; }
 function netRateCell(c,field,bytesField,rateError){
   if(c.status!=='ESTABLISHED') return '<span class="net-rate muted">-</span>';
+  if(!Object.prototype.hasOwnProperty.call(c,bytesField))
+    return '<span class="net-rate muted" title="The running service has not loaded per-socket counters. Restart argus-management.">-</span>';
   if(c[bytesField]==null) return '<span class="net-rate muted" title="No per-socket byte counters">-</span>';
   const v=c[field];
   if(v==null){
@@ -705,7 +707,9 @@ async function renderNetDetail(silent){
     const d=await (await api('/api/system/connections'+(only?'?established=1':''))).json();
     if(_srvDetailKind!=='net'||only!==_netOnlyEstablished) return;
     if(d.error){ if(!silent&&b) b.innerHTML=`<div class="empty-state">${esc(d.error)}</div>`; return; }
-    const rows=(d.connections||[]).map(c=>{
+    const conns=d.connections||[];
+    const staleCounters=conns.length>0 && !conns.some(c=>Object.prototype.hasOwnProperty.call(c,'bytes_in'));
+    const rows=conns.map(c=>{
       const isAuth=c.process&&c.process.includes('sshd-auth'), isSess=c.process&&c.process.includes('sshd-session');
       let rowStyle='',stateCell=esc(c.status),processCell=esc(c.process);
       if(isAuth){ rowStyle='background:color-mix(in srgb, var(--danger) 8%, transparent);'; stateCell='<span style="color:var(--danger);font-weight:700;">ESTAB</span>';
@@ -718,11 +722,14 @@ async function renderNetDetail(silent){
       ? 'Showing established TCP connections only. In and Out are live per-socket rates, sampled every 2 seconds.'
       : 'Showing all sockets. In and Out are live per-socket rates for established TCP connections, sampled every 2 seconds; listeners show a hyphen.';
     const warn=d.rate_error?`<div class="net-warn">${esc(d.rate_error)}</div>`:'';
+    const staleWarn=staleCounters
+      ? '<div class="net-warn">The running Argus service is still the pre-update process, so it has no per-socket counters. Restart it from a separate shell, then reopen Network: <code>sudo systemctl restart argus-management</code>.</div>'
+      : '';
     const empty=only?'No established connections.':'No connections.';
     if(b){
       b.innerHTML=`<div class="net-tools"><label class="net-filter"><input type="checkbox" ${only?'checked':''} onchange="setNetEstablishedOnly(this.checked)"> Established only</label>
         <span class="net-live"><span class="status-dot"></span>Live every 2s</span></div>
-        <div class="net-intro">${intro}</div>${warn}
+        <div class="net-intro">${intro}</div>${staleWarn}${warn}
         <div class="net-legend">Per-socket TCP counters. Loopback traffic can appear on both endpoints. On port 22:
           <span style="color:var(--danger);font-weight:600;">sshd-auth</span> = connected but not authenticated · <span style="color:var(--success);font-weight:600;">sshd-session</span> = authenticated shell.</div>
         <table><thead><tr><th>Proto</th><th>Local</th><th>Remote IP</th><th title="Bytes received by this socket">↓ In</th><th title="Bytes sent by this socket">↑ Out</th><th>State</th><th>PID</th><th>Process</th></tr></thead>

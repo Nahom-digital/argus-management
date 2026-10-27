@@ -702,6 +702,7 @@
   .net-intro { font-size:12px; color:var(--gray-600); line-height:1.55; margin-bottom:6px; }
   .net-warn { margin:6px 0 8px; padding:7px 9px; border:1px solid color-mix(in srgb, var(--warn) 28%, var(--gray-200));
     border-radius:6px; background:color-mix(in srgb, var(--warn) 8%, var(--white)); color:var(--warn); font-size:11px; line-height:1.45; }
+  .net-warn code { font-family:var(--mono); background:color-mix(in srgb, var(--warn) 12%, var(--white)); padding:1px 4px; border-radius:3px; white-space:nowrap; }
   .net-legend { font-size:11px; color:var(--gray-600); line-height:1.55; margin-bottom:10px; }
   .net-rate { font-family:var(--mono); font-size:11.5px; font-weight:600; color:var(--black); white-space:nowrap; }
   .net-rate.muted { color:var(--gray-400); font-weight:400; }
@@ -878,7 +879,7 @@
   .dev-fact-label { color:var(--gray-400); font-family:var(--display); font-size:9px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; }
   .dev-fact-value { margin-top:1px; color:var(--black); font-size:12.5px; line-height:1.35; overflow-wrap:anywhere; }
   .dev-fact.cpu .dev-fact-value { font-size:13px; font-weight:600; }
-  .dev-fact.cores .dev-fact-value, .dev-fact.clock .dev-fact-value { font-size:12.5px; font-weight:600; }
+  .dev-fact.cores .dev-fact-value, .dev-fact.clock .dev-fact-value { font-size:12.5px; font-weight:400; }
   .dev-fact-value.mono { font-family:var(--mono); font-size:11.5px; line-height:1.45; }
   .dev-fact-value.muted { color:var(--gray-500); }
   .dev-fact-value.dev-state-cool { color:var(--success); }
