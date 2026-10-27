@@ -1395,7 +1395,13 @@ _PANES_TEMPLATE = """
       </div>
     </div>
     <div class="device-card">
-      <div class="device-title">Device &amp; OS</div>
+      <div class="device-card-head">
+        <div class="device-card-heading">
+          <div class="device-title">Device &amp; OS</div>
+          <div class="device-sub">Hardware, network and runtime at a glance.</div>
+        </div>
+        <span class="device-live" title="Refreshes every 15 seconds"><span class="status-dot on"></span>Live hardware</span>
+      </div>
       <div class="device-grid" id="device-grid"><div class="empty-state">Loading device info&hellip;</div></div>
     </div>
   </div></div></div>

@@ -4,6 +4,8 @@ Hiding a control is a courtesy, not a boundary (the matrix test covers the
 boundary). These assert the courtesy is applied correctly: staff must not be
 shown admin machinery, and must be shown their own account.
 """
+from pathlib import Path
+
 import pytest
 
 import panel
@@ -12,6 +14,7 @@ from fastapi.testclient import TestClient
 
 STAFF = "pytest_render_user"
 PASSWORD = "R3nder!Pass"
+ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(scope="module")
@@ -203,3 +206,41 @@ def test_the_proxy_page_is_absent_without_net_proxy(client, conn):
         assert 'id="px-fw-in"' in page
     finally:
         pu.delete_user(conn, STAFF)
+
+
+# ---------------------------------------------------------------- device card
+def test_the_device_card_is_grouped_for_reading(client):
+    """The section used to be one flat key/value grid. It now has an identity
+    header and three panels, so the facts keep their context instead of all
+    competing for attention. This pins the structure the renderer targets."""
+    page = _page_as(client, "admin")
+    assert 'class="device-card-head"' in page
+    assert "Hardware, network and runtime at a glance." in page
+    assert 'class="device-grid" id="device-grid"' in page
+    assert "Live hardware" in page
+
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    assert "function renderDeviceInfo(d)" in js
+    assert "function devIp(" in js
+    assert "grid.innerHTML=renderDeviceInfo(d)" in js
+    assert "data-copy" in js
+    assert "dev-item" not in js
+    assert "dev-val" not in js
+    start = js.index("function renderDeviceInfo(d)")
+    end = js.index("async function loadServerStatic", start)
+    block = js[start:end]
+    for text in ("Hardware", "Network", "System", "Processor", "Memory",
+                 "Temperature", "Battery", "Private", "Public", "OS detail",
+                 "Kernel", "Process"):
+        assert text in block, text
+    for cls in ("dev-hero", "dev-groups", "dev-group", "dev-details"):
+        assert cls in block, cls
+    for helper in ("devFact(", "devIp("):
+        assert helper in block, helper
+    assert 'class="dev-fact' in js
+    assert 'class="dev-ip' in js
+
+    css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
+    for cls in (".device-card-head", ".dev-hero", ".dev-groups",
+                ".dev-group", ".dev-details", ".dev-fact", ".dev-ip"):
+        assert cls in css, cls

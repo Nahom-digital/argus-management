@@ -344,8 +344,8 @@ function startServerPolling(){
   pollServerStats();
   if(serverPollTimer) clearInterval(serverPollTimer);
   serverPollTimer=setInterval(pollServerStats,1500);
-  // Temperature, fan, battery and the IPs move, so the grid is re-read on a
-  // slow clock. One request feeds both the static rows and the moving ones.
+  // Temperature, fan, battery and the IPs move, so the panel is re-read on a
+  // slow clock. One request feeds both the fixed facts and the moving ones.
   if(serverStaticTimer) clearInterval(serverStaticTimer);
   serverStaticTimer=setInterval(loadServerStatic,15000);
 }
@@ -363,24 +363,141 @@ function fanText(d){
   if(d.fan_not_reported) return 'n/a (sensor hardware fault)';
   return 'no sensor';
 }
+function devStateClass(n){
+  const v=Number(n);
+  if(n==null||n===''||!isFinite(v)) return '';
+  if(v>=80) return 'dev-state-hot';
+  if(v>=60) return 'dev-state-warm';
+  return 'dev-state-cool';
+}
+function devBatteryClass(b){
+  if(!b) return '';
+  const state=String(b.state||'').toLowerCase();
+  if(state==='charging'||state==='full'||state==='charged') return 'dev-state-cool';
+  const p=Number(b.percent);
+  if(!isFinite(p)) return '';
+  if(p<=15) return 'dev-state-hot';
+  if(p<=35) return 'dev-state-warm';
+  return 'dev-state-cool';
+}
+function devBootParts(value){
+  const m=String(value||'').match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)$/);
+  if(m) return {date:m[1],time:m[2]};
+  return {date:value||'n/a',time:''};
+}
+function devFan(d){
+  if(d.fans&&d.fans.length){
+    const f=d.fans[0];
+    const notes=[];
+    const rpm=Number(f.rpm);
+    if(d.fans.length>1) notes.push(d.fans.length+' fans');
+    if(f.percent!=null) notes.push(f.percent+'% of max');
+    if(f.label) notes.push(f.label);
+    return {value:(isFinite(rpm)?rpm.toLocaleString():f.rpm)+' RPM',note:notes.join(' · '),title:fanText(d)};
+  }
+  if(d.fan_not_reported) return {value:'Not reported',note:'sensor fault',title:'The fan sensor is present but reports no speed.'};
+  return {value:'No sensor',note:'',title:'This machine reports no fan sensor.'};
+}
+function devFact(label,value,opt){
+  opt=opt||{};
+  const cls='dev-fact'+(opt.wide?' wide':'')+(opt.extraClass?' '+opt.extraClass:'');
+  const val='dev-fact-value'+(opt.mono?' mono':'')+(opt.valueClass?' '+opt.valueClass:'');
+  const title=opt.title?` title="${escAttr(opt.title)}"`:'';
+  const note=opt.noteHtml!=null?`<div class="dev-fact-note">${opt.noteHtml}</div>`:(opt.note?`<div class="dev-fact-note">${esc(opt.note)}</div>`:'');
+  return `<div class="${cls}"><div class="dev-fact-label">${esc(label)}</div><div class="${val}"${title}>${esc(value==null||value===''?'n/a':value)}</div>${note}</div>`;
+}
+function devIp(kind,value,note,icon,label,fallback){
+  const has=!!value;
+  const tag=has?'button':'div';
+  const attrs=has?` type="button" data-copy="${escAttr(value)}" data-label="${escAttr(label)}" onclick="copyVal(this.dataset.copy,this.dataset.label)" title="Copy ${escAttr(label)}"`:'';
+  const copy=has?'<svg class="ic dev-ip-copy" aria-hidden="true"><use href="#ic-copy"/></svg>':'';
+  return `<${tag} class="dev-ip${has?'':' muted'}"${attrs}><span class="dev-ip-kind"><svg class="ic"><use href="#${icon}"/></svg>${esc(kind)}</span><span class="dev-ip-value" title="${escAttr(value||fallback||'')}">${esc(has?value:(fallback||'Not available'))}</span><span class="dev-ip-note">${esc(note||'')}</span>${copy}</${tag}>`;
+}
+/* Group the static facts by the questions people actually ask: what is this
+   box, what is inside it, how does it reach the network, and what is it
+   running. The old flat grid gave every answer the same visual weight. */
+function renderDeviceInfo(d){
+  d=d||{};
+  const temp=d.cpu_temp_c!=null?Number(d.cpu_temp_c):null;
+  const hasTemp=temp!=null&&isFinite(temp);
+  const tempText=hasTemp?temp.toFixed(0)+'°C':'No sensor';
+  const tempClass=hasTemp?devStateClass(temp):'muted';
+  const tempNote=hasTemp&&d.cpu_temp_label?d.cpu_temp_label:'';
+  const fan=devFan(d);
+  const boot=devBootParts(d.boot_time);
+  const cores=Number(d.cpu_cores_physical)||0;
+  const threads=Number(d.cpu_cores_logical)||0;
+  const freq=d.cpu_max_mhz?` @ ${(d.cpu_max_mhz/1000).toFixed(2)} GHz`:'';
+  const coreNote=(cores||threads)?`${cores} physical / ${threads} logical${freq}`:'';
+  let battText='None present',battNote='',battClass='muted';
+  if(d.battery){
+    const p=Number(d.battery.percent);
+    battText=isFinite(p)?p+'%':'n/a';
+    battNote=d.battery.state||'';
+    battClass=devBatteryClass(d.battery);
+  }
+  const pid=d.process_pid!=null?'pid '+d.process_pid:'pid n/a';
+  const tempPill=hasTemp?`<span class="dev-pill ${tempClass}" title="CPU temperature${d.cpu_temp_label?' from '+escAttr(d.cpu_temp_label):''}"><svg class="ic"><use href="#ic-activity"/></svg>${esc(tempText)}</span>`:'';
+  const hero=`
+    <div class="dev-hero">
+      <div class="dev-id">
+        <span class="dev-mark"><svg class="ic"><use href="#ic-server"/></svg></span>
+        <div class="dev-id-copy">
+          <div class="dev-name" title="${escAttr(d.hostname||'')}">${esc(d.hostname||'Unknown host')}</div>
+          <div class="dev-os" title="${escAttr(d.os_full||'')}">${esc(d.distro||d.os||'Unknown OS')}<span class="dev-sep">·</span>${esc(d.arch||'unknown')}</div>
+        </div>
+      </div>
+      <div class="dev-pills">
+        <span class="dev-pill" title="Booted ${escAttr(d.boot_time||'unknown')}"><svg class="ic"><use href="#ic-clock"/></svg>Uptime ${esc(fmtUptime(d.uptime_seconds))}</span>
+        ${tempPill}
+        <span class="dev-pill" title="Panel process user"><svg class="ic"><use href="#ic-user-round"/></svg>${esc(d.process_user||'unknown')}</span>
+      </div>
+    </div>`;
+  const hardware=`
+    <section class="dev-group hardware">
+      <div class="dev-group-head"><svg class="ic"><use href="#ic-cpu"/></svg>Hardware</div>
+      ${devFact('Processor',d.cpu_model||'Unknown CPU',{extraClass:'cpu',title:d.cpu_model||'',note:coreNote})}
+      <div class="dev-facts">
+        ${devFact('Memory',d.ram_total_h||'n/a',{mono:true})}
+        ${devFact('Disk',d.disk_total_h||'n/a',{mono:true})}
+        ${devFact('Temperature',tempText,{mono:true,valueClass:tempClass,note:tempNote,title:hasTemp?'CPU temperature':'No temperature sensor reported'})}
+        ${devFact('Fan',fan.value,{mono:true,note:fan.note,title:fan.title,valueClass:fan.value==='No sensor'||fan.value==='Not reported'?'muted':''})}
+        ${devFact('Battery',battText,{wide:true,mono:true,valueClass:battClass,note:battNote,title:d.battery?'Battery charge and state':'No battery reported by this machine'})}
+      </div>
+    </section>`;
+  const hasIp=!!(d.private_ip||d.public_ip);
+  const network=`
+    <section class="dev-group network">
+      <div class="dev-group-head"><svg class="ic"><use href="#ic-wifi"/></svg>Network</div>
+      ${devIp('Private',d.private_ip,d.private_ip_iface||'','ic-wifi','Private IP','Not connected')}
+      ${devIp('Public',d.public_ip,d.public_ip?'external address':'lookup in progress','ic-globe','Public IP','Checking…')}
+      <div class="dev-hint"><svg class="ic"><use href="${hasIp?'#ic-copy':'#ic-globe'}"/></svg>${hasIp?'Click an address to copy it.':'No addresses reported yet.'}</div>
+    </section>`;
+  const system=`
+    <section class="dev-group system">
+      <div class="dev-group-head"><svg class="ic"><use href="#ic-monitor"/></svg>System</div>
+      <div class="dev-facts">
+        ${devFact('Python',d.python||'n/a',{mono:true})}
+        ${devFact('Booted',boot.date,{mono:true,note:boot.time})}
+        ${devFact('Uptime',fmtUptime(d.uptime_seconds),{mono:true})}
+        ${devFact('Process',pid,{mono:true,noteHtml:'running as <span class="dev-tag">'+esc(d.process_user||'unknown')+'</span>'})}
+      </div>
+      <div class="dev-details">
+        ${devFact('OS detail',d.os_full||'n/a',{mono:true,title:d.os_full||''})}
+        ${devFact('Kernel',d.kernel||'n/a',{mono:true,title:d.kernel||''})}
+      </div>
+    </section>`;
+  return hero+`<div class="dev-groups">${hardware}${network}${system}</div>`;
+}
 async function loadServerStatic(){
   try{
     const r=await api('/api/system/static'); if(!r||!r.ok) return; const d=await r.json();
-    const rows=[
-      ['Hostname',d.hostname],['Operating System',d.distro],['OS Detail',d.os_full],
-      ['Kernel',d.kernel],['Architecture',d.arch],['CPU',d.cpu_model],
-      ['CPU Cores',`${d.cpu_cores_physical} physical / ${d.cpu_cores_logical} logical`+(d.cpu_max_mhz?` @ ${(d.cpu_max_mhz/1000).toFixed(2)} GHz`:'')],
-      ['CPU Temp',d.cpu_temp_c!=null?`${d.cpu_temp_c.toFixed(0)}°C (${d.cpu_temp_label||'sensor'})`:'no sensor'],
-      ['Fan',fanText(d)],
-      ['Total RAM',d.ram_total_h],['Total Disk',d.disk_total_h],
-      ['Battery',d.battery?`${d.battery.percent}% (${d.battery.state||'unknown'})`:'none present'],
-      ['IP Private',d.private_ip?d.private_ip+(d.private_ip_iface?` (${d.private_ip_iface})`:''):'none'],
-      ['IP Public',d.public_ip||'checking'],
-      ['Python',d.python],
-      ['Booted',d.boot_time],['Uptime',fmtUptime(d.uptime_seconds)],
-      ['Process',`pid ${d.process_pid} as ${d.process_user}`+(d.is_root?' (root)':'')],
-    ];
-    $('device-grid').innerHTML=rows.map(([k,v])=>`<div class="dev-item"><span class="dev-key">${esc(k)}</span><span class="dev-val">${esc(v||'n/a')}</span></div>`).join('');
+    const grid=$('device-grid');
+    if(!grid){ serverStaticLoaded=true; return; }
+    // The panel redraws every 15 seconds. Never steal focus from a copy button.
+    const active=document.activeElement;
+    if(active&&grid.contains(active)&&active.tagName==='BUTTON'){ serverStaticLoaded=true; return; }
+    grid.innerHTML=renderDeviceInfo(d);
     serverStaticLoaded=true;
   }catch(e){}
 }

@@ -825,12 +825,92 @@
     .core-bar > span, .disk-fill { transition:background 0.3s ease; }
   }
 
-  .device-card { border:1px solid var(--gray-200); border-radius:8px; padding:16px 18px; margin-top:16px; background:var(--white); }
+  .device-card { border:1px solid var(--gray-200); border-radius:12px; padding:16px 18px; margin-top:16px; background:var(--white); box-shadow:var(--shadow-sm); }
   .device-title { font-size:13px; font-weight:700; color:var(--black); margin-bottom:14px; }
-  .device-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px 24px; }
-  .dev-item { display:flex; flex-direction:column; gap:2px; }
-  .dev-key { font-size:10px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; color:var(--gray-400); }
-  .dev-val { font-size:13px; color:var(--black); font-family:var(--mono); word-break:break-word; }
+  .device-card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+  .device-card-head .device-title { margin-bottom:0; font-size:14px; }
+  .device-card-heading { min-width:0; }
+  .device-sub { margin-top:2px; color:var(--gray-500); font-size:11.5px; line-height:1.4; }
+  .device-live { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border:1px solid var(--gray-200); border-radius:999px; background:var(--gray-50); color:var(--gray-600); font-size:10.5px; font-weight:600; white-space:nowrap; }
+  .device-live .status-dot { flex:0 0 auto; }
+  .device-grid { display:block; }
+
+  .dev-hero { display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; padding:13px 15px; border:1px solid var(--gray-200); border-radius:10px; background:var(--gray-50); }
+  .dev-id { display:flex; align-items:center; gap:12px; min-width:0; }
+  .dev-mark { flex:0 0 auto; width:40px; height:40px; display:grid; place-items:center; border-radius:10px; background:var(--accent-soft); color:var(--accent); }
+  .dev-mark .ic { width:20px; height:20px; }
+  .dev-id-copy { min-width:0; }
+  .dev-name { max-width:46ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--black); font-family:var(--display); font-size:18px; font-weight:700; line-height:1.2; }
+  .dev-os { display:flex; align-items:center; flex-wrap:wrap; gap:5px; margin-top:2px; color:var(--gray-600); font-size:11.5px; line-height:1.35; }
+  .dev-sep { color:var(--gray-300); }
+  .dev-pills { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:6px; margin-left:auto; }
+  .dev-pill { display:inline-flex; align-items:center; gap:4px; padding:4px 8px; border:1px solid var(--gray-200); border-radius:999px; background:var(--white); color:var(--gray-700); font-family:var(--display); font-size:10.5px; font-weight:600; white-space:nowrap; }
+  .dev-pill .ic { width:12px; height:12px; color:var(--gray-400); }
+  .dev-pill.dev-state-cool { border-color:color-mix(in srgb, var(--success) 30%, var(--gray-200)); background:color-mix(in srgb, var(--success) 10%, var(--white)); color:var(--success); }
+  .dev-pill.dev-state-warm { border-color:color-mix(in srgb, var(--warn) 30%, var(--gray-200)); background:color-mix(in srgb, var(--warn) 10%, var(--white)); color:var(--warn); }
+  .dev-pill.dev-state-hot { border-color:color-mix(in srgb, var(--danger) 30%, var(--gray-200)); background:color-mix(in srgb, var(--danger) 10%, var(--white)); color:var(--danger); }
+  .dev-pill.dev-state-cool .ic, .dev-pill.dev-state-warm .ic, .dev-pill.dev-state-hot .ic { color:currentColor; }
+
+  .dev-groups { display:grid; grid-template-columns:1.05fr .85fr 1.1fr; gap:12px; margin-top:12px; align-items:stretch; }
+  .dev-group { min-width:0; padding:12px 14px; border:1px solid var(--gray-200); border-radius:10px; background:var(--white); }
+  .dev-group-head { display:flex; align-items:center; gap:6px; margin-bottom:10px; color:var(--gray-600); font-family:var(--display); font-size:10px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; }
+  .dev-group-head .ic { width:13px; height:13px; color:var(--accent); }
+  .dev-group > .dev-fact { margin-bottom:9px; }
+  .dev-details { margin-top:10px; padding-top:9px; border-top:1px solid var(--gray-100); }
+  .dev-details .dev-fact + .dev-fact { margin-top:8px; }
+  .dev-group.network { display:flex; flex-direction:column; }
+  .dev-group.network .dev-hint { margin-top:auto; padding-top:9px; }
+  .dev-facts { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px 12px; }
+  .dev-fact { min-width:0; }
+  .dev-fact.wide { grid-column:1 / -1; }
+  .dev-fact-label { color:var(--gray-400); font-family:var(--display); font-size:9px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; }
+  .dev-fact-value { margin-top:1px; color:var(--black); font-size:12.5px; line-height:1.35; overflow-wrap:anywhere; }
+  .dev-fact.cpu .dev-fact-value { font-size:13px; font-weight:600; }
+  .dev-fact-value.mono { font-family:var(--mono); font-size:11.5px; line-height:1.45; }
+  .dev-fact-value.muted { color:var(--gray-500); }
+  .dev-fact-value.dev-state-cool { color:var(--success); }
+  .dev-fact-value.dev-state-warm { color:var(--warn); }
+  .dev-fact-value.dev-state-hot { color:var(--danger); }
+  .dev-fact-note { margin-top:1px; color:var(--gray-500); font-size:10px; line-height:1.4; overflow-wrap:anywhere; }
+  .dev-tag { display:inline-block; padding:0 4px; border-radius:3px; background:var(--accent-soft); color:var(--accent); font-family:var(--mono); font-size:9.5px; line-height:1.5; }
+
+  .dev-ip { appearance:none; -webkit-appearance:none; width:100%; display:grid; grid-template-columns:minmax(0, 1fr) auto; grid-template-rows:auto auto auto; column-gap:8px; align-items:center; padding:9px 10px; border:1px solid var(--gray-200); border-radius:8px; background:var(--white); color:inherit; font-family:inherit; text-align:left; cursor:pointer; transition:background 0.14s, border-color 0.14s; }
+  .dev-ip + .dev-ip { margin-top:8px; }
+  .dev-ip:hover { background:var(--accent-soft); border-color:var(--accent); }
+  .dev-ip:focus-visible { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+  .dev-ip.muted { cursor:default; background:var(--gray-50); }
+  .dev-ip.muted:hover { background:var(--gray-50); border-color:var(--gray-200); }
+  .dev-ip-kind { grid-column:1; display:flex; align-items:center; gap:4px; color:var(--gray-500); font-family:var(--display); font-size:9px; font-weight:700; letter-spacing:0.6px; text-transform:uppercase; }
+  .dev-ip-kind .ic { width:11px; height:11px; color:var(--gray-400); }
+  .dev-ip-value { grid-column:1; overflow:hidden; color:var(--black); font-family:var(--mono); font-size:13px; text-overflow:ellipsis; white-space:nowrap; }
+  .dev-ip.muted .dev-ip-value { color:var(--gray-500); }
+  .dev-ip-note { grid-column:1; color:var(--gray-500); font-size:10px; line-height:1.3; }
+  .dev-ip-note:empty { display:none; }
+  .dev-ip-copy { grid-column:2; grid-row:1 / span 3; width:14px; height:14px; color:var(--gray-400); opacity:0.6; transition:opacity 0.14s, color 0.14s; }
+  .dev-ip:hover .dev-ip-copy { color:var(--accent); opacity:1; }
+  .dev-hint { display:flex; align-items:center; gap:4px; color:var(--gray-400); font-size:9.5px; line-height:1.4; }
+  .dev-hint .ic { width:10px; height:10px; flex:0 0 auto; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .dev-ip, .dev-ip-copy { transition:none; }
+  }
+  @media (max-width: 980px) {
+    .dev-groups { grid-template-columns:1fr 1fr; }
+    .dev-group.system { grid-column:1 / -1; }
+  }
+  @media (max-width: 720px) {
+    .device-card { padding:14px; }
+    .dev-hero { padding:12px; }
+    .dev-pills { width:100%; justify-content:flex-start; margin-left:0; }
+    .dev-groups { grid-template-columns:1fr; }
+    .dev-group.system { grid-column:auto; }
+  }
+  @media (max-width: 480px) {
+    .dev-name { font-size:16px; }
+    .dev-mark { width:36px; height:36px; }
+    .dev-facts { grid-template-columns:1fr; }
+    .dev-fact.wide { grid-column:auto; }
+  }
 
   /* ---- TERMINAL (xterm.js PTY), multi-session tabs ---- */
   /* The terminal view fills the whole pane (no padding) so the PTY gets every
