@@ -427,8 +427,8 @@ function renderDeviceInfo(d){
   const boot=devBootParts(d.boot_time);
   const cores=Number(d.cpu_cores_physical)||0;
   const threads=Number(d.cpu_cores_logical)||0;
-  const freq=d.cpu_max_mhz?` @ ${(d.cpu_max_mhz/1000).toFixed(2)} GHz`:'';
-  const coreNote=(cores||threads)?`${cores} physical / ${threads} logical${freq}`:'';
+  const clock=d.cpu_max_mhz?`${(d.cpu_max_mhz/1000).toFixed(2)} GHz`:'';
+  const coreText=(cores||threads)?`${cores} physical / ${threads} logical`:'n/a';
   let battText='None present',battNote='',battClass='muted';
   if(d.battery){
     const p=Number(d.battery.percent);
@@ -456,12 +456,14 @@ function renderDeviceInfo(d){
   const hardware=`
     <section class="dev-group hardware">
       <div class="dev-group-head"><svg class="ic"><use href="#ic-cpu"/></svg>Hardware</div>
-      ${devFact('Processor',d.cpu_model||'Unknown CPU',{extraClass:'cpu',title:d.cpu_model||'',note:coreNote})}
+      ${devFact('Processor',d.cpu_model||'Unknown CPU',{extraClass:'cpu',title:d.cpu_model||''})}
       <div class="dev-facts">
         ${devFact('Memory',d.ram_total_h||'n/a',{mono:true})}
         ${devFact('Disk',d.disk_total_h||'n/a',{mono:true})}
         ${devFact('Temperature',tempText,{mono:true,valueClass:tempClass,note:tempNote,title:hasTemp?'CPU temperature':'No temperature sensor reported'})}
         ${devFact('Fan',fan.value,{mono:true,note:fan.note,title:fan.title,valueClass:fan.value==='No sensor'||fan.value==='Not reported'?'muted':''})}
+        ${devFact('Cores',coreText,{mono:true,extraClass:'cores'})}
+        ${devFact('Max clock',clock||'n/a',{mono:true,extraClass:'clock'})}
         ${devFact('Battery',battText,{wide:true,mono:true,valueClass:battClass,note:battNote,title:d.battery?'Battery charge and state':'No battery reported by this machine'})}
       </div>
     </section>`;
@@ -587,6 +589,7 @@ let _srvDetailKind=null, _fbPath='', _accessDetailId=null;
 let _uploadQueue=[], _uploadActive=false, _uploadCancelled=false, _uploadXhr=null;
 let _uploadFolder='', _uploadStopResolve=null;
 let _ipDetailTarget=null, _ipProfileData=null, _lineDetailObj=null, _lineDetailTitle='';
+let _netDetailTimer=null, _netDetailBusy=false, _netOnlyEstablished=true;
 const _SRV_TITLES={cpu:'CPU: Top Processes',mem:'Memory: Top Processes',net:'Network: Active Connections',disk:'Disk: File Browser'};
 /* Which grant each drill-down needs. The server refuses without it either way;
    this is so the person sees a sentence instead of a failed request. */
@@ -607,6 +610,7 @@ const _SRV_DENIED={
 };
 
 function openServerDetail(kind){
+  stopNetDetailPoll();
   _srvDetailKind=kind;
   $('srv-detail-title').textContent=_SRV_TITLES[kind]||'Detail';
   $('srv-detail-overlay').classList.add('open');
@@ -622,6 +626,7 @@ function openServerDetail(kind){
     return;
   }
   loadServerDetail();
+  if(kind==='net') startNetDetailPoll();
 }
 
 /* Marks the meters that cannot be opened, so the pointer and hover state stop
@@ -637,12 +642,27 @@ function applyMetricPermissions(){
   });
 }
 function closeServerDetail(){
+  stopNetDetailPoll();
   $('srv-detail-overlay').classList.remove('open');
   _srvDetailKind=null;
   const uploadBtn=$('srv-upload-btn');
   if(uploadBtn) uploadBtn.hidden=true;
 }
 function refreshServerDetail(){ loadServerDetail(); }
+function startNetDetailPoll(){
+  stopNetDetailPoll();
+  _netDetailTimer=setInterval(()=>{
+    if(_srvDetailKind!=='net'){ stopNetDetailPoll(); return; }
+    renderNetDetail(true);
+  },2000);
+}
+function stopNetDetailPoll(){
+  if(_netDetailTimer){ clearInterval(_netDetailTimer); _netDetailTimer=null; }
+}
+function setNetEstablishedOnly(on){
+  _netOnlyEstablished=!!on;
+  renderNetDetail();
+}
 async function loadServerDetail(){
   if(_srvDetailKind==='cpu'||_srvDetailKind==='mem') return renderProcDetail(_srvDetailKind);
   if(_srvDetailKind==='net') return renderNetDetail();
@@ -663,11 +683,28 @@ async function renderProcDetail(by){
       <tbody>${rows||'<tr><td colspan="6">No data.</td></tr>'}</tbody></table>`;
   }catch(e){ b.innerHTML=`<div class="empty-state">Failed: ${esc(String(e))}</div>`; }
 }
-async function renderNetDetail(){
-  const b=$('srv-detail-body'); b.innerHTML='<div class="empty-state">Reading connections…</div>';
+function fmtRate(n){ return fmtBytes(n)+'/s'; }
+function netRateCell(c,field,bytesField,rateError){
+  if(c.status!=='ESTABLISHED') return '<span class="net-rate muted">-</span>';
+  if(c[bytesField]==null) return '<span class="net-rate muted" title="No per-socket byte counters">-</span>';
+  const v=c[field];
+  if(v==null){
+    if(rateError) return `<span class="net-rate muted" title="${escAttr(rateError)}">-</span>`;
+    return '<span class="net-rate sampling">sampling…</span>';
+  }
+  const total=`In ${fmtBytes(c.bytes_in)} total · Out ${fmtBytes(c.bytes_out)} total`;
+  return `<span class="net-rate" title="${escAttr(total)}">${esc(fmtRate(v))}</span>`;
+}
+async function renderNetDetail(silent){
+  if(_srvDetailKind!=='net'||_netDetailBusy) return;
+  _netDetailBusy=true;
+  const b=$('srv-detail-body'); const oldScroll=b?b.scrollTop:0;
+  if(!silent&&b) b.innerHTML='<div class="empty-state">Reading connections…</div>';
+  const only=_netOnlyEstablished;
   try{
-    const d=await (await api('/api/system/connections')).json();
-    if(d.error){ b.innerHTML=`<div class="empty-state">${esc(d.error)}</div>`; return; }
+    const d=await (await api('/api/system/connections'+(only?'?established=1':''))).json();
+    if(_srvDetailKind!=='net'||only!==_netOnlyEstablished) return;
+    if(d.error){ if(!silent&&b) b.innerHTML=`<div class="empty-state">${esc(d.error)}</div>`; return; }
     const rows=(d.connections||[]).map(c=>{
       const isAuth=c.process&&c.process.includes('sshd-auth'), isSess=c.process&&c.process.includes('sshd-session');
       let rowStyle='',stateCell=esc(c.status),processCell=esc(c.process);
@@ -675,13 +712,25 @@ async function renderNetDetail(){
         processCell='<span style="color:var(--danger);font-weight:600;">sshd-auth</span> <span style="font-size:10px;color:var(--danger);background:color-mix(in srgb, var(--danger) 12%, transparent);border-radius:3px;padding:1px 5px;">TCP only, NOT authenticated</span>'; }
       else if(isSess){ rowStyle='background:color-mix(in srgb, var(--success) 8%, transparent);'; stateCell='<span style="color:var(--success);font-weight:700;">ESTAB</span>';
         processCell=`<span style="color:var(--success);font-weight:600;">${esc(c.process)}</span> <span style="font-size:10px;color:var(--success);background:color-mix(in srgb, var(--success) 12%, transparent);border-radius:3px;padding:1px 5px;">SSH authenticated session</span>`; }
-      return `<tr style="${rowStyle}"><td>${esc(c.proto)}</td><td>${esc(c.laddr)}</td><td><b>${esc(c.raddr)}</b></td><td>${stateCell}</td><td>${esc(c.pid)}</td><td>${processCell}</td></tr>`;
+      return `<tr style="${rowStyle}"><td>${esc(c.proto)}</td><td>${esc(c.laddr)}</td><td><b>${esc(c.raddr)}</b></td><td>${netRateCell(c,'rate_in','bytes_in',d.rate_error)}</td><td>${netRateCell(c,'rate_out','bytes_out',d.rate_error)}</td><td>${stateCell}</td><td>${esc(c.pid)}</td><td>${processCell}</td></tr>`;
     }).join('');
-    b.innerHTML=`<div style="font-size:12px;color:var(--gray-600);margin-bottom:10px;line-height:1.6;">Listening sockets first. On port 22:
-      <span style="color:var(--danger);font-weight:600;">sshd-auth</span> = connected but not authenticated · <span style="color:var(--success);font-weight:600;">sshd-session</span> = authenticated shell.</div>
-      <table><thead><tr><th>Proto</th><th>Local</th><th>Remote IP</th><th>State</th><th>PID</th><th>Process</th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="6">No connections.</td></tr>'}</tbody></table>`;
-  }catch(e){ b.innerHTML=`<div class="empty-state">Failed: ${esc(String(e))}</div>`; }
+    const intro=only
+      ? 'Showing established TCP connections only. In and Out are live per-socket rates, sampled every 2 seconds.'
+      : 'Showing all sockets. In and Out are live per-socket rates for established TCP connections, sampled every 2 seconds; listeners show a hyphen.';
+    const warn=d.rate_error?`<div class="net-warn">${esc(d.rate_error)}</div>`:'';
+    const empty=only?'No established connections.':'No connections.';
+    if(b){
+      b.innerHTML=`<div class="net-tools"><label class="net-filter"><input type="checkbox" ${only?'checked':''} onchange="setNetEstablishedOnly(this.checked)"> Established only</label>
+        <span class="net-live"><span class="status-dot"></span>Live every 2s</span></div>
+        <div class="net-intro">${intro}</div>${warn}
+        <div class="net-legend">Per-socket TCP counters. Loopback traffic can appear on both endpoints. On port 22:
+          <span style="color:var(--danger);font-weight:600;">sshd-auth</span> = connected but not authenticated · <span style="color:var(--success);font-weight:600;">sshd-session</span> = authenticated shell.</div>
+        <table><thead><tr><th>Proto</th><th>Local</th><th>Remote IP</th><th title="Bytes received by this socket">↓ In</th><th title="Bytes sent by this socket">↑ Out</th><th>State</th><th>PID</th><th>Process</th></tr></thead>
+        <tbody>${rows||`<tr><td colspan="8">${empty}</td></tr>`}</tbody></table>`;
+      if(silent) b.scrollTop=oldScroll;
+    }
+  }catch(e){ if(!silent&&_srvDetailKind==='net'&&b) b.innerHTML=`<div class="empty-state">Failed: ${esc(String(e))}</div>`; }
+  finally{ _netDetailBusy=false; }
 }
 /* A long name must not eat the extension. The last dot splits the base from
    the suffix, so the base can ellipsize while the suffix stays fully visible.
@@ -3061,7 +3110,17 @@ function termCloseTab(sid){
   if(tab.ws){ try{ tab.ws.onclose=null; tab.ws.close(); }catch(e){} }
   if(tab._ro){ try{ tab._ro.disconnect(); }catch(e){} tab._ro=null; }
   if(tab.term){ try{ tab.term.dispose(); }catch(e){} }
-  if(tab.els&&tab.els.wrap) tab.els.wrap.remove();
+  if(tab.els&&tab.els.wrap){
+    if(termFsElement()===tab.els.wrap){
+      const exit=document.exitFullscreen||document.webkitExitFullscreen;
+      if(exit){ try{ const p=exit.call(document); if(p&&p.catch) p.catch(()=>{}); }catch(e){} }
+    }
+    if(tab.els.wrap.classList.contains('term-fs')){
+      tab.els.wrap.classList.remove('term-fs');
+      document.body.classList.remove('term-fs-open');
+    }
+    tab.els.wrap.remove();
+  }
   termTabs.splice(idx,1);
   if(!termTabs.length){ const t=termMakeTab(genSid(),null,false); termTabs.push(t); termRenderTabs(); termStoreSave(); termActivate(t.sid); return; }
   termRenderTabs(); termStoreSave(); if(activeSid===sid) termActivate(termTabs[Math.max(0,idx-1)].sid);
@@ -3077,12 +3136,72 @@ function termFit(tab){ if(!tab||!tab.term||!tab.fit||!tab.els) return false; con
 function termFitWhenReady(tab,tries){ tries=(tries==null)?40:tries; if(termFit(tab)){ try{ tab.term.focus(); }catch(e){} return; } if(tries<=0) return; requestAnimationFrame(()=>termFitWhenReady(tab,tries-1)); }
 function termFitActive(){ termFitWhenReady(termGetTab(activeSid)); }
 function termSetStatus(tab,text,cls){ if(tab&&tab.els){ tab.els.status.textContent=text; tab.els.status.className='term-status'+(cls?' '+cls:''); } }
+/* Fullscreen works both ways: the Browser Fullscreen API where it exists, and
+   a fixed-position fallback where it is refused (some embedded webviews). The
+   fallback keeps Escape working too, since the browser has nothing to exit. */
+function termFsElement(){ return document.fullscreenElement||document.webkitFullscreenElement||null; }
+function termFullscreenActive(tab){
+  const wrap=tab&&tab.els&&tab.els.wrap;
+  return !!wrap&&(termFsElement()===wrap||wrap.classList.contains('term-fs'));
+}
+function termSyncFullscreenButton(tab){
+  if(!tab||!tab.els||!tab.els.wrap) return;
+  const btn=tab.els.wrap.querySelector('.t-full'); if(!btn) return;
+  const on=termFullscreenActive(tab);
+  const label=btn.querySelector('span'); if(label) label.textContent=on?'Exit fullscreen':'Fullscreen';
+  btn.title=on?'Exit fullscreen':'Fullscreen terminal';
+  btn.setAttribute('aria-pressed',on?'true':'false');
+}
+function termFallbackFullscreen(tab,on){
+  const wrap=tab&&tab.els&&tab.els.wrap; if(!wrap) return;
+  _hideTermCopyBtn();
+  wrap.classList.toggle('term-fs',!!on);
+  document.body.classList.toggle('term-fs-open',!!on);
+  termSyncFullscreenButton(tab);
+  setTimeout(termFitActive,60);
+}
+function termToggleFullscreen(tab){
+  const wrap=tab&&tab.els&&tab.els.wrap; if(!wrap) return;
+  if(termFsElement()===wrap){
+    const exit=document.exitFullscreen||document.webkitExitFullscreen;
+    if(exit){ try{ const p=exit.call(document); if(p&&p.catch) p.catch(()=>{}); }catch(e){} }
+    return;
+  }
+  if(wrap.classList.contains('term-fs')){ termFallbackFullscreen(tab,false); return; }
+  const req=wrap.requestFullscreen||wrap.webkitRequestFullscreen;
+  if(!req){ termFallbackFullscreen(tab,true); return; }
+  try{
+    const p=req.call(wrap);
+    if(p&&p.catch) p.catch(()=>termFallbackFullscreen(tab,true));
+  }catch(e){ termFallbackFullscreen(tab,true); }
+}
+function termSyncAllFullscreenButtons(){
+  _hideTermCopyBtn();
+  termTabs.forEach(tab=>termSyncFullscreenButton(tab));
+  setTimeout(termFitActive,60);
+}
+document.addEventListener('fullscreenchange',termSyncAllFullscreenButtons);
+document.addEventListener('webkitfullscreenchange',termSyncAllFullscreenButtons);
+document.addEventListener('keydown',(e)=>{
+  if(e.key!=='Escape') return;
+  let changed=false;
+  termTabs.forEach(tab=>{
+    if(tab.els&&tab.els.wrap.classList.contains('term-fs')){
+      tab.els.wrap.classList.remove('term-fs');
+      termSyncFullscreenButton(tab);
+      changed=true;
+    }
+  });
+  if(changed){ document.body.classList.remove('term-fs-open'); setTimeout(termFitActive,60); }
+});
 function termBuildPanel(tab){
   const stack=$('term-stack'); const wrap=document.createElement('div'); wrap.className='term-wrap'; wrap.dataset.sid=tab.sid; wrap.style.display='none';
   const perms=window.MGMT_PERMS||{}; const termTitle=perms.terminalAccess==='limited'?'Restricted terminal: your own system account':'Root terminal: live interactive shell';
   wrap.innerHTML='<div class="term-bar"><span class="term-title">'+esc(termTitle)+'</span><span class="term-status">connecting…</span>'+
     '<label class="term-stay" title="Keep this session running even after you close the site"><input type="checkbox"'+(tab.persist?' checked':'')+'><span>Stay on</span></label>'+
-    '<button class="term-clear t-clear">Clear</button><button class="term-clear t-recon">Reconnect</button><button class="term-clear term-close t-close">Close</button></div>'+
+    '<button class="term-clear t-clear">Clear</button><button class="term-clear t-recon">Reconnect</button>'+
+    '<button class="term-clear t-full" type="button" aria-pressed="false" title="Fullscreen terminal"><svg class="ic"><use href="#ic-maximize-2"/></svg><span>Fullscreen</span></button>'+
+    '<button class="term-clear term-close t-close">Close</button></div>'+
     '<div class="term-host"></div><div class="term-hint">A real PTY: run <code>top</code>, <code>vim</code>, anything interactive. <strong>Stay on</strong> keeps it alive after you close the site.</div>';
   stack.appendChild(wrap);
   const host=wrap.querySelector('.term-host'), status=wrap.querySelector('.term-status'), stay=wrap.querySelector('.term-stay input');
@@ -3090,6 +3209,7 @@ function termBuildPanel(tab){
   stay.addEventListener('change',()=>{ tab.persist=stay.checked; try{ if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(JSON.stringify({persist:tab.persist})); }catch(e){} termStoreSave(); termRenderTabs(); });
   wrap.querySelector('.t-clear').onclick=()=>{ if(tab.term){ tab.term.clear(); tab.term.focus(); } };
   wrap.querySelector('.t-recon').onclick=()=>termTabReconnect(tab);
+  wrap.querySelector('.t-full').onclick=()=>termToggleFullscreen(tab);
   wrap.querySelector('.t-close').onclick=()=>termCloseTab(tab.sid);
   const isDark=document.documentElement.getAttribute('data-theme')==='dark';
   const term=new window.Terminal({cursorBlink:true,fontFamily:'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',fontSize:13,scrollback:5000,
@@ -3118,12 +3238,20 @@ function termTabReconnect(tab){ if(tab.ws){ try{ tab.ws.onclose=null; tab.ws.clo
 /* Floating copy button that follows a terminal text selection (dash.css
    already ships .term-copy-btn; this just drives it). */
 let _termCopyBtn=null;
+function _termCopyBtnHost(){
+  const fs=termFsElement();
+  return fs&&fs.classList&&fs.classList.contains('term-wrap')?fs:document.body;
+}
 function _termCopyBtnEl(){
-  if(_termCopyBtn) return _termCopyBtn;
+  if(_termCopyBtn){
+    const host=_termCopyBtnHost();
+    if(_termCopyBtn.parentElement!==host) host.appendChild(_termCopyBtn);
+    return _termCopyBtn;
+  }
   const btn=document.createElement('button'); btn.type='button'; btn.className='term-copy-btn';
   btn.innerHTML='<svg class="ic"><use href="#ic-copy"/></svg>Copy';
-  document.body.appendChild(btn);
-  document.addEventListener('mousedown',(e)=>{ if(e.target!==btn) _hideTermCopyBtn(); });
+  _termCopyBtnHost().appendChild(btn);
+  document.addEventListener('mousedown',(e)=>{ if(!btn.contains(e.target)) _hideTermCopyBtn(); });
   window.addEventListener('scroll',_hideTermCopyBtn,true);
   _termCopyBtn=btn; return btn;
 }

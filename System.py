@@ -12,6 +12,7 @@
 # Heavy deps (psutil) and DB are imported lazily inside the functions.
 
 import os
+import re
 import sys
 import time
 import shlex
@@ -19,6 +20,7 @@ import platform
 import shutil
 import subprocess
 import logging
+import threading
 from datetime import datetime
 
 # --- Server launch defaults ---------------------------------------------------
@@ -42,6 +44,16 @@ _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 # psutil only gives cumulative byte counters; we turn them into a live rate by
 # remembering the previous sample and dividing the delta by the elapsed time.
 _net_last = {"t": None, "sent": 0, "recv": 0}
+
+# The drill-down uses ss tcp_info counters per established socket. Those are
+# cumulative too, so the same delta trick works; the cache is rebuilt on every
+# detail request so closed sockets cannot accumulate here.
+_conn_last = {}
+_conn_lock = threading.Lock()
+_SS_SENT_RE = re.compile(r"bytes_sent:(\d+)")
+_SS_RECV_RE = re.compile(r"bytes_received:(\d+)")
+_SS_PID_RE = re.compile(r"pid=(\d+)")
+_SS_FD_RE = re.compile(r"fd=(\d+)")
 
 # --- Terminal state -----------------------------------------------------------
 # A web terminal needs a working directory that survives between commands so
@@ -893,18 +905,139 @@ def top_processes(by="cpu", limit=25):
     return {"by": key, "processes": out[:limit]}
 
 
-def net_connections(limit=300):
-    """Live inbound/outbound network connections with the owning process and port."""
+def _norm_endpoint(value):
+    """Normalize an ss IPv6 endpoint to the ip:port form psutil produces."""
+    value = str(value or "")
+    if value.startswith("[") and "]:" in value:
+        return value[1:].replace("]:", ":", 1)
+    return value
+
+
+def _parse_ss_established(text):
+    """Parse `ss -tinp` output into established sockets with byte counters.
+
+    ss prints one socket line, then a tab-indented tcp_info line carrying the
+    cumulative bytes_sent and bytes_received fields. Keeping the parse separate
+    makes the wire format testable without a live kernel socket.
+    """
+    entries = []
+    current = None
+    for raw in str(text or "").splitlines():
+        if not raw.strip():
+            continue
+        if raw[:1].isspace():
+            if current is None:
+                continue
+            sent = _SS_SENT_RE.search(raw)
+            recv = _SS_RECV_RE.search(raw)
+            if sent is None and recv is None:
+                current = None
+                continue
+            current["sent"] = int(sent.group(1)) if sent else 0
+            current["recv"] = int(recv.group(1)) if recv else 0
+            entries.append(current)
+            current = None
+            continue
+        if raw.startswith("State "):
+            current = None
+            continue
+        parts = raw.split(None, 4)
+        if len(parts) < 4:
+            current = None
+            continue
+        rest = parts[4] if len(parts) > 4 else ""
+        pid = _SS_PID_RE.search(rest)
+        fd = _SS_FD_RE.search(rest)
+        current = {
+            "local": parts[2],
+            "peer": parts[3],
+            "pid": int(pid.group(1)) if pid else None,
+            "fd": int(fd.group(1)) if fd else None,
+            "sent": None,
+            "recv": None,
+        }
+    return entries
+
+
+def _ss_established():
+    """(established socket counters, error) from ss.
+
+    The Network card already has interface totals; this is the per-socket
+    counter source for the drill-down. ss is part of iproute2 on Linux and is
+    only invoked when someone opens that detail, never by the overview poll.
+    """
+    try:
+        proc = subprocess.run(
+            ["ss", "-tinp", "-H", "state", "established"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f"Per-socket counters are unavailable: {type(exc).__name__}"
+    if proc.returncode != 0:
+        msg = (proc.stderr or "").strip().splitlines()
+        reason = msg[0][:120] if msg else "ss failed"
+        return [], f"Per-socket counters are unavailable: {reason}"
+    return _parse_ss_established(proc.stdout or ""), ""
+
+
+def _attach_conn_rates(rows, now=None):
+    """Turn cumulative per-socket counters into rates between detail polls.
+
+    The cache is replaced rather than appended: a closed socket disappears on
+    the next sample, while a reused process/fd pair gets a fresh endpoint key.
+    """
+    global _conn_last
+    now = time.monotonic() if now is None else now
+    with _conn_lock:
+        previous = _conn_last
+        fresh = {}
+        for row in rows:
+            key = row.get("_rate_key")
+            if not key or row.get("bytes_in") is None or row.get("bytes_out") is None:
+                continue
+            old = previous.get(key)
+            if old:
+                dt = now - old["t"]
+                if dt > 0:
+                    row["rate_in"] = max(0.0, round((row["bytes_in"] - old["recv"]) / dt, 1))
+                    row["rate_out"] = max(0.0, round((row["bytes_out"] - old["sent"]) / dt, 1))
+                else:
+                    row["rate_in"] = 0.0
+                    row["rate_out"] = 0.0
+            else:
+                row["rate_in"] = None
+                row["rate_out"] = None
+            fresh[key] = {"t": now, "recv": row["bytes_in"], "sent": row["bytes_out"]}
+        _conn_last = fresh
+
+
+def net_connections(limit=300, established_only=False):
+    """Live network sockets with owner details and per-socket TCP rates.
+
+    Only ESTABLISHED TCP sockets have tcp_info byte counters, so listeners and
+    UDP rows deliberately carry null traffic fields instead of a misleading 0.
+    """
     import psutil
     import socket
     try:
         conns = psutil.net_connections(kind="inet")
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "connections": []}
+    traffic, rate_error = _ss_established()
+    by_fd = {}
+    by_ep = {}
+    for item in traffic:
+        if item.get("pid") is not None and item.get("fd") is not None:
+            by_fd[(item["pid"], item["fd"])] = item
+        by_ep[(_norm_endpoint(item.get("local")), _norm_endpoint(item.get("peer")))] = item
     name_cache = {}
     out = []
     for c in conns:
+        status = c.status or ""
+        if established_only and (status != "ESTABLISHED" or c.type != socket.SOCK_STREAM):
+            continue
         pid = c.pid
+        fd = getattr(c, "fd", None)
         pname = ""
         if pid:
             if pid not in name_cache:
@@ -913,18 +1046,45 @@ def net_connections(limit=300):
                 except Exception:
                     name_cache[pid] = ""
             pname = name_cache[pid]
-        out.append({
+        laddr = f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else ""
+        raddr = f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else ""
+        row = {
             "proto": "TCP" if c.type == socket.SOCK_STREAM else "UDP",
-            "laddr": f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else "",
+            "laddr": laddr,
             "lport": c.laddr.port if c.laddr else 0,
-            "raddr": f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else "",
-            "status": c.status or "",
+            "raddr": raddr,
+            "status": status,
             "pid": pid or "",
             "process": pname,
-        })
+            "bytes_in": None,
+            "bytes_out": None,
+            "rate_in": None,
+            "rate_out": None,
+        }
+        if status == "ESTABLISHED" and c.type == socket.SOCK_STREAM:
+            traffic_row = None
+            if pid is not None and fd is not None:
+                traffic_row = by_fd.get((pid, fd))
+            if traffic_row is None:
+                traffic_row = by_ep.get((_norm_endpoint(laddr), _norm_endpoint(raddr)))
+            if traffic_row is not None:
+                row["bytes_in"] = traffic_row["recv"]
+                row["bytes_out"] = traffic_row["sent"]
+                if pid is not None and fd is not None:
+                    row["_rate_key"] = f"{pid}:{fd}:{laddr}->{raddr}"
+                else:
+                    row["_rate_key"] = f"{row['proto']}:{laddr}->{raddr}"
+        out.append(row)
     # listening sockets first, then by local port
-    out.sort(key=lambda r: (r["status"] != "LISTEN", r["lport"]))
-    return {"connections": out[:limit]}
+    out.sort(key=lambda r: (r["status"] != "LISTEN", r["lport"], r["raddr"]))
+    shown = out[:limit]
+    _attach_conn_rates(shown)
+    for row in shown:
+        row.pop("_rate_key", None)
+    result = {"connections": shown}
+    if rate_error:
+        result["rate_error"] = rate_error
+    return result
 
 
 # Files that must never be offered for download. Source code is blocked because

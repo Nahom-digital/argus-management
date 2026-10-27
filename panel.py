@@ -2674,14 +2674,14 @@ async def api_processes(request: Request, by: str = "cpu"):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/api/system/connections")
-async def api_connections(request: Request):
+async def api_connections(request: Request, established: int = 0):
     if not _authed(request):
         return _need_auth()
     perms, denied = await _require(request, _grant("net_detail"))
     if denied:
         return denied
     try:
-        return await DB.run(System.net_connections)
+        return await DB.run(System.net_connections, established_only=bool(established))
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 

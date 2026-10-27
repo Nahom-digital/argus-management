@@ -694,6 +694,18 @@
       0 -14px 0 var(--white),
       0 -15px 0 var(--white);
   }
+  .net-tools { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+  .net-filter { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; font-weight:600; color:var(--gray-700); cursor:pointer; user-select:none; }
+  .net-filter input { width:14px; height:14px; margin:0; accent-color:var(--accent); cursor:pointer; }
+  .net-live { display:inline-flex; align-items:center; gap:6px; font-size:10.5px; font-weight:600; color:var(--gray-500); }
+  .net-live .status-dot { width:7px; height:7px; box-shadow:0 0 0 2px color-mix(in srgb, var(--success) 18%, transparent); }
+  .net-intro { font-size:12px; color:var(--gray-600); line-height:1.55; margin-bottom:6px; }
+  .net-warn { margin:6px 0 8px; padding:7px 9px; border:1px solid color-mix(in srgb, var(--warn) 28%, var(--gray-200));
+    border-radius:6px; background:color-mix(in srgb, var(--warn) 8%, var(--white)); color:var(--warn); font-size:11px; line-height:1.45; }
+  .net-legend { font-size:11px; color:var(--gray-600); line-height:1.55; margin-bottom:10px; }
+  .net-rate { font-family:var(--mono); font-size:11.5px; font-weight:600; color:var(--black); white-space:nowrap; }
+  .net-rate.muted { color:var(--gray-400); font-weight:400; }
+  .net-rate.sampling { color:var(--gray-500); font-weight:400; font-style:italic; }
   .fb-crumbs { font-family:monospace; font-size:12px; word-break:break-all; margin-bottom:10px; color:var(--gray-600); }
   .fb-row { display:flex; align-items:center; gap:10px; padding:6px 4px; border-bottom:1px solid var(--gray-100); }
   .fb-name { flex:1; min-width:0; display:flex; align-items:center; gap:6px; cursor:default; }
@@ -866,6 +878,7 @@
   .dev-fact-label { color:var(--gray-400); font-family:var(--display); font-size:9px; font-weight:600; letter-spacing:0.5px; text-transform:uppercase; }
   .dev-fact-value { margin-top:1px; color:var(--black); font-size:12.5px; line-height:1.35; overflow-wrap:anywhere; }
   .dev-fact.cpu .dev-fact-value { font-size:13px; font-weight:600; }
+  .dev-fact.cores .dev-fact-value, .dev-fact.clock .dev-fact-value { font-size:12.5px; font-weight:600; }
   .dev-fact-value.mono { font-family:var(--mono); font-size:11.5px; line-height:1.45; }
   .dev-fact-value.muted { color:var(--gray-500); }
   .dev-fact-value.dev-state-cool { color:var(--success); }
@@ -945,13 +958,21 @@
   .term-host .xterm { height:100%; }
   .term-hint { padding:6px 12px; background:var(--gray-50); border-top:1px solid var(--gray-200); font-size:11px; color:var(--gray-500); flex-shrink:0; }
   .term-hint code { font-family:var(--mono); background:var(--gray-100); padding:1px 5px; border-radius:3px; color:var(--gray-800); }
-  .term-clear { padding:5px 12px; border:1px solid var(--gray-200); background:var(--white); border-radius:4px; font-size:11px; cursor:pointer; color:var(--gray-600); flex-shrink:0; }
+  .term-clear { padding:5px 12px; border:1px solid var(--gray-200); background:var(--white); border-radius:4px; font-size:11px; cursor:pointer; color:var(--gray-600); flex-shrink:0; display:inline-flex; align-items:center; gap:5px; }
   .term-clear:hover { background:var(--gray-100); color:var(--black); }
+  .term-clear .ic { width:12px; height:12px; }
+  .term-clear.t-full .ic { color:var(--accent); }
   .term-close:hover { color:var(--danger); border-color:var(--danger); }
+  /* Fullscreen terminal. The API path uses the top layer; the term-fs class is
+     the fallback for webviews that refuse requestFullscreen. */
+  .term-wrap:fullscreen, .term-wrap:-webkit-full-screen { position:fixed; inset:0; width:100%; height:100%; }
+  .term-wrap.term-fs { position:fixed; inset:0; z-index:3200; width:100%; height:100%; }
+  .term-wrap:fullscreen .term-hint, .term-wrap:-webkit-full-screen .term-hint, .term-wrap.term-fs .term-hint { display:none; }
+  body.term-fs-open { overflow:hidden; }
 
   /* Floating "Copy" button that appears next to a terminal text selection. */
   .term-copy-btn {
-    position: fixed; z-index: 2400; display: none;
+    position: fixed; z-index: 3400; display: none;
     align-items: center; gap: 5px;
     padding: 6px 11px; border-radius: 8px;
     background: var(--accent); color: #fff7ea; border: none;
@@ -1065,6 +1086,7 @@
     /* Terminal */
     .term-title { font-size: 11px; }
     .term-hint  { font-size: 10px; }
+    .term-bar   { flex-wrap: wrap; row-gap: 6px; }
   }
 
   @media (max-width: 480px) {

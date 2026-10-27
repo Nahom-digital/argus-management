@@ -230,8 +230,8 @@ def test_the_device_card_is_grouped_for_reading(client):
     end = js.index("async function loadServerStatic", start)
     block = js[start:end]
     for text in ("Hardware", "Network", "System", "Processor", "Memory",
-                 "Temperature", "Battery", "Private", "Public", "OS detail",
-                 "Kernel", "Process"):
+                 "Temperature", "Battery", "Cores", "Max clock",
+                 "Private", "Public", "OS detail", "Kernel", "Process"):
         assert text in block, text
     for cls in ("dev-hero", "dev-groups", "dev-group", "dev-details"):
         assert cls in block, cls
@@ -242,5 +242,66 @@ def test_the_device_card_is_grouped_for_reading(client):
 
     css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
     for cls in (".device-card-head", ".dev-hero", ".dev-groups",
-                ".dev-group", ".dev-details", ".dev-fact", ".dev-ip"):
+                ".dev-group", ".dev-details", ".dev-fact", ".dev-ip",
+                ".dev-fact.cores", ".dev-fact.clock"):
         assert cls in css, cls
+
+
+def test_the_network_detail_has_live_per_socket_rates():
+    """The overview card shows interface totals; the detail adds a direction for
+    each established socket. These names tie the JS renderer to the backend
+    fields and to the two-second sampler it relies on."""
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    start = js.index("function netRateCell(")
+    end = js.index("/* A long name must not eat the extension.", start)
+    block = js[start:end]
+    for text in ("rate_in", "rate_out", "bytes_in", "bytes_out",
+                 "Established only", "Live every 2s", "sampling…",
+                 "?established=1", "setNetEstablishedOnly"):
+        assert text in block, text
+    assert "function renderNetDetail(silent)" in js
+    assert "renderNetDetail(true)" in js
+    assert "stopNetDetailPoll()" in js
+    assert "setInterval(" in js
+    assert "function fmtRate(" in js
+
+    css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
+    for cls in (".net-tools", ".net-filter", ".net-live", ".net-intro",
+                ".net-warn", ".net-legend", ".net-rate"):
+        assert cls in css, cls
+
+
+def test_the_terminal_has_a_fullscreen_toggle():
+    """Fullscreen is an explicit enter/exit control, not F11: the browser
+    Fullscreen API is used where available and a fixed-position fallback keeps
+    embedded webviews working. Escape exits the fallback."""
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    for text in ("termToggleFullscreen", "termSyncFullscreenButton",
+                 "t-full", "ic-maximize-2", "requestFullscreen",
+                 "fullscreenchange", "Exit fullscreen", "term-fs"):
+        assert text in js, text
+    assert "document.addEventListener('keydown'" in js
+
+    css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
+    for cls in (".term-wrap:fullscreen", ".term-wrap.term-fs",
+                "body.term-fs-open", ".term-clear.t-full"):
+        assert cls in css, cls
+
+
+def test_the_network_endpoint_forwards_the_established_filter(client, monkeypatch):
+    """The detail view defaults to established sockets; the query has to reach
+    System.net_connections or the filter is only cosmetic."""
+    import System
+
+    seen = {}
+
+    def fake_connections(established_only=False):
+        seen["established_only"] = established_only
+        return {"connections": []}
+
+    monkeypatch.setattr(System, "net_connections", fake_connections)
+    client.cookies.clear()
+    client.cookies.set("session", panel._create_session_token("admin"))
+    r = client.get("/api/system/connections?established=1")
+    assert r.status_code == 200, r.status_code
+    assert seen["established_only"] is True
