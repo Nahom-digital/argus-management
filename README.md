@@ -104,8 +104,8 @@ throttled per-IP and globally, and every attempt, accepted or not, lands in
 
 ## Config
 
-The Config tab is where the panel administers itself. The admin sees all five
-cards; a staff account sees its own account card plus whatever its grants
+The Config tab is where the panel administers itself. The admin sees every
+card; a staff account sees its own account card plus whatever its grants
 unlock.
 
 - **User Management.** Create staff accounts with their own login and their own
@@ -125,6 +125,20 @@ unlock.
   password field (stored encrypted, informational only, it does not change
   any real account password), and a password-login-vs-key-only toggle for
   `sshd`.
+
+  The same page links other Argus panels. On first start each installation
+  mints a unique server key and keeps it encrypted in `merge_serverkey`; an
+  admin adds a panel by entering its host and pasting *that* panel's key. A bare
+  host means HTTPS on 443; add `:80` or an `http://` URL for a plain-HTTP panel.
+  The first contact records an access request on the other side, and nothing is
+  readable until its admin allows it. Approval is one-directional: linking A to
+  B does not give B access to A. Linked servers appear in a rail at the top of
+  the Server page with their live CPU, memory, network, disk, load and hardware
+  overview, and go visibly down when they stop answering. Remote terminals are
+  admin-only; encrypted remote keys are never sent back to the browser (the
+  local identity key appears only on the admin-only Server Configuration card).
+  Either side can replace a stored key without losing the staff rules attached
+  to that server.
 - **Service.** The systemd service list and controls that used to be their
   own tab.
 - **Database.** A row-level viewer and editor over this panel's own tables
@@ -188,6 +202,13 @@ Four things worth knowing about how this is enforced:
   needs a matching request-body limit.
 - **Revocation is per account.** Resetting one staff password, or taking a grant
   away, signs out that person on their next request and nobody else.
+- **Linked servers are a separate grant list.** An admin grants a staff account
+  named servers and, separately per server, an access switch plus CPU, memory,
+  network and disk. Access alone still shows the hardware overview; the metric
+  cards need their own scope. Those scopes are stored in `merge_user_access`,
+  not in the ordinary permission registry, and are re-checked by the other panel
+  from signed claims. Linked terminals are never delegable, and remote disk
+  access is the whole filesystem for admins and permitted staff alike.
 
 Recovery codes belong to the admin account alone. A staff member who forgets
 their password asks an admin, who resets it from the user list, which is a
@@ -205,6 +226,7 @@ stronger check than a code sitting in a file.
 | `vault.py`      | symmetric encryption for the few secrets that must be read back, not just verified |
 | `ssh_vault.py`  | SSH keypair generation and encrypted storage for the Server Configuration card |
 | `panel_users.py`| staff accounts and their permission grants |
+| `merge_servers.py` | panel linking, server keys, signed server-to-server calls, linked-user scopes |
 | `nginx_proxy.py`| renders, validates and manages nginx server blocks for the Proxy card |
 | `firewall.py`   | port rules, blocked addresses, and the automatic block after repeated SSH failures |
 | `static_mgmt/`  | CSS design system + panel JS + icon sprite |
@@ -228,6 +250,10 @@ The wizard creates exactly what the panel runs on:
 | `http_access_log` | HTTP request/response log |
 | `ssh` | encrypted SSH keypair and reference password for Server Configuration |
 | `panel_user` | staff accounts and their permission grants |
+| `merge_serverkey` | this installation's server key and each linked panel's encrypted key |
+| `merge_server` | linked panels, their address, approval and live status |
+| `merge_request` | incoming panel access requests and the local decision |
+| `merge_user_access` | per-staff linked-server visibility and CPU/memory/network/disk scopes |
 
 Picking an existing database only adds these tables; nothing already there is touched,
 and the Database card only ever shows this list, never other tables that might already

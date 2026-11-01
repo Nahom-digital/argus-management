@@ -1463,6 +1463,61 @@ SCHEMA = (
     ("Cloudflare tunnels and their forwards", cloudflare_tunnel.SCHEMA),
     ("mailboxes, messages and mail settings", mail.SCHEMA),
     ("names and pictures for each account", identity.SCHEMA),
+    # Kept inline rather than imported from merge_servers: that module imports
+    # DB and psycopg2, and this file is read before the dependency bootstrap.
+    ("linked management servers", (
+        """CREATE TABLE IF NOT EXISTS merge_serverkey (
+               key_id       VARCHAR(64) PRIMARY KEY,
+               server_uid   VARCHAR(64),
+               role         VARCHAR(16) NOT NULL DEFAULT 'remote',
+               label        VARCHAR(200) NOT NULL DEFAULT '',
+               key_cipher   TEXT NOT NULL,
+               created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+               rotated_at   TIMESTAMPTZ
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_merge_key_uid ON merge_serverkey(server_uid)",
+        """CREATE TABLE IF NOT EXISTS merge_server (
+               id              VARCHAR(64) PRIMARY KEY,
+               name            VARCHAR(120) NOT NULL DEFAULT '',
+               host            TEXT NOT NULL,
+               port            INTEGER NOT NULL DEFAULT 80,
+               scheme          VARCHAR(8) NOT NULL DEFAULT 'http',
+               base_path       VARCHAR(200) NOT NULL DEFAULT '',
+               key_id          VARCHAR(64) NOT NULL,
+               server_uid      VARCHAR(64),
+               remote_hostname TEXT NOT NULL DEFAULT '',
+               status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+               approved        BOOLEAN NOT NULL DEFAULT FALSE,
+               last_error      TEXT NOT NULL DEFAULT '',
+               last_seen       TIMESTAMPTZ,
+               position        INTEGER NOT NULL DEFAULT 0,
+               created_by      VARCHAR(100) NOT NULL DEFAULT '',
+               created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_merge_server_pos ON merge_server(position)",
+        "CREATE INDEX IF NOT EXISTS idx_merge_server_uid ON merge_server(server_uid)",
+        """CREATE TABLE IF NOT EXISTS merge_request (
+               server_uid   VARCHAR(64) PRIMARY KEY,
+               hostname     TEXT NOT NULL DEFAULT '',
+               host         TEXT NOT NULL DEFAULT '',
+               status       VARCHAR(16) NOT NULL DEFAULT 'pending',
+               requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
+               decided_at   TIMESTAMPTZ,
+               decided_by   VARCHAR(100) NOT NULL DEFAULT '',
+               note         TEXT NOT NULL DEFAULT ''
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_merge_request_status ON merge_request(status)",
+        """CREATE TABLE IF NOT EXISTS merge_user_access (
+               username    VARCHAR(100) NOT NULL,
+               server_id   VARCHAR(64) NOT NULL,
+               permissions JSONB NOT NULL DEFAULT '{}'::jsonb,
+               position    INTEGER NOT NULL DEFAULT 0,
+               created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+               PRIMARY KEY (username, server_id)
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_merge_access_user ON merge_user_access(username, position)",
+    )),
 )
 
 # Columns added to tables that may predate this version of the schema. Each is
@@ -1484,7 +1539,8 @@ SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",
                  "http_access_log", "ssh", "panel_user",
                  "fw_block", "fw_rule", "cf_tunnel", "cf_route",
                  "mail_config", "mail_box", "mail_message",
-                 "panel_identity")
+                 "panel_identity", "merge_serverkey", "merge_server",
+                 "merge_request", "merge_user_access")
 
 
 def app_connection(cfg):

@@ -338,8 +338,19 @@ function renderRecoveryCodes(codes){
 const HIST_LEN=40;
 let cpuHist=[],ramHist=[],netInHist=[],netOutHist=[];
 let serverPollTimer=null, serverStaticTimer=null, serverStaticLoaded=false;
+let remotePollTimer=null, remoteStaticTimer=null, remoteStaticLoaded=false;
+let serverListTimer=null;
+let _srvList=[], _srvActive='local', _srvListLoaded=false, _srvRailBusy=false;
+let _srvRailInfo={is_admin:false,local:{name:'This server'}};
+let remoteCpuHist=[],remoteRamHist=[],remoteNetInHist=[],remoteNetOutHist=[];
+let remoteStatsBusyFor=null, remoteStaticBusyFor=null;
 
 function startServerPolling(){
+  if(!_srvListLoaded) loadServerList();
+  if(serverListTimer) clearInterval(serverListTimer);
+  serverListTimer=setInterval(loadServerList,15000);
+  if(_srvActive!=='local'){ startRemotePolling(); return; }
+  stopRemotePolling();
   if(!serverStaticLoaded) loadServerStatic();
   pollServerStats();
   if(serverPollTimer) clearInterval(serverPollTimer);
@@ -352,6 +363,234 @@ function startServerPolling(){
 function stopServerPolling(){
   if(serverPollTimer){ clearInterval(serverPollTimer); serverPollTimer=null; }
   if(serverStaticTimer){ clearInterval(serverStaticTimer); serverStaticTimer=null; }
+  if(serverListTimer){ clearInterval(serverListTimer); serverListTimer=null; }
+  stopRemotePolling();
+}
+function stopRemotePolling(){
+  if(remotePollTimer){ clearInterval(remotePollTimer); remotePollTimer=null; }
+  if(remoteStaticTimer){ clearInterval(remoteStaticTimer); remoteStaticTimer=null; }
+}
+function remoteServer(id){
+  return (_srvList||[]).find(s=>s.id===id)||null;
+}
+function remoteScope(id, scope){
+  const s=remoteServer(id); return !!(s&&s.scopes&&s.scopes[scope]);
+}
+function renderRemoteMeta(){
+  const s=remoteServer(_srvActive), el=$('remote-meta'); if(!s||!el) return;
+  el.innerHTML=`${esc(mergeTargetText(s))} · ${mergeStatusChip(s.status)}`;
+}
+
+async function loadServerList(){
+  const rail=$('srv-rail-list'); if(!rail) return;
+  try{
+    const d=await getJSON('/api/merge/servers'); if(!d) return;
+    _srvList=d.servers||[];
+    _srvListLoaded=true;
+    if(_srvActive!=='local'&&!remoteServer(_srvActive)){
+      _srvActive='local';
+      const local=$('local-server-view'), remote=$('remote-server-view');
+      if(local) local.hidden=false;
+      if(remote) remote.hidden=true;
+      startServerPolling();
+    }
+    renderServerRail(d);
+    if(_srvActive!=='local'){
+      if(!remotePollTimer){
+        // showRemoteDown stops the timers so a dead host is not hammered.
+        // The server-list tick is the slow retry that notices it came back.
+        remoteStaticLoaded=false;
+        startRemotePolling();
+      }else{
+        selectServer(_srvActive,true);
+      }
+    }
+  }catch(e){
+    if(rail) rail.innerHTML='<div class="empty-state">Could not read the server list.</div>';
+  }
+}
+function renderServerRail(d){
+  const rail=$('srv-rail-list'); if(!rail) return;
+  if(d) _srvRailInfo=d;
+  const isAdmin=!!_srvRailInfo.is_admin;
+  const localName=(_srvRailInfo.local&&_srvRailInfo.local.name)||'This server';
+  const sub=$('srv-rail-sub');
+  if(sub) sub.textContent=isAdmin
+    ? 'This panel, plus every server that allowed it. Arrows set the order.'
+    : 'This panel, plus every server an admin listed for you.';
+  const chips=[`<div class="srv-chip-wrap${_srvActive==='local'?' active':''}">
+      <button class="srv-chip" onclick="selectServer('local')">
+        <span class="srv-chip-dot local"></span>
+        <span class="srv-chip-copy"><span class="srv-chip-name">${esc(localName)}</span>
+          <span class="srv-chip-sub">This server</span></span>
+      </button></div>`];
+  _srvList.forEach((s,i)=>{
+    const down=String(s.status||'').toLowerCase()==='down';
+    const actions=isAdmin
+      ? `<span class="srv-chip-actions">
+          <button class="srv-chip-btn" title="Move up" onclick="event.stopPropagation();moveServerRail('${escAttr(s.id)}',-1)"${i===0?' disabled':''}>&uarr;</button>
+          <button class="srv-chip-btn" title="Move down" onclick="event.stopPropagation();moveServerRail('${escAttr(s.id)}',1)"${i===_srvList.length-1?' disabled':''}>&darr;</button>
+          <button class="srv-chip-btn terminal" title="Open a terminal on ${escAttr(s.name||s.host)}" onclick="event.stopPropagation();openRemoteTerminal('${escAttr(s.id)}')"><svg class="ic"><use href="#ic-monitor"/></svg></button>
+        </span>`:'';
+    chips.push(`<div class="srv-chip-wrap${_srvActive===s.id?' active':''}${down?' down':''}">
+      <button class="srv-chip" onclick="selectServer('${escAttr(s.id)}')">
+        <span class="srv-chip-dot ${down?'down':'on'}"></span>
+        <span class="srv-chip-copy"><span class="srv-chip-name">${esc(s.name||s.host)}</span>
+          <span class="srv-chip-sub">${down?'Down':esc(s.remote_hostname||s.host)}</span></span>
+      </button>${actions}</div>`);
+  });
+  if(!_srvList.length){
+    chips.push(`<span class="srv-rail-hint">${window.MGMT_PERMS&&MGMT_PERMS.role==='admin'
+      ? 'Add another panel in Config, Server Configuration.'
+      : 'An admin can give you access to more servers.'}</span>`);
+  }
+  rail.innerHTML=chips.join('');
+}
+function syncRemoteChrome(){
+  if(_srvActive==='local') return;
+  const s=remoteServer(_srvActive); if(!s) return;
+  const name=$('remote-name'); if(name) name.textContent=s.name||s.host||'Linked server';
+  const term=$('remote-terminal-btn');
+  if(term) term.hidden=!((window.MGMT_PERMS||{}).role==='admin');
+  renderRemoteMeta();
+  document.querySelectorAll('#remote-metric-grid [data-remotescope]').forEach(card=>{
+    card.hidden=!remoteScope(_srvActive,card.dataset.remotescope);
+    card.classList.toggle('metric-clickable',remoteScope(_srvActive,card.dataset.remotescope));
+  });
+}
+function selectServer(id,silent){
+  if(id!=='local'&&!remoteServer(id)) return;
+  if(_srvActive===id&&silent){ syncRemoteChrome(); return; }
+  _srvActive=id;
+  renderServerRail();
+  stopServerPolling();
+  const local=$('local-server-view'), remote=$('remote-server-view');
+  if(local) local.hidden=id!=='local';
+  if(remote) remote.hidden=id==='local';
+  if(id==='local'){
+    serverStaticLoaded=false;
+    startServerPolling();
+    return;
+  }
+  remoteCpuHist=[];remoteRamHist=[];remoteNetInHist=[];remoteNetOutHist=[];remoteStaticLoaded=false;
+  const s=remoteServer(id);
+  if(!s) return;
+  const devGrid=$('r-device-grid');
+  if(devGrid) devGrid.innerHTML='<div class="empty-state">Loading device info&hellip;</div>';
+  syncRemoteChrome();
+  const down=$('remote-down'), live=$('remote-live');
+  if(String(s.status||'').toLowerCase()==='down'){
+    if(down){ down.hidden=false; down.innerHTML=`<div class="empty-state"><b>${esc(s.name||s.host)} is down.</b><br>${esc(s.last_error||'That server is not answering right now.')}</div>`; }
+    if(live) live.hidden=true;
+  }else{
+    if(down) down.hidden=true;
+    if(live) live.hidden=false;
+  }
+  startServerPolling();
+}
+function startRemotePolling(){
+  if(_srvActive==='local') return;
+  stopRemotePolling();
+  if(!remoteStaticLoaded) loadRemoteStatic();
+  pollRemoteStats();
+  remotePollTimer=setInterval(pollRemoteStats,2000);
+  remoteStaticTimer=setInterval(loadRemoteStatic,15000);
+}
+function refreshRemoteServer(){ if(_srvActive!=='local'){ remoteStaticLoaded=false; loadRemoteStatic(); pollRemoteStats(); } else startServerPolling(); }
+async function moveServerRail(id,delta){
+  if(_srvRailBusy) return;
+  const ids=_srvList.map(s=>s.id), at=ids.indexOf(id), to=at+delta;
+  if(at<0||to<0||to>=ids.length) return;
+  ids.splice(to,0,ids.splice(at,1)[0]);
+  _srvRailBusy=true;
+  try{
+    const r=await api('/api/merge/servers/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+    if(r&&r.ok) await loadServerList();
+    else appToast('Could not reorder servers','err');
+  }catch(e){ appToast('Could not reorder servers','err'); }
+  _srvRailBusy=false;
+}
+async function loadRemoteStatic(){
+  if(_srvActive==='local'||remoteStaticBusyFor===_srvActive) return;
+  const id=_srvActive, grid=$('r-device-grid'); if(!grid) return;
+  remoteStaticBusyFor=id;
+  try{
+    const r=await api('/api/merge/server/'+encodeURIComponent(id)+'/static');
+    if(!r) return;
+    const d=await r.json();
+    if(_srvActive!==id) return;
+    if(!r.ok){ showRemoteDown(d.error||'That server is unreachable.'); return; }
+    const active=document.activeElement;
+    if(active&&grid.contains(active)&&active.tagName==='BUTTON'){ remoteStaticLoaded=true; return; }
+    grid.innerHTML=renderDeviceInfo(d);
+    remoteStaticLoaded=true;
+    showRemoteUp();
+  }catch(e){}
+  finally{ if(remoteStaticBusyFor===id) remoteStaticBusyFor=null; }
+}
+function showRemoteDown(message){
+  const down=$('remote-down'), live=$('remote-live');
+  if(down){ down.hidden=false; down.innerHTML=`<div class="empty-state"><b>That server is not answering.</b><br>${esc(message||'')}</div>`; }
+  if(live) live.hidden=true;
+  stopRemotePolling();
+  remoteStaticLoaded=false;
+  const s=remoteServer(_srvActive);
+  if(s&&String(s.status||'').toLowerCase()!=='down'){ s.status='down'; s.last_error=message||s.last_error; renderServerRail(); renderRemoteMeta(); }
+}
+function showRemoteUp(){
+  const down=$('remote-down'), live=$('remote-live');
+  if(down) down.hidden=true;
+  if(live) live.hidden=false;
+  const s=remoteServer(_srvActive);
+  if(s&&String(s.status||'').toLowerCase()!=='connected'){
+    s.status='connected'; s.last_error=''; renderServerRail(); renderRemoteMeta();
+  }
+}
+async function pollRemoteStats(){
+  if(_srvActive==='local'||remoteStatsBusyFor===_srvActive) return;
+  const id=_srvActive;
+  remoteStatsBusyFor=id;
+  try{
+    const r=await api('/api/merge/server/'+encodeURIComponent(id)+'/stats');
+    if(!r) return;
+    const d=await r.json();
+    if(_srvActive!==id) return;
+    if(!r.ok){ showRemoteDown(d.error||'That server is unreachable.'); return; }
+    showRemoteUp();
+    if(d.cpu_percent!=null){
+      pushHist(remoteCpuHist,d.cpu_percent);
+      if($('r-cpu-now')) $('r-cpu-now').textContent=d.cpu_percent.toFixed(0)+'%';
+      if($('r-cpu-foot')) $('r-cpu-foot').textContent=`${d.processes||0} procs · uptime ${fmtUptime(d.uptime_seconds)}`;
+      renderCoreBars('r-core-bars',d.cpu_per_core);
+      drawLineChart('r-chart-cpu',[remoteCpuHist],100,['--black']);
+    }
+    if(d.ram){
+      pushHist(remoteRamHist,d.ram.percent);
+      if($('r-ram-now')) $('r-ram-now').textContent=d.ram.percent.toFixed(0)+'%';
+      if($('r-ram-foot')) $('r-ram-foot').textContent=`${d.ram.used_h} / ${d.ram.total_h}`+(d.swap&&d.swap.total?` · swap ${d.swap.used_h}`:'');
+      drawLineChart('r-chart-ram',[remoteRamHist],100,['--black']);
+    }
+    if(d.net){
+      pushHist(remoteNetInHist,d.net.rate_in); pushHist(remoteNetOutHist,d.net.rate_out);
+      if($('r-net-now')){
+        $('r-net-now').innerHTML=`<span>&darr;${esc(compactRate(d.net.rate_in_h))}</span><span>&uarr;${esc(compactRate(d.net.rate_out_h))}</span>`;
+      }
+      if($('r-net-foot')) $('r-net-foot').textContent=`total ↓${d.net.total_in_h} ↑${d.net.total_out_h}`;
+      const max=Math.max(1,...remoteNetInHist,...remoteNetOutHist);
+      drawLineChart('r-chart-net',[remoteNetInHist,remoteNetOutHist],max,['--success','--warn']);
+    }
+    if(d.disk){
+      if($('r-disk-now')) $('r-disk-now').textContent=d.disk.percent.toFixed(0)+'%';
+      if($('r-disk-foot')) $('r-disk-foot').textContent=`${d.disk.used_h} / ${d.disk.total_h}`;
+      const fill=$('r-disk-fill');
+      if(fill){ fill.style.transform='scaleX('+Math.max(0,Math.min(1,d.disk.percent/100)).toFixed(4)+')'; fill.style.background=barColor(d.disk.percent); }
+    }
+    if(d.load){
+      if($('r-load-now')) $('r-load-now').textContent=d.load['1'].toFixed(2);
+      if($('r-load-foot')) $('r-load-foot').textContent=`${d.load['1']} / ${d.load['5']} / ${d.load['15']}`;
+    }
+  }catch(e){}
+  finally{ if(remoteStatsBusyFor===id) remoteStatsBusyFor=null; }
 }
 
 function fanText(d){
@@ -599,9 +838,9 @@ function drawLineChart(id,series,max,colors){
    knows which directory this account is allowed to see, and a staff member
    scoped to their own home was being shown "outside your permitted area"
    because the browser asked for the root of the filesystem first. */
-let _srvDetailKind=null, _fbPath='', _accessDetailId=null;
+let _srvDetailKind=null, _srvDetailServer=null, _fbPath='', _fbContext=null, _accessDetailId=null;
 let _uploadQueue=[], _uploadActive=false, _uploadCancelled=false, _uploadXhr=null;
-let _uploadFolder='', _uploadStopResolve=null;
+let _uploadFolder='', _uploadStopResolve=null, _uploadServer=null;
 let _ipDetailTarget=null, _ipProfileData=null, _lineDetailObj=null, _lineDetailTitle='';
 let _netDetailTimer=null, _netDetailBusy=false, _netOnlyEstablished=true;
 let _netSamplingKeys=new Set();
@@ -610,11 +849,29 @@ const _SRV_TITLES={cpu:'CPU: Top Processes',mem:'Memory: Top Processes',net:'Net
    this is so the person sees a sentence instead of a failed request. */
 const _SRV_DETAIL_GRANT={cpu:'cpumem_detail',mem:'cpumem_detail',net:'net_detail'};
 
+function _remoteDetailScope(kind){
+  return {cpu:'cpu',mem:'memory',net:'network',disk:'disk'}[kind]||'';
+}
 function _mayOpenDetail(kind){
+  if(_srvDetailServer) return remoteScope(_srvDetailServer,_remoteDetailScope(kind));
   const needed=_SRV_DETAIL_GRANT[kind];
   if(kind==='disk') return (window.MGMT_PERMS||{}).disk_scope!=='none';
   if(!needed) return true;
   return !!(window.MGMT_PERMS||{})[needed];
+}
+function _detailCanUpload(kind){
+  if(kind!=='disk'||!_mayOpenDetail(kind)) return false;
+  if(_srvDetailServer) return remoteScope(_srvDetailServer,'disk');
+  return !!(window.MGMT_PERMS||{}).disk_upload;
+}
+function _detailServerName(){
+  if(!_srvDetailServer) return '';
+  const s=remoteServer(_srvDetailServer);
+  return s?(s.name||s.host||'Linked server'):'Linked server';
+}
+function _detailTitle(kind){
+  const base=_SRV_TITLES[kind]||'Detail';
+  return _srvDetailServer?base+' · '+_detailServerName():base;
 }
 
 const _SRV_DENIED={
@@ -625,18 +882,37 @@ const _SRV_DENIED={
 };
 
 function openServerDetail(kind){
+  _srvDetailServer=null;
+  _openServerDetail(kind);
+}
+function openRemoteDetail(kind){
+  if(_srvActive==='local') return;
+  _srvDetailServer=_srvActive;
+  _openServerDetail(kind);
+}
+function _openServerDetail(kind){
   stopNetDetailPoll();
+  if(kind==='disk'){
+    const ctx=_srvDetailServer||'local';
+    if(_fbContext!==ctx){ _fbPath=''; _fbContext=ctx; }
+  }
   _srvDetailKind=kind;
-  $('srv-detail-title').textContent=_SRV_TITLES[kind]||'Detail';
+  $('srv-detail-title').textContent=_detailTitle(kind);
   $('srv-detail-overlay').classList.add('open');
   const uploadBtn=$('srv-upload-btn');
-  if(uploadBtn) uploadBtn.hidden=!(kind==='disk' && _mayOpenDetail(kind) &&
-    (window.MGMT_PERMS||{}).disk_upload);
+  if(uploadBtn) uploadBtn.hidden=!(kind==='disk' && _detailCanUpload(kind));
   if(!_mayOpenDetail(kind)){
+    const label={cpu:'CPU',mem:'memory',net:'network',disk:'disk'}[kind]||'this';
+    const denied=_srvDetailServer
+      ? `This account does not have ${label} access on ${_detailServerName()}.`
+      : (_SRV_DENIED[kind]||'You do not have permission to open this.');
+    const hint=_srvDetailServer
+      ? 'An admin can grant it from Config, User Management, under their linked servers.'
+      : 'An admin can grant it from Config, User Management.';
     $('srv-detail-body').innerHTML=`<div class="detail-denied">
       <svg class="ic ic-lg"><use href="#ic-shield-alert"/></svg>
-      <p>${esc(_SRV_DENIED[kind]||'You do not have permission to open this.')}</p>
-      <p class="detail-denied-sub">An admin can grant it from Config, User Management.</p>
+      <p>${esc(denied)}</p>
+      <p class="detail-denied-sub">${esc(hint)}</p>
     </div>`;
     return;
   }
@@ -647,7 +923,7 @@ function openServerDetail(kind){
 /* Marks the meters that cannot be opened, so the pointer and hover state stop
    promising something that will be refused. */
 function applyMetricPermissions(){
-  document.querySelectorAll('.metric-card[onclick]').forEach(card=>{
+  document.querySelectorAll('#local-server-view .metric-card[onclick]').forEach(card=>{
     const m=/openServerDetail\('([a-z]+)'\)/.exec(card.getAttribute('onclick')||'');
     if(!m) return;
     const allowed=_mayOpenDetail(m[1]);
@@ -660,6 +936,8 @@ function closeServerDetail(){
   stopNetDetailPoll();
   $('srv-detail-overlay').classList.remove('open');
   _srvDetailKind=null;
+  _srvDetailServer=null;
+  _uploadServer=null;
   const uploadBtn=$('srv-upload-btn');
   if(uploadBtn) uploadBtn.hidden=true;
 }
@@ -690,10 +968,17 @@ async function loadServerDetail(){
 }
 async function renderProcDetail(by){
   const b=$('srv-detail-body'); b.innerHTML='<div class="empty-state">Sampling processes…</div>';
+  const srv=_srvDetailServer;
+  const url=srv
+    ? '/api/merge/server/'+encodeURIComponent(srv)+'/processes?by='+encodeURIComponent(by)
+    : '/api/system/processes?by='+by;
   try{
-    const d=await (await api('/api/system/processes?by='+by)).json();
+    const r=await api(url); if(!r) return;
+    const d=await r.json();
+    if(_srvDetailServer!==srv) return;
+    if(!r.ok){ b.innerHTML=`<div class="empty-state">${esc(d.error||'That server is unreachable.')}</div>`; return; }
     const rows=(d.processes||[]).map(p=>`<tr><td>${esc(p.pid)}</td><td>${esc(p.name)}</td><td>${esc(p.user)}</td>
-      <td><b>${p.cpu.toFixed(1)}%</b></td><td>${p.mem.toFixed(1)}%</td>
+      <td>${p.cpu==null?'-':`<b>${p.cpu.toFixed(1)}%</b>`}</td><td>${p.mem==null?'-':p.mem.toFixed(1)+'%'}</td>
       <td style="white-space:normal;color:var(--gray-600);">${esc(p.cmd)}</td></tr>`).join('');
     b.innerHTML=`<div style="font-size:12px;color:var(--gray-600);margin-bottom:8px;">Sorted by ${by==='mem'?'memory':'CPU'}. CPU is share of the whole machine.</div>
       <table><thead><tr><th>PID</th><th>Process</th><th>User</th><th>CPU</th><th>Mem</th><th>Command</th></tr></thead>
@@ -721,9 +1006,15 @@ async function renderNetDetail(silent){
   const b=$('srv-detail-body'); const oldScroll=b?b.scrollTop:0;
   if(!silent&&b) b.innerHTML='<div class="empty-state">Reading connections…</div>';
   const only=_netOnlyEstablished;
+  const srv=_srvDetailServer;
+  const netUrl=srv
+    ? '/api/merge/server/'+encodeURIComponent(srv)+'/connections'+(only?'?established=1':'')
+    : '/api/system/connections'+(only?'?established=1':'');
   try{
-    const d=await (await api('/api/system/connections'+(only?'?established=1':''))).json();
-    if(_srvDetailKind!=='net'||only!==_netOnlyEstablished) return;
+    const nr=await api(netUrl); if(!nr) return;
+    const d=await nr.json();
+    if(_srvDetailKind!=='net'||srv!==_srvDetailServer||only!==_netOnlyEstablished) return;
+    if(!nr.ok){ if(!silent&&b) b.innerHTML=`<div class="empty-state">${esc(d.error||'That server is unreachable.')}</div>`; return; }
     if(d.error){ if(!silent&&b) b.innerHTML=`<div class="empty-state">${esc(d.error)}</div>`; return; }
     const conns=d.connections||[];
     const staleCounters=conns.length>0 && !conns.some(c=>Object.prototype.hasOwnProperty.call(c,'bytes_in'));
@@ -796,9 +1087,18 @@ function fileFormat(e){
   return fileNameParts(name)[1] || 'No ext';
 }
 async function browseDir(path){
+  const srv=_srvDetailServer;
   _fbPath=path; const b=$('srv-detail-body'); b.innerHTML='<div class="empty-state">Loading folder…</div>';
+  const fileUrl=srv
+    ? '/api/merge/server/'+encodeURIComponent(srv)+'/files?path='+encodeURIComponent(path)
+    : '/api/system/files?path='+encodeURIComponent(path);
   try{
-    const d=await (await api('/api/system/files?path='+encodeURIComponent(path))).json();
+    const r=await api(fileUrl); if(!r) return;
+    const d=await r.json();
+    if(_srvDetailServer!==srv) return;
+    if(!r.ok){
+      b.innerHTML=`<div class="fb-crumbs">${esc(path||'/')}</div><div class="empty-state">${esc(d.error||'That server is unreachable.')}</div>`; return;
+    }
     if(d.error&&!(d.entries||[]).length){
       b.innerHTML=`<div class="fb-crumbs">${esc(d.path||path)}</div><div class="empty-state">${esc(d.error)}</div>
         ${d.parent?`<div class="fb-row"><span class="fb-name dir" data-path="${escAttr(d.parent)}" onclick="browseDir(this.dataset.path)">↩ Up</span></div>`:''}`; return;
@@ -808,8 +1108,13 @@ async function browseDir(path){
     const rows=(d.entries||[]).map(e=>{
       const name=fileBrowserName(e);
       const format=fileFormat(e);
-      const dl=e.is_dir?'':(e.downloadable?`<a class="fb-dl" href="${BASE}/api/system/download?path=${encodeURIComponent(e.path)}" style="display:inline-flex;align-items:center;gap:4px;"><svg class="ic"><use href="#ic-download"/></svg> Download</a>`:`<span class="fb-locked">protected</span>`);
-      const canDelete=!!(window.MGMT_PERMS&&MGMT_PERMS.disk_delete)&&!e.is_dir&&e.deletable;
+      const dlHref=srv
+        ? BASE+'/api/merge/server/'+encodeURIComponent(srv)+'/download?path='+encodeURIComponent(e.path)
+        : BASE+'/api/system/download?path='+encodeURIComponent(e.path);
+      const dl=e.is_dir?'':(e.downloadable?`<a class="fb-dl" href="${dlHref}" style="display:inline-flex;align-items:center;gap:4px;"><svg class="ic"><use href="#ic-download"/></svg> Download</a>`:`<span class="fb-locked">protected</span>`);
+      const canDelete=srv
+        ? (remoteScope(srv,'disk')&&!e.is_dir&&e.deletable)
+        : (!!(window.MGMT_PERMS&&MGMT_PERMS.disk_delete)&&!e.is_dir&&e.deletable);
       const del=canDelete?`<button class="db-action-btn" style="color:var(--danger);" onclick="deleteFile('${escAttr(e.path)}')"><svg class="ic"><use href="#ic-trash-2"/></svg></button>`:'';
       return `<div class="fb-row">${name}<span class="fb-size">${esc(e.size_h)}</span><span class="fb-format${e.is_dir?' dir':''}">${esc(format)}</span><span class="fb-dl" style="display:inline-flex;gap:8px;align-items:center;">${dl}${del}</span></div>`;
     }).join('');
@@ -818,8 +1123,12 @@ async function browseDir(path){
 }
 async function deleteFile(path){
   if(!(await uiConfirm('Delete this file?', path+'\n\nThis cannot be undone.'))) return;
+  const srv=_srvDetailServer;
+  const url=srv
+    ? '/api/merge/server/'+encodeURIComponent(srv)+'/delete'
+    : '/api/system/delete';
   try{
-    const r=await api('/api/system/delete',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
+    const r=await api(url,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
     const d=await r.json();
     if(!r.ok){ appToast(d.error||'Delete failed','err'); return; }
     appToast('Deleted','ok'); browseDir(_fbPath);
@@ -942,6 +1251,7 @@ function startUploads(files, folder){
     status:'waiting', progress:0, loaded:0, error:''
   }));
   _uploadFolder=folder||'';
+  _uploadServer=_srvDetailServer;
   _uploadCancelled=false;
   _uploadActive=true;
   $('upload-title').textContent=chosen.length===1?'Uploading file':`Uploading ${chosen.length} files`;
@@ -961,8 +1271,13 @@ function uploadOne(item, folder, onProgress){
   return new Promise((resolve,reject)=>{
     const xhr=new XMLHttpRequest();
     _uploadXhr=xhr;
-    xhr.open('POST', BASE+'/api/system/upload?path='+encodeURIComponent(folder||'')+
-      '&name='+encodeURIComponent(item.name));
+    const srv=_uploadServer;
+    const endpoint=srv
+      ? BASE+'/api/merge/server/'+encodeURIComponent(srv)+'/upload?path='+encodeURIComponent(folder||'')+
+        '&name='+encodeURIComponent(item.name)
+      : BASE+'/api/system/upload?path='+encodeURIComponent(folder||'')+
+        '&name='+encodeURIComponent(item.name);
+    xhr.open('POST', endpoint);
     xhr.upload.onprogress=(e)=>{
       if(!e.lengthComputable) return;
       const total=e.total||item.size||1;
@@ -1019,11 +1334,13 @@ async function runUploadQueue(){
     });
   }
   const wasCancelled=_uploadCancelled;
+  const uploadedTo=_uploadServer;
   _uploadActive=false;
   _uploadCancelled=false;
   _uploadXhr=null;
   updateUploadSummary();
-  if(_srvDetailKind==='disk') await browseDir(_uploadFolder||_fbPath);
+  if(_srvDetailKind==='disk' && _srvDetailServer===uploadedTo) await browseDir(_uploadFolder||_fbPath);
+  _uploadServer=null;
   const done=_uploadQueue.filter(i=>i.status==='uploaded').length;
   const failed=_uploadQueue.filter(i=>i.status==='failed').length;
   if(wasCancelled) appToast('Upload stopped','info');
@@ -1165,7 +1482,213 @@ async function loadServerConfig(){
   }catch(e){}
   loadSshStatus();
   loadSshKeyStatus();
+  loadLinkedServers();
+  loadMergeRequests();
 }
+
+/* ---- linked management servers ---- */
+let _linkedServers=[];
+function mergeStatusChip(status){
+  const key=String(status||'pending').toLowerCase();
+  const text={connected:'Connected',pending:'Waiting for approval',denied:'Denied',
+              down:'Down',allowed:'Connected'}[key]||key;
+  return `<span class="merge-status ${escAttr(key)}"><span class="status-dot"></span>${esc(text)}</span>`;
+}
+function mergeTargetText(s){
+  const scheme=String(s.scheme||'http').toLowerCase();
+  const port=Number(s.port)||(scheme==='https'?443:80);
+  const path=s.base_path||'';
+  const host=String(s.host||'');
+  const shownHost=(host.includes(':')&&!host.startsWith('['))?'['+host+']':host;
+  const defaultPort=(scheme==='https'&&port===443)||(scheme==='http'&&port===80);
+  return `${scheme}://${shownHost}${defaultPort?'':':'+port}${path}`;
+}
+async function loadLinkedServers(){
+  const el=$('merge-server-list'); if(!el) return;
+  el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
+  try{
+    const d=await getJSON('/api/config/servers'); if(!d) return;
+    if(d.identity){
+      const name=$('merge-local-name'), uid=$('merge-local-id'), key=$('merge-local-key');
+      if(name) name.textContent=d.identity.label||'This server';
+      if(uid) uid.textContent=d.identity.server_uid||'';
+      if(key) key.value=d.identity.key||'';
+    }
+    _linkedServers=d.servers||[];
+    renderLinkedServers();
+  }catch(e){ el.innerHTML='<div class="empty-state">Could not read linked servers.</div>'; }
+}
+function renderLinkedServers(){
+  const el=$('merge-server-list'); if(!el) return;
+  if(!_linkedServers.length){
+    el.innerHTML='<div class="empty-state">No linked servers yet. Add one above.</div>';
+    return;
+  }
+  el.innerHTML=_linkedServers.map((s,i)=>{
+    const err=s.last_error?`<div class="merge-err">${esc(s.last_error)}</div>`:'';
+    const hostLine=s.approved
+      ? `This host is managing it using <b>${esc(s.remote_hostname||s.host)}</b>.`
+      : (s.server_uid
+        ? `Waiting for <b>${esc(s.remote_hostname||s.host)}</b> to allow this panel.`
+        : `Waiting for <b>${esc(s.host)}</b> to answer.`);
+    return `<div class="merge-row">
+      <div class="merge-row-main">
+        <div class="merge-row-top"><b>${esc(s.name||s.host)}</b>${mergeStatusChip(s.status)}</div>
+        <div class="merge-row-sub">${esc(mergeTargetText(s))}</div>
+        <div class="merge-row-sub">${hostLine}</div>${err}
+      </div>
+      <div class="merge-row-actions">
+        <button class="db-action-btn merge-arrow" title="Move up" onclick="moveLinkedServer('${escAttr(s.id)}',-1)"${i===0?' disabled':''}>&uarr;</button>
+        <button class="db-action-btn merge-arrow" title="Move down" onclick="moveLinkedServer('${escAttr(s.id)}',1)"${i===_linkedServers.length-1?' disabled':''}>&darr;</button>
+        <button class="db-action-btn" onclick="retryLinkedServer('${escAttr(s.id)}')"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Retry</button>
+        <button class="db-action-btn" title="Replace the stored private key" onclick="replaceLinkedServerKey('${escAttr(s.id)}')"><svg class="ic"><use href="#ic-lock-keyhole"/></svg>Key</button>
+        <button class="db-action-btn merge-danger" onclick="removeLinkedServer('${escAttr(s.id)}')"><svg class="ic"><use href="#ic-trash-2"/></svg></button>
+      </div>
+    </div>`;
+  }).join('');
+}
+async function loadMergeRequests(){
+  const el=$('merge-request-list'); if(!el) return;
+  el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
+  try{
+    const d=await getJSON('/api/config/servers/requests'); if(!d) return;
+    const rows=d.requests||[];
+    if(!rows.length){ el.innerHTML='<div class="empty-state">No panel has asked for access.</div>'; return; }
+    el.innerHTML=rows.map(r=>{
+      const pending=r.status==='pending';
+      const allowed=r.status==='allowed';
+      const action=pending
+        ? `<button class="save-btn merge-allow" onclick="decideMergeRequest('${escAttr(r.server_uid)}','allow')">Allow</button>
+           <button class="db-action-btn merge-danger" onclick="decideMergeRequest('${escAttr(r.server_uid)}','deny')">Deny</button>`
+        : allowed
+          ? `<button class="db-action-btn merge-danger" onclick="decideMergeRequest('${escAttr(r.server_uid)}','deny')">Revoke</button>`
+          : `<button class="save-btn merge-allow" onclick="decideMergeRequest('${escAttr(r.server_uid)}','allow')">Allow</button>`;
+      return `<div class="merge-row">
+        <div class="merge-row-main">
+          <div class="merge-row-top"><b>${esc(r.hostname||r.host||r.server_uid)}</b>${mergeStatusChip(allowed?'connected':r.status)}</div>
+          <div class="merge-row-sub">${esc(r.host||r.server_uid)}</div>
+          <div class="merge-row-sub">${allowed?'Allowed: '+esc(r.hostname||r.host||'that panel')+' may manage this server.':'Asked '+esc(String(r.requested_at||'').slice(0,19))}</div>
+        </div>
+        <div class="merge-row-actions">${action}</div>
+      </div>`;
+    }).join('');
+  }catch(e){ el.innerHTML='<div class="empty-state">Could not read access requests.</div>'; }
+}
+async function addLinkedServer(){
+  const fb=$('merge-add-feedback'), btn=$('merge-add-btn');
+  fb.textContent=''; fb.className='save-feedback';
+  const host=($('merge-host').value||'').trim();
+  const key=($('merge-key').value||'').trim();
+  if(!host){ fb.textContent='Enter the server host.'; fb.classList.add('err'); return; }
+  if(!key){ fb.textContent='Paste that server\'s private key.'; fb.classList.add('err'); return; }
+  btn.disabled=true; fb.textContent='Contacting that server…'; fb.classList.add('info');
+  try{
+    const r=await api('/api/config/servers',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:($('merge-name').value||'').trim(),host,
+        port:($('merge-port').value||'').trim(),path:($('merge-path').value||'').trim(),key})});
+    const d=await r.json();
+    if(!r.ok){ fb.textContent=d.error||'Could not add that server.'; fb.classList.add('err'); }
+    else{
+      const hs=d.handshake||{};
+      if(hs.ok&&hs.status==='connected'){
+        fb.textContent='Server linked. It appears in the Server page.';
+        fb.classList.add('ok');
+      }else if(hs.ok&&hs.status==='denied'){
+        fb.textContent='Saved. That panel has denied this server; its admin must allow it in Server Configuration.';
+        fb.classList.add('err');
+      }else if(hs.ok){
+        fb.textContent='Request sent. That panel\'s admin must allow it in Server Configuration before the server appears.';
+        fb.classList.add('info');
+      }else{
+        fb.textContent='Saved, but that server did not answer: '+(hs.error||'unreachable')+'. Retry when it is up.';
+        fb.classList.add('err');
+      }
+      $('merge-key').value=''; $('merge-host').value=''; $('merge-name').value='';
+      loadLinkedServers(); loadMergeRequests();
+    }
+  }catch(e){ fb.textContent='Request failed.'; fb.classList.add('err'); }
+  btn.disabled=false;
+}
+function copyMergeKey(){ copyVal(($('merge-local-key')||{}).value||'','Private key'); }
+async function rotateMergeKey(){
+  if(!(await uiConfirm('Rotate this server\'s private key?',
+       'Every other panel that links to this one must be given the new key. Until then their requests stop working.'))) return;
+  try{
+    const r=await api('/api/config/servers/rotate-key',{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){ appToast(d.error||'Could not rotate the key','err'); return; }
+    if(d.identity&&$('merge-local-key')) $('merge-local-key').value=d.identity.key||'';
+    appToast('Private key rotated','ok');
+  }catch(e){ appToast('Request failed','err'); }
+}
+async function retryLinkedServer(id){
+  try{
+    const r=await api('/api/config/servers/'+encodeURIComponent(id)+'/retry',{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){ appToast(d.error||'Retry failed','err'); return; }
+    const st=(d.result||{}).status;
+    const msg=st==='connected'?'Server is connected'
+      :st==='pending'?'Still waiting for approval'
+      :st==='denied'?'That panel has not allowed this server'
+      :(d.result&&d.result.error)||'Retry failed';
+    appToast(msg,st==='connected'?'ok':st==='pending'||st==='denied'?'info':'err',7000);
+    loadLinkedServers(); loadMergeRequests();
+  }catch(e){ appToast('Request failed','err'); }
+}
+async function replaceLinkedServerKey(id){
+  const hit=_linkedServers.find(s=>s.id===id)||{};
+  const name=hit.name||hit.host||'this server';
+  const key=window.prompt('Paste the new private key for '+name+'. It replaces the stored key and contacts that panel again.','');
+  if(key===null) return;
+  if(!key.trim()){ appToast('No key entered','err'); return; }
+  try{
+    const r=await api('/api/config/servers/'+encodeURIComponent(id)+'/key',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key.trim()})});
+    const d=await r.json();
+    if(!r.ok){ appToast(d.error||'Could not replace the key','err'); return; }
+    const st=(d.result||{}).status;
+    const msg=st==='connected'?'Key replaced, server connected'
+      :st==='pending'?'Key replaced, waiting for approval'
+      :st==='denied'?'Key replaced, but that panel has not allowed this server'
+      :'Key replaced; the server did not answer';
+    appToast(msg,st==='connected'?'ok':st==='pending'||st==='denied'?'info':'err',7000);
+    loadLinkedServers(); loadMergeRequests();
+  }catch(e){ appToast('Request failed','err'); }
+}
+async function removeLinkedServer(id){
+  const hit=_linkedServers.find(s=>s.id===id)||{};
+  const name=hit.name||hit.host||'The linked server';
+  if(!(await uiConfirm('Remove this server?',name+' will disappear from the Server page, and every staff rule for it is removed.'))) return;
+  try{
+    const r=await api('/api/config/servers/'+encodeURIComponent(id),{method:'DELETE'});
+    const d=await r.json();
+    if(!r.ok){ appToast(d.error||'Could not remove it','err'); return; }
+    appToast('Server removed','ok'); loadLinkedServers(); loadMergeRequests();
+  }catch(e){ appToast('Request failed','err'); }
+}
+async function moveLinkedServer(id,delta){
+  const ids=_linkedServers.map(s=>s.id), at=ids.indexOf(id), to=at+delta;
+  if(at<0||to<0||to>=ids.length) return;
+  ids.splice(to,0,ids.splice(at,1)[0]);
+  try{
+    const r=await api('/api/config/servers/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+    if(!r||!r.ok){ appToast('Could not reorder','err'); return; }
+    loadLinkedServers();
+  }catch(e){ appToast('Request failed','err'); }
+}
+async function decideMergeRequest(uid,action){
+  const verb=action==='allow'?'Allow this server?':'Deny or revoke this server?';
+  if(!(await uiConfirm(verb,'The other panel will see the change the next time it checks in.'))) return;
+  try{
+    const r=await api('/api/config/servers/requests/'+encodeURIComponent(uid),{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+    const d=await r.json();
+    if(!r.ok){ appToast(d.error||'Could not save that decision','err'); return; }
+    appToast(action==='allow'?'Server allowed':'Access withdrawn','ok');
+    loadMergeRequests();
+  }catch(e){ appToast('Request failed','err'); }
+}
+
 async function saveServerConfig(){
   const host=$('cfg-host').value.trim(), port=parseInt($('cfg-port').value,10);
   const fb=$('cfg-feedback'), btn=$('cfg-save-btn'); fb.textContent=''; fb.className='save-feedback'; btn.disabled=true;
@@ -1358,6 +1881,84 @@ function readGrantForm(idPrefix){
 /* ================= USER MANAGEMENT ================= */
 let _editingUser=null;
 
+/* A staff account's linked-server rules are their own list, with their own
+   order. CPU, memory and network are switches; disk is full disk access on
+   that server, not the local "own files" scope. Terminal is never listed. */
+async function ensureLinkedServersData(){
+  try{
+    const d=await getJSON('/api/config/servers');
+    if(d) _linkedServers=d.servers||[];
+  }catch(e){ return _linkedServers; }
+  return _linkedServers;
+}
+function _userServerRowsHtml(rows){
+  if(!_linkedServers.length){
+    return '<div class="empty-state">No linked servers yet. Add one in Server Configuration first.</div>';
+  }
+  const ordered=[];
+  (rows||[]).forEach(r=>{ const s=_linkedServers.find(x=>x.id===r.server_id); if(s) ordered.push({s,p:r.permissions||{},access:true}); });
+  _linkedServers.forEach(s=>{ if(!ordered.find(o=>o.s.id===s.id)) ordered.push({s,p:{},access:false}); });
+  return ordered.map(({s,p,access})=>{
+    const off=access?'':' disabled';
+    const bits=['cpu','memory','network','disk'].map(k=>
+      `<label class="us-check"><input type="checkbox" data-us-scope="${k}"${p[k]?' checked':''}${off}>${k==='memory'?'Memory':k[0].toUpperCase()+k.slice(1)}</label>`).join('');
+    return `<div class="user-server-row" data-sid="${escAttr(s.id)}">
+      <div class="user-server-order">
+        <button type="button" class="db-action-btn merge-arrow" title="Move up" onclick="moveUserServerRow(this,-1)">&uarr;</button>
+        <button type="button" class="db-action-btn merge-arrow" title="Move down" onclick="moveUserServerRow(this,1)">&darr;</button>
+      </div>
+      <div class="user-server-copy">
+        <div class="user-server-name">${esc(s.name||s.host)}</div>
+        <div class="user-server-host">${esc(s.remote_hostname||s.host)} · ${mergeStatusChip(s.status)}</div>
+      </div>
+      <div class="user-server-scopes">
+        <label class="us-check us-access" title="Show this server even without any metric scope">
+          <input type="checkbox" data-us-access${access?' checked':''} onchange="toggleUserServerAccess(this)">Access</label>
+        ${bits}
+      </div>
+      <span class="user-server-terminal" title="Only an admin can open a linked terminal">Terminal: admin only</span>
+    </div>`;
+  }).join('');
+}
+function renderUserServerRules(rows){
+  const box=$('nu-servers'); if(!box) return;
+  box.innerHTML=_userServerRowsHtml(rows||[]);
+  refreshUserServerArrows();
+}
+function moveUserServerRow(btn,delta){
+  const row=btn.closest('.user-server-row'); if(!row) return;
+  const sib=delta<0?row.previousElementSibling:row.nextElementSibling;
+  if(!sib) return;
+  row.parentNode.insertBefore(row, delta<0?sib:sib.nextElementSibling);
+  refreshUserServerArrows();
+}
+function refreshUserServerArrows(){
+  const rows=Array.from(document.querySelectorAll('#nu-servers .user-server-row'));
+  rows.forEach((row,i)=>{
+    const btns=row.querySelectorAll('.merge-arrow');
+    if(btns[0]) btns[0].disabled=i===0;
+    if(btns[1]) btns[1].disabled=i===rows.length-1;
+  });
+}
+function toggleUserServerAccess(cb){
+  const row=cb.closest('.user-server-row'); if(!row) return;
+  row.querySelectorAll('input[data-us-scope]').forEach(scope=>{
+    scope.disabled=!cb.checked;
+    if(!cb.checked) scope.checked=false;
+  });
+}
+function readUserServerRules(){
+  const rows=[];
+  document.querySelectorAll('#nu-servers .user-server-row').forEach(row=>{
+    const access=row.querySelector('input[data-us-access]');
+    if(!access||!access.checked) return;
+    const permissions={};
+    row.querySelectorAll('input[data-us-scope]').forEach(cb=>{ permissions[cb.dataset.usScope]=cb.checked; });
+    rows.push({server_id:row.dataset.sid,permissions});
+  });
+  return rows;
+}
+
 function grantSummary(grants){
   if(!_GRANT_DEFS) return '';
   const parts=[];
@@ -1374,6 +1975,8 @@ async function loadUserManagement(){
   el.innerHTML='<div class="empty-state">Loading&hellip;</div>';
   try{
     await loadGrantRegistry();
+    await ensureLinkedServersData();
+    if($('nu-servers')) renderUserServerRules(readUserServerRules());
     if(!$('nu-grants').dataset.ready) resetUserForm();
     const d=await getJSON('/api/config/users'); if(!d) return;
     const users=d.users||[];
@@ -1405,6 +2008,7 @@ function resetUserForm(){
   $('nu-password-hint').textContent='At least 8 characters, and not only digits.';
   $('nu-submit').textContent='Create User';
   $('nu-cancel').hidden=true;
+  renderUserServerRules([]);
   const fb=$('nu-feedback'); fb.textContent=''; fb.className='save-feedback';
 }
 
@@ -1417,6 +2021,7 @@ async function editPanelUser(username){
   const box=$('nu-grants');
   box.innerHTML=grantFormHtml(user.grants,{idPrefix:'nu'});
   box.dataset.ready='1';
+  renderUserServerRules(user.servers||[]);
   $('nu-card-title').textContent='Edit '+username;
   $('nu-card-sub').textContent='Unchecking a permission revokes it, and signs them out straight away.';
   $('nu-username-group').hidden=true;
@@ -1432,15 +2037,16 @@ async function submitPanelUser(){
   const fb=$('nu-feedback'), btn=$('nu-submit');
   fb.textContent=''; fb.className='save-feedback';
   const grants=readGrantForm('nu'), password=$('nu-password').value;
+  const servers=readUserServerRules();
   const editing=_editingUser;
   let url, body;
   if(editing){
     url='/api/config/users/'+encodeURIComponent(editing);
-    body={grants}; if(password) body.password=password;
+    body={grants,servers}; if(password) body.password=password;
   }else{
     const username=$('nu-username').value.trim();
     if(!username){ fb.textContent='Enter a username.'; fb.classList.add('err'); return; }
-    url='/api/config/users'; body={username,password,grants};
+    url='/api/config/users'; body={username,password,grants,servers};
   }
   btn.disabled=true;
   try{
@@ -3123,11 +3729,17 @@ function ensureTermLib(){
 }
 function genSid(){ const a=new Uint8Array(8); (window.crypto||window.msCrypto).getRandomValues(a); return Array.from(a,b=>b.toString(16).padStart(2,'0')).join(''); }
 function termGetTab(sid){ return termTabs.find(t=>t.sid===sid)||null; }
-function termStoreSave(){ try{ localStorage.setItem(TERM_STORE_KEY,JSON.stringify(termTabs.map(t=>({sid:t.sid,name:t.name,persist:t.persist})))); }catch(e){} }
+function termStoreSave(){ try{ localStorage.setItem(TERM_STORE_KEY,JSON.stringify(termTabs.filter(t=>!t.server).map(t=>({sid:t.sid,name:t.name,persist:t.persist})))); }catch(e){} }
 function termStoreLoad(){ try{ return JSON.parse(localStorage.getItem(TERM_STORE_KEY))||[]; }catch(e){ return []; } }
 function termMakeTab(sid,name,persist){ return {sid,name:name||('Terminal '+(termTabs.length+1)),persist:!!persist,term:null,fit:null,ws:null,els:null,built:false}; }
-async function initTerminal(){
-  if(termViewReady){ termFitActive(); return; }
+let termInitPromise=null;
+function initTerminal(){
+  if(termViewReady){ termFitActive(); return Promise.resolve(); }
+  if(termInitPromise) return termInitPromise;
+  termInitPromise=termInitNow().finally(()=>{ termInitPromise=null; });
+  return termInitPromise;
+}
+async function termInitNow(){
   try{ await ensureTermLib(); }catch(e){ appToast('Terminal library failed to load','err'); return; }
   let live=[]; try{ const r=await api('/api/system/terminals'); if(r&&r.ok) live=(await r.json()).sessions||[]; }catch(e){}
   const liveById={}; live.forEach(s=>liveById[s.id]=s);
@@ -3240,8 +3852,8 @@ document.addEventListener('keydown',(e)=>{
   if(changed){ document.body.classList.remove('term-fs-open'); setTimeout(termFitActive,60); }
 });
 function termBuildPanel(tab){
-  const stack=$('term-stack'); const wrap=document.createElement('div'); wrap.className='term-wrap'; wrap.dataset.sid=tab.sid; wrap.style.display='none';
-  const perms=window.MGMT_PERMS||{}; const termTitle=perms.terminalAccess==='limited'?'Restricted terminal: your own system account':'Root terminal: live interactive shell';
+  const stack=$('term-stack'); const wrap=document.createElement('div'); wrap.className='term-wrap'+(tab.server?' term-remote':''); wrap.dataset.sid=tab.sid; wrap.style.display='none';
+  const perms=window.MGMT_PERMS||{}; const termTitle=tab.server?'Linked server: '+tab.name:(perms.terminalAccess==='limited'?'Restricted terminal: your own system account':'Root terminal: live interactive shell');
   wrap.innerHTML='<div class="term-bar"><span class="term-title">'+esc(termTitle)+'</span><span class="term-status">connecting…</span>'+
     '<label class="term-stay" title="Keep this session running even after you close the site"><input type="checkbox"'+(tab.persist?' checked':'')+'><span>Stay on</span></label>'+
     '<button class="term-clear t-clear">Clear</button><button class="term-clear t-recon">Reconnect</button>'+
@@ -3272,13 +3884,40 @@ function termTabConnect(tab){
   termSetStatus(tab,'connecting…');
   const proto=location.protocol==='https:'?'wss':'ws'; const rows=tab.term?tab.term.rows:24, cols=tab.term?tab.term.cols:80;
   const qs='?sid='+encodeURIComponent(tab.sid)+'&persist='+(tab.persist?'1':'0')+'&rows='+rows+'&cols='+cols;
-  const ws=new WebSocket(proto+'://'+location.host+BASE+'/ws/terminal'+qs); ws.binaryType='arraybuffer'; tab.ws=ws;
+  const path=tab.server
+    ? '/ws/merge-terminal?server='+encodeURIComponent(tab.server)+'&'+qs.slice(1)
+    : '/ws/terminal'+qs;
+  const ws=new WebSocket(proto+'://'+location.host+BASE+path); ws.binaryType='arraybuffer'; tab.ws=ws;
   ws.onopen=()=>{ termSetStatus(tab,'connected','ok'); termFit(tab); };
   ws.onmessage=ev=>{ if(typeof ev.data==='string'){ try{ JSON.parse(ev.data); }catch(e){ tab.term.write(ev.data); } return; } tab.term.write(new Uint8Array(ev.data)); };
   ws.onclose=()=>{ termSetStatus(tab,'disconnected','dead'); if(tab.term) tab.term.write('\r\n\x1b[90m[disconnected, press Reconnect]\x1b[0m\r\n'); if(tab.ws===ws) tab.ws=null; };
   ws.onerror=()=>termSetStatus(tab,'error','dead');
 }
 function termTabReconnect(tab){ if(tab.ws){ try{ tab.ws.onclose=null; tab.ws.close(); }catch(e){} tab.ws=null; } if(tab.term) tab.term.reset(); termTabConnect(tab); }
+
+/* A linked terminal is opened from the Server page. The browser still only
+   talks to this panel; the local proxy holds the server key. */
+async function openRemoteTerminal(id){
+  if((window.MGMT_PERMS||{}).role!=='admin'){
+    appToast('Only an admin can open a linked server terminal.','err'); return;
+  }
+  const sid=(id&&id!=='local')?id:_srvActive;
+  if(!sid||sid==='local'){ switchSection('terminal'); return; }
+  const s=remoteServer(sid);
+  if(!s){ appToast('That server is no longer linked.','err'); return; }
+  switchSection('terminal');
+  try{ await ensureTermLib(); }catch(e){ appToast('Terminal library failed to load','err'); return; }
+  const tab=termMakeTab('mr'+genSid(), s.name||s.host||'Linked server', false);
+  tab.server=sid;
+  if(!termViewReady){
+    termTabs.unshift(tab);
+    await initTerminal();
+    if(termViewReady && termGetTab(tab.sid)) termActivate(tab.sid);
+    return;
+  }
+  termTabs.push(tab);
+  termRenderTabs(); termStoreSave(); termActivate(tab.sid);
+}
 
 /* Floating copy button that follows a terminal text selection (dash.css
    already ships .term-copy-btn; this just drives it). */

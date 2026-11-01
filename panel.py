@@ -40,7 +40,8 @@ import ipaddress
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, FileResponse
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               Response, FileResponse, StreamingResponse)
 from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 
@@ -60,6 +61,7 @@ import branding
 import provision
 import web_guard
 import nginx_proxy
+import merge_servers
 from psycopg2 import sql as pg_sql
 
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -287,8 +289,25 @@ def _client_ip_ws(websocket: WebSocket) -> str:
 def _is_https(request: Request) -> bool:
     return request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
 
+# Only the endpoints another panel calls are exempt from the edge gate. The
+# Server-page endpoints under /api/merge/server/ are browser routes and stay
+# behind it: they authenticate with the ordinary session cookie.
+_MERGE_REMOTE_PATHS = frozenset({
+    "/api/merge/handshake", "/api/merge/status", "/api/merge/static",
+    "/api/merge/stats", "/api/merge/processes", "/api/merge/connections",
+    "/api/merge/files", "/api/merge/download", "/api/merge/delete",
+    "/api/merge/upload",
+})
+
 class _CloudflareOnly(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
+        # Panel-to-panel traffic authenticates with its own short-lived JWT,
+        # not a browser session, and may arrive directly from a private LAN
+        # address rather than through Cloudflare. Those paths do their own
+        # signature and approval checks in the route, so the edge gate does not
+        # get to refuse them before they can be verified.
+        if request.url.path in _MERGE_REMOTE_PATHS:
+            return await call_next(request)
         if not _ingress_allowed(_hop_ip(request)):
             return Response(status_code=403)
         return await call_next(request)
@@ -826,6 +845,13 @@ def _config_sub_users():
         <div class="field-hint" id="nu-password-hint">At least 8 characters, and not only digits.</div>
         <input class="field-input" id="nu-password" type="password" autocomplete="new-password"></div>
       <div id="nu-grants" class="grant-form"><div class="empty-state">Loading permissions&hellip;</div></div>
+      <div class="nu-server-block" id="nu-server-block">
+        <div class="grant-legend">Linked servers</div>
+        <div class="field-hint" style="margin:0 0 10px;">Tick Access to show a server, then pick the metrics for it. Access alone shows the hardware overview.
+          Remote terminal and Server Configuration stay admin-only. Disk, when ticked, is full disk access on that server.
+          Use the arrows to set the order the account sees them.</div>
+        <div id="nu-servers"><div class="empty-state">No linked servers yet.</div></div>
+      </div>
       <div class="nu-actions">
         <button class="save-btn" id="nu-submit" onclick="submitPanelUser()">Create User</button>
         <button class="db-action-btn" id="nu-cancel" onclick="resetUserForm()" hidden>Cancel</button>
@@ -906,6 +932,72 @@ def _config_sub_server():
         <label class="perm-check"><input type="checkbox" id="ssh-allow-password" onchange="toggleSshPasswordLogin()">Allow password login (uncheck for key-only)</label>
       </div>
       <div class="save-feedback" id="ssh-login-mode-feedback"></div>
+    </div>
+
+    <div class="cfg-card cfg-card-wide" style="margin-top:18px;" id="merge-add-card">
+      <div class="device-title">Add servers</div>
+      <div class="settings-subtitle" style="margin:6px 0 16px;">
+        Manage more than one panel from here. This installation's private key is
+        below: give it to the other panel's admin only when you want that panel to
+        link back to this one. To add a server, paste <em>its</em> private key,
+        never this one.
+      </div>
+      <div class="merge-identity">
+        <div>
+          <div class="field-label">This server</div>
+          <div class="merge-id-line"><span id="merge-local-name">Loading&hellip;</span>
+            <code id="merge-local-id"></code></div>
+        </div>
+        <button class="db-action-btn" onclick="copyMergeKey()"><svg class="ic"><use href="#ic-copy"/></svg>Copy private key</button>
+        <button class="db-action-btn merge-danger" onclick="rotateMergeKey()" title="Every linked panel must be given the new key">Rotate key</button>
+      </div>
+      <div class="field-group">
+        <label class="field-label" for="merge-local-key">Private key</label>
+        <div class="field-hint">The other panel's admin pastes this when adding this host. Treat it like a password.</div>
+        <textarea class="field-input merge-key-box" id="merge-local-key" rows="2" readonly spellcheck="false"></textarea>
+      </div>
+
+      <div class="merge-form-grid">
+        <div class="field-group"><label class="field-label" for="merge-name">Name</label>
+          <div class="field-hint">Shown in the server list.</div>
+          <input class="field-input" id="merge-name" type="text" maxlength="120" placeholder="Office server" autocomplete="off"></div>
+        <div class="field-group"><label class="field-label" for="merge-host">Host</label>
+          <div class="field-hint">IP address, domain, or a full URL.</div>
+          <input class="field-input" id="merge-host" type="text" placeholder="192.168.1.9" spellcheck="false" autocomplete="off"></div>
+        <div class="field-group"><label class="field-label" for="merge-port">Port</label>
+          <div class="field-hint">Leave empty for HTTPS on 443; use 80 for plain HTTP.</div>
+          <input class="field-input" id="merge-port" type="number" min="1" max="65535" placeholder="443" autocomplete="off"></div>
+        <div class="field-group"><label class="field-label" for="merge-path">Panel path</label>
+          <div class="field-hint">Leave empty when the panel is at the domain root.</div>
+          <input class="field-input" id="merge-path" type="text" maxlength="200" placeholder="/management" spellcheck="false" autocomplete="off"></div>
+      </div>
+      <div class="field-group"><label class="field-label" for="merge-key">Private key of that server</label>
+        <div class="field-hint">Pasted from that panel's Server Configuration page.</div>
+        <input class="field-input" id="merge-key" type="password" autocomplete="off" spellcheck="false"></div>
+      <button class="save-btn" id="merge-add-btn" onclick="addLinkedServer()">Add Server</button>
+      <div class="save-feedback" id="merge-add-feedback"></div>
+    </div>
+
+    <div class="cfg-card cfg-card-wide" style="margin-top:18px;">
+      <div class="px-card-head">
+        <div>
+          <div class="device-title">Servers this panel manages</div>
+          <div class="settings-subtitle" style="margin-top:6px;">A link becomes usable after the other panel's admin allows the request on that panel.</div>
+        </div>
+        <button class="db-action-btn" onclick="loadLinkedServers()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
+      </div>
+      <div id="merge-server-list" style="margin-top:16px;"><div class="empty-state">Loading&hellip;</div></div>
+    </div>
+
+    <div class="cfg-card cfg-card-wide" style="margin-top:18px;">
+      <div class="px-card-head">
+        <div>
+          <div class="device-title">Server access requests</div>
+          <div class="settings-subtitle" style="margin-top:6px;">Another panel asked to access this server. It gets nothing until you allow it. Remote admins can open a root terminal here; remote staff only see the scopes their own admin grants. Allowing one does not give this panel access to that panel: add it above if you want both directions.</div>
+        </div>
+        <button class="db-action-btn" onclick="loadMergeRequests()"><svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
+      </div>
+      <div id="merge-request-list" style="margin-top:16px;"><div class="empty-state">Loading&hellip;</div></div>
     </div>
   </div>"""
 
@@ -1368,7 +1460,15 @@ def _crest():
 _PANES_TEMPLATE = """
 <div class="mgmt-main">
   <!-- SERVER -->
-  <div class="pane" data-pane="server"><div class="pane-scroll"><div class="server-inner">
+  <div class="pane" data-pane="server"><div class="pane-scroll">
+    <div class="srv-rail" id="srv-rail">
+      <div class="srv-rail-copy">
+        <div class="srv-rail-label">Servers</div>
+        <div class="srv-rail-sub" id="srv-rail-sub">This panel, and every server you may manage.</div>
+      </div>
+      <div class="srv-rail-list" id="srv-rail-list"><div class="empty-state">Loading&hellip;</div></div>
+    </div>
+    <div class="server-inner" id="local-server-view">
     <div class="srv-grid">
       <div class="metric-card metric-clickable" onclick="openServerDetail('cpu')" title="Top processes by CPU">
         <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-cpu"/></svg>CPU</span><span class="metric-now" id="m-cpu-now">0%</span></div>
@@ -1404,7 +1504,65 @@ _PANES_TEMPLATE = """
       </div>
       <div class="device-grid" id="device-grid"><div class="empty-state">Loading device info&hellip;</div></div>
     </div>
-  </div></div></div>
+  </div>
+
+    <div class="server-inner" id="remote-server-view" hidden>
+      <div class="remote-head">
+        <div class="remote-head-copy">
+          <div class="remote-name" id="remote-name">Linked server</div>
+          <div class="remote-meta" id="remote-meta"></div>
+        </div>
+        <div class="remote-head-actions">
+          <button class="db-action-btn" id="remote-terminal-btn" onclick="openRemoteTerminal()" hidden>
+            <svg class="ic"><use href="#ic-monitor"/></svg>Terminal</button>
+          <button class="db-action-btn" onclick="refreshRemoteServer()">
+            <svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
+        </div>
+      </div>
+      <div class="remote-down" id="remote-down" hidden></div>
+      <div id="remote-live">
+        <div class="srv-grid" id="remote-metric-grid">
+          <div class="metric-card metric-clickable" data-remotescope="cpu"
+               onclick="openRemoteDetail('cpu')" title="Top processes by CPU">
+            <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-cpu"/></svg>CPU</span><span class="metric-now" id="r-cpu-now">0%</span></div>
+            <canvas class="metric-chart" id="r-chart-cpu" height="70"></canvas>
+            <div class="metric-foot" id="r-cpu-foot">-</div>
+            <div class="core-bars" id="r-core-bars"></div>
+          </div>
+          <div class="metric-card metric-clickable" data-remotescope="memory"
+               onclick="openRemoteDetail('mem')" title="Top processes by memory">
+            <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-memory-stick"/></svg>Memory</span><span class="metric-now" id="r-ram-now">0%</span></div>
+            <canvas class="metric-chart" id="r-chart-ram" height="70"></canvas>
+            <div class="metric-foot" id="r-ram-foot">-</div>
+          </div>
+          <div class="metric-card metric-clickable" data-remotescope="network"
+               onclick="openRemoteDetail('net')" title="Active connections">
+            <div class="metric-head net-head"><span class="metric-title"><svg class="ic"><use href="#ic-wifi"/></svg>Network</span><span class="metric-now net-now" id="r-net-now"><span>&darr;0B/s</span><span>&uarr;0B/s</span></span></div>
+            <canvas class="metric-chart" id="r-chart-net" height="70"></canvas>
+            <div class="metric-foot" id="r-net-foot">-</div>
+          </div>
+          <div class="metric-card metric-clickable" data-remotescope="disk"
+               onclick="openRemoteDetail('disk')" title="Browse, upload and download files">
+            <div class="metric-head"><span class="metric-title"><svg class="ic"><use href="#ic-hard-drive"/></svg>Disk</span><span class="metric-now" id="r-disk-now">0%</span></div>
+            <div class="disk-bar"><div class="disk-fill" id="r-disk-fill"></div></div>
+            <div class="metric-foot" id="r-disk-foot">-</div>
+            <div class="metric-head" style="margin-top:14px;"><span class="metric-title">Load avg</span><span class="metric-now" id="r-load-now">0.00</span></div>
+            <div class="metric-foot" id="r-load-foot">1m / 5m / 15m</div>
+          </div>
+        </div>
+        <div class="device-card">
+          <div class="device-card-head">
+            <div class="device-card-heading">
+              <div class="device-title">Device &amp; OS</div>
+              <div class="device-sub">Hardware, network and runtime at a glance. Shown for every server you can access.</div>
+            </div>
+            <span class="device-live" title="Refreshes every 15 seconds"><span class="status-dot on"></span>Live hardware</span>
+          </div>
+          <div class="device-grid" id="r-device-grid"><div class="empty-state">Loading device info&hellip;</div></div>
+        </div>
+      </div>
+    </div>
+  </div></div>
 
   {config_pane}
 
@@ -1931,11 +2089,28 @@ def _ensure_feature_tables():
     try:
         cur = conn.cursor()
         for statement in (cloudflare_tunnel.SCHEMA + mail.SCHEMA
-                          + identity.SCHEMA + telegram_bot.SCHEMA):
+                          + identity.SCHEMA + telegram_bot.SCHEMA
+                          + merge_servers.SCHEMA):
             cur.execute(statement)
         cur.close()
     finally:
         DB.release_connection(conn)
+
+async def _merge_status_loop():
+    """Keep linked-server state honest without making a page request wait on a
+    dead host. One sweep runs in the DB thread and never raises into the app."""
+    while True:
+        try:
+            await DB.run(merge_servers.refresh_all_status, 4)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logging.warning(f"linked-server status sweep failed: {e}")
+        try:
+            await asyncio.sleep(45)
+        except asyncio.CancelledError:
+            return
+
 
 # ===========================================================================
 # FastAPI app
@@ -1954,8 +2129,18 @@ async def lifespan(app: FastAPI):
         _ensure_feature_tables()
     except Exception as e:
         logging.error(f"feature tables failed: {e}")
+    try:
+        merge_servers.ensure_local_identity()
+    except Exception as e:
+        logging.error(f"merge identity failed: {e}")
+    merge_task = asyncio.create_task(_merge_status_loop())
     write_log("INFO", "SYSTEM", "Management panel started", actor="system", detail=f"pid={os.getpid()}")
     yield
+    merge_task.cancel()
+    try:
+        await merge_task
+    except asyncio.CancelledError:
+        pass
     write_log("INFO", "SYSTEM", "Management panel stopped", actor="system")
 
 app = FastAPI(title="Management", lifespan=lifespan)
@@ -2848,6 +3033,683 @@ async def api_config_set(request: Request):
               ip=_client_ip(request), target=f"{host}:{port}")
     return {"status": "ok", "host": host, "port": port, "needs_restart": needs_restart}
 
+# ---------------------------------------------------------------------------
+# Linked management servers: local admin side
+# ---------------------------------------------------------------------------
+def _merge_public_identity(ident):
+    """The identity card. The key is shown only on this admin-only response."""
+    return {"server_uid": ident.get("server_uid"), "label": ident.get("label"),
+            "key": ident.get("key")}
+
+
+def _merge_servers_view():
+    ident = merge_servers.ensure_local_identity()
+    return {
+        "identity": _merge_public_identity(ident),
+        "servers": merge_servers.list_servers(),
+        "requests": merge_servers.list_requests(),
+    }
+
+
+@app.get("/api/config/servers")
+async def api_merge_servers(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    try:
+        return await DB.run(_merge_servers_view)
+    except Exception as e:
+        logging.error(f"linked-server view failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not read linked servers."})
+
+
+@app.post("/api/config/servers")
+async def api_merge_server_add(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    try:
+        server_id = await DB.run(
+            merge_servers.create_server,
+            body.get("name"), body.get("host"), body.get("port"),
+            body.get("path"), body.get("key"), _admin_name(request))
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        logging.error(f"linked-server add failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not save that server."})
+    result = await DB.run(merge_servers.handshake, server_id)
+    write_log("ACTION", "SERVER", "Added linked server", actor=_admin_name(request),
+              ip=_client_ip(request), target=(body.get("host") or "")[:200],
+              detail=result.get("status", ""))
+    row = await DB.run(merge_servers.get_server, server_id)
+    return {"status": "ok", "server": row, "handshake": result}
+
+
+@app.post("/api/config/servers/{server_id}/key")
+async def api_merge_server_key(request: Request, server_id: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    try:
+        ok = await DB.run(merge_servers.replace_server_key, server_id, body.get("key"))
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "No such server."})
+    result = await DB.run(merge_servers.handshake, server_id)
+    write_log("ACTION", "SECURITY", "Replaced linked-server key",
+              actor=_admin_name(request), ip=_client_ip(request),
+              target=server_id, detail=result.get("status", ""))
+    return {"status": "ok", "result": result,
+            "server": await DB.run(merge_servers.get_server, server_id)}
+
+
+@app.post("/api/config/servers/reorder")
+async def api_merge_servers_reorder(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    ids = body.get("ids") if isinstance(body.get("ids"), list) else []
+    await DB.run(merge_servers.reorder_servers, [str(i) for i in ids if i])
+    return {"status": "ok"}
+
+
+@app.post("/api/config/servers/rotate-key")
+async def api_merge_rotate_key(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    ident = await DB.run(merge_servers.rotate_local_key)
+    # The old key may have been shared with every linked panel; cut their live
+    # root shells too, not just future token checks.
+    _close_merge_terminals()
+    write_log("ACTION", "SECURITY", "Rotated linked-server key",
+              actor=_admin_name(request), ip=_client_ip(request),
+              target=ident.get("server_uid", ""))
+    return {"status": "ok", "identity": _merge_public_identity(ident)}
+
+
+@app.get("/api/config/servers/requests")
+async def api_merge_requests(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    return {"requests": await DB.run(merge_servers.list_requests)}
+
+
+@app.post("/api/config/servers/requests/{server_uid}")
+async def api_merge_request_decide(request: Request, server_uid: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    action = (body.get("action") or "").strip().lower()
+    if action not in ("allow", "deny"):
+        return JSONResponse(status_code=400, content={"error": "Choose allow or deny."})
+    ok = await DB.run(merge_servers.decide_request, server_uid,
+                      action == "allow", _admin_name(request))
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "No such request."})
+    if action == "deny":
+        # Revocation is immediate: do not leave a root shell open from the panel
+        # whose access was just withdrawn.
+        _close_merge_terminals(server_uid)
+    write_log("ACTION", "SECURITY",
+              "Allowed linked server" if action == "allow" else "Denied linked server",
+              actor=_admin_name(request), ip=_client_ip(request), target=server_uid)
+    return {"status": "ok"}
+
+
+@app.post("/api/config/servers/{server_id}/retry")
+async def api_merge_server_retry(request: Request, server_id: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    row = await DB.run(merge_servers.get_server, server_id)
+    if not row:
+        return JSONResponse(status_code=404, content={"error": "No such server."})
+    if row.get("server_uid"):
+        result = await DB.run(merge_servers.refresh_status, server_id)
+    else:
+        result = await DB.run(merge_servers.handshake, server_id)
+    return {"status": "ok", "result": result,
+            "server": await DB.run(merge_servers.get_server, server_id)}
+
+
+@app.delete("/api/config/servers/{server_id}")
+async def api_merge_server_delete(request: Request, server_id: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    row = await DB.run(merge_servers.get_server, server_id)
+    ok = await DB.run(merge_servers.delete_server, server_id)
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "No such server."})
+    write_log("ACTION", "SERVER", "Removed linked server", actor=_admin_name(request),
+              ip=_client_ip(request), target=(row or {}).get("host", server_id))
+    return {"status": "ok"}
+
+# ---------------------------------------------------------------------------
+# Linked management servers: what another panel may call
+#
+# These routes are exempt from the Cloudflare edge gate in _CloudflareOnly and
+# do their own work: verify the JWT with this panel's private key, check the
+# issuer is an allowed request, then check the scope the token was minted for.
+# ---------------------------------------------------------------------------
+async def _merge_local_identity():
+    return await DB.run(merge_servers.ensure_local_identity)
+
+
+def _merge_verify(data, ident):
+    if not data:
+        return None
+    if data.get("aud") and data.get("aud") != ident.get("server_uid"):
+        return None
+    return data
+
+
+async def _merge_incoming(request: Request, required_scope=None, purpose="api",
+                          allow_pending=False):
+    ident = await _merge_local_identity()
+    token = merge_servers._token_from_request(request)
+    data = _merge_verify(merge_servers.verify_token(token, ident.get("key", "")), ident)
+    if not data or data.get("purpose") != purpose:
+        return None, JSONResponse(status_code=401, content={"error": "Invalid server token."})
+    issuer = data.get("iss")
+    status = await DB.run(merge_servers.request_status, issuer)
+    if not status:
+        return None, JSONResponse(status_code=401, content={"error": "This server has not requested access."})
+    if status != "allowed" and not allow_pending:
+        return None, JSONResponse(status_code=401,
+                                  content={"error": "This server is not allowed yet."})
+    scopes = data.get("scopes") or []
+    if required_scope and required_scope not in scopes:
+        return None, JSONResponse(status_code=401, content={"error": "That scope is not granted."})
+    return data, None
+
+
+@app.post("/api/merge/handshake")
+async def api_merge_handshake(request: Request):
+    ident = await _merge_local_identity()
+    token = merge_servers._token_from_request(request)
+    data = _merge_verify(merge_servers.verify_token(token, ident.get("key", "")), ident)
+    if not data or data.get("purpose") != "handshake":
+        return JSONResponse(status_code=401, content={"error": "Invalid server token."})
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    hostname = (body.get("hostname") or data.get("hostname") or "")
+    # Prefer the address this request actually came from over a self-reported
+    # string: the request row is there to tell the admin where to look.
+    host = _client_ip(request) or body.get("host") or data.get("host") or ""
+    status = await DB.run(merge_servers.record_request, data.get("iss"),
+                          hostname, host)
+    write_log("INFO", "SECURITY", "Linked server handshake",
+              actor=f"merge:{str(data.get('iss'))[:12]}",
+              ip=_client_ip(request), target=(hostname or host)[:200],
+              detail=f"status={status}")
+    return {"status": "allowed" if status == "allowed" else status,
+            "server_uid": ident.get("server_uid"),
+            "hostname": ident.get("label")}
+
+
+@app.get("/api/merge/status")
+async def api_merge_status(request: Request):
+    data, err = await _merge_incoming(request, purpose="status", allow_pending=True)
+    if err:
+        return err
+    status = await DB.run(merge_servers.request_status, data.get("iss"))
+    ident = await _merge_local_identity()
+    return {"status": "allowed" if status == "allowed" else status,
+            "server_uid": ident.get("server_uid"),
+            "hostname": ident.get("label")}
+
+
+@app.get("/api/merge/static")
+async def api_merge_static(request: Request):
+    data, err = await _merge_incoming(request)
+    if err:
+        return err
+    try:
+        return await DB.run(System.static_info)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/merge/stats")
+async def api_merge_stats(request: Request):
+    data, err = await _merge_incoming(request)
+    if err:
+        return err
+    scopes = set(data.get("scopes") or [])
+    try:
+        stats = await DB.run(System.live_stats)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    out = {"scopes": sorted(scopes), "ts": stats.get("ts"),
+           "uptime_seconds": stats.get("uptime_seconds")}
+    if "cpu" in scopes:
+        out.update(cpu_percent=stats.get("cpu_percent"),
+                   cpu_per_core=stats.get("cpu_per_core"),
+                   processes=stats.get("processes"))
+    if "cpu" in scopes or "disk" in scopes:
+        # The load average sits in the disk card, exactly as it does locally,
+        # so a disk-only account must still get it.
+        out["load"] = stats.get("load")
+    if "memory" in scopes:
+        out.update(ram=stats.get("ram"), swap=stats.get("swap"))
+    if "network" in scopes:
+        out["net"] = stats.get("net")
+    if "disk" in scopes:
+        out["disk"] = stats.get("disk")
+    return out
+
+
+@app.get("/api/merge/processes")
+async def api_merge_processes(request: Request, by: str = "cpu"):
+    data, err = await _merge_incoming(request)
+    if err:
+        return err
+    scopes = set(data.get("scopes") or [])
+    needed = "memory" if by == "mem" else "cpu"
+    if needed not in scopes:
+        return JSONResponse(status_code=401, content={"error": "That process view is not granted."})
+    try:
+        result = await DB.run(System.top_processes, "mem" if by == "mem" else "cpu")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    # The table can be opened with either scope. Do not leak the other column
+    # just because System computes both in one pass.
+    for proc in result.get("processes") or []:
+        if "cpu" not in scopes:
+            proc.pop("cpu", None)
+        if "memory" not in scopes:
+            proc.pop("mem", None)
+    return result
+
+
+@app.get("/api/merge/connections")
+async def api_merge_connections(request: Request, established: int = 0):
+    data, err = await _merge_incoming(request, required_scope="network")
+    if err:
+        return err
+    try:
+        return await DB.run(System.net_connections, established_only=bool(established))
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/merge/files")
+async def api_merge_files(request: Request, path: str = ""):
+    data, err = await _merge_incoming(request, required_scope="disk")
+    if err:
+        return err
+    try:
+        # A linked admin, or a staff member an admin granted disk on this
+        # server, gets the whole filesystem. The user-scoped home restriction
+        # belongs to accounts on this panel, not to the linked server.
+        return await DB.run(System.list_dir, path or None, None)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/merge/download")
+async def api_merge_download(request: Request, path: str = ""):
+    data, err = await _merge_incoming(request, required_scope="disk")
+    if err:
+        return err
+    full, reason = System.resolve_download(path, root=None)
+    if reason == "not_found":
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    if reason == "blocked":
+        return JSONResponse(status_code=403, content={"error": "download blocked"})
+    write_log("ACTION", "SYSTEM", "Linked file download",
+              actor=f"merge:{str(data.get('iss'))[:12]}",
+              ip=_client_ip(request), target=full[:200])
+    return FileResponse(full, filename=os.path.basename(full),
+                        media_type="application/octet-stream")
+
+
+@app.delete("/api/merge/delete")
+async def api_merge_delete(request: Request):
+    data, err = await _merge_incoming(request, required_scope="disk")
+    if err:
+        return err
+    body = await _json_body(request)
+    path = body.get("path") or ""
+    ok, reason = await DB.run(System.delete_file, path, None)
+    if not ok:
+        code = 404 if reason == "not_found" else 400 if reason == "is_directory" else 403 if reason == "blocked" else 500
+        return JSONResponse(status_code=code, content={"error": reason or "delete failed"})
+    write_log("ACTION", "SYSTEM", "Linked file deleted",
+              actor=f"merge:{str(data.get('iss'))[:12]}",
+              ip=_client_ip(request), target=path[:200])
+    return {"status": "ok"}
+
+
+@app.post("/api/merge/upload")
+async def api_merge_upload(request: Request, path: str = "", name: str = ""):
+    data, err = await _merge_incoming(request, required_scope="disk")
+    if err:
+        return err
+    directory, dest, reason = System.resolve_upload(path, name, None, staff=False)
+    if reason:
+        code = 409 if reason == "exists" else 403 if reason == "blocked" else 400
+        return JSONResponse(status_code=code, content={
+            "error": _UPLOAD_ERRORS.get(reason, "Upload refused.")})
+    limit = System.MAX_UPLOAD_BYTES
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return JSONResponse(status_code=413, content={"error": f"Use a file under {_upload_limit_text()}."})
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".argus-merge-upload-", dir=directory)
+    except OSError:
+        return JSONResponse(status_code=500, content={"error": "Could not save the upload."})
+    total = 0
+    too_large = False
+    try:
+        with os.fdopen(fd, "wb") as out:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    too_large = True
+                    break
+                out.write(chunk)
+        if too_large:
+            return JSONResponse(status_code=413, content={"error": f"Use a file under {_upload_limit_text()}."})
+        ok, detail = await DB.run(System.finish_upload, temp_path, dest, None)
+        if not ok:
+            code = 409 if detail == "exists" else 403 if detail == "blocked" else 500
+            return JSONResponse(status_code=code, content={
+                "error": _UPLOAD_ERRORS.get(detail, "Could not save the upload.")})
+    except Exception:
+        return JSONResponse(status_code=500, content={"error": "Could not save the upload."})
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+    write_log("ACTION", "SYSTEM", "Linked file uploaded",
+              actor=f"merge:{str(data.get('iss'))[:12]}", target=dest[:200],
+              detail=f"{total} bytes")
+    return {"status": "ok", "name": name, "path": dest, "size": total}
+
+
+# ---------------------------------------------------------------------------
+# Linked management servers: what this panel calls on another panel
+# ---------------------------------------------------------------------------
+def _merge_local_uid():
+    return merge_servers.ensure_local_identity().get("server_uid", "")
+
+
+async def _merge_access(request: Request, server_id, required=None, admin_only=False):
+    perms = await _current_permissions(request)
+    if admin_only and perms.get("role") != "admin":
+        return None, None, None, JSONResponse(status_code=403, content={"error": "Only an admin can do that."})
+    server = await DB.run(merge_servers.get_server, server_id, False)
+    if not server:
+        return None, None, None, JSONResponse(status_code=404, content={"error": "No such server."})
+    if not server.get("approved"):
+        return None, None, None, JSONResponse(status_code=403, content={
+            "error": "That server has not allowed this panel yet."})
+    has_access, scopes = merge_servers.access_for_user(
+        perms.get("username", ""), perms.get("role"), server)
+    if not has_access:
+        # The overview is shared with every account an admin gave this server,
+        # even one with no metric boxes ticked, but not with someone who was
+        # never given the server in User Management.
+        return None, None, None, JSONResponse(status_code=403, content={
+            "error": "You do not have access to that linked server."})
+    if required and required not in scopes:
+        return None, None, None, JSONResponse(status_code=403, content={
+            "error": "You do not have access to that part of the linked server."})
+    return perms, server, scopes, None
+
+
+def _merge_failure(code, data, err, server):
+    if code == 401:
+        return JSONResponse(status_code=403, content={
+            "error": (data or {}).get("error") or err or "That server refused this panel.",
+            "server_status": "denied", "upstream": code})
+    if code == 403:
+        # 403 from a merge endpoint is an operation refusal (for example a
+        # protected file), not a withdrawn link. Leave the link approved.
+        return JSONResponse(status_code=403, content={
+            "error": (data or {}).get("error") or err or "That server refused the request.",
+            "server_status": "connected", "upstream": code})
+    return JSONResponse(status_code=502, content={
+        "error": (data or {}).get("error") or err or "That server could not be reached.",
+        "server_status": "down", "upstream": code})
+
+
+@app.get("/api/merge/servers")
+async def api_merge_visible_servers(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms = await _current_permissions(request)
+    role = perms.get("role")
+    servers = await DB.run(merge_servers.servers_for_user, perms.get("username", ""), role)
+    return {"is_admin": role == "admin", "local": {
+                "name": await DB.run(merge_servers.local_label),
+                "server_uid": await DB.run(_merge_local_uid)},
+            "servers": servers}
+
+
+@app.post("/api/merge/servers/reorder")
+async def api_merge_visible_reorder(request: Request):
+    if not _authed(request):
+        return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
+    body = await _json_body(request)
+    ids = body.get("ids") if isinstance(body.get("ids"), list) else []
+    await DB.run(merge_servers.reorder_servers, [str(i) for i in ids if i])
+    return {"status": "ok"}
+
+
+@app.get("/api/merge/server/{server_id}/static")
+async def api_merge_remote_static(request: Request, server_id: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, server, scopes, err = await _merge_access(request, server_id)
+    if err:
+        return err
+    code, data, msg = await DB.run(
+        merge_servers.call_for_user, server, perms.get("username", ""),
+        perms.get("role"), "/api/merge/static", "GET", None, None, 10)
+    if code != 200:
+        return _merge_failure(code, data, msg, server)
+    return data
+
+
+@app.get("/api/merge/server/{server_id}/stats")
+async def api_merge_remote_stats(request: Request, server_id: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, server, scopes, err = await _merge_access(request, server_id)
+    if err:
+        return err
+    code, data, msg = await DB.run(
+        merge_servers.call_for_user, server, perms.get("username", ""),
+        perms.get("role"), "/api/merge/stats", "GET", None, None, 8)
+    if code != 200:
+        return _merge_failure(code, data, msg, server)
+    return data
+
+
+@app.get("/api/merge/server/{server_id}/processes")
+async def api_merge_remote_processes(request: Request, server_id: str, by: str = "cpu"):
+    if not _authed(request):
+        return _need_auth()
+    required = "cpu" if by != "mem" else "memory"
+    perms, server, scopes, err = await _merge_access(request, server_id, required)
+    if err:
+        return err
+    code, data, msg = await DB.run(
+        merge_servers.call_for_user, server, perms.get("username", ""),
+        perms.get("role"), f"/api/merge/processes?by={'mem' if by == 'mem' else 'cpu'}",
+        "GET", None, None, 10)
+    if code != 200:
+        return _merge_failure(code, data, msg, server)
+    return data
+
+
+@app.get("/api/merge/server/{server_id}/connections")
+async def api_merge_remote_connections(request: Request, server_id: str,
+                                       established: int = 0):
+    if not _authed(request):
+        return _need_auth()
+    perms, server, scopes, err = await _merge_access(request, server_id, "network")
+    if err:
+        return err
+    code, data, msg = await DB.run(
+        merge_servers.call_for_user, server, perms.get("username", ""),
+        perms.get("role"),
+        "/api/merge/connections" + ("?established=1" if established else ""),
+        "GET", None, None, 10)
+    if code != 200:
+        return _merge_failure(code, data, msg, server)
+    return data
+
+
+@app.get("/api/merge/server/{server_id}/files")
+async def api_merge_remote_files(request: Request, server_id: str, path: str = ""):
+    if not _authed(request):
+        return _need_auth()
+    perms, server, scopes, err = await _merge_access(request, server_id, "disk")
+    if err:
+        return err
+    from urllib.parse import urlencode
+    code, data, msg = await DB.run(
+        merge_servers.call_for_user, server, perms.get("username", ""),
+        perms.get("role"), "/api/merge/files?" + urlencode({"path": path}),
+        "GET", None, None, 15)
+    if code != 200:
+        return _merge_failure(code, data, msg, server)
+    return data
+
+
+@app.get("/api/merge/server/{server_id}/download")
+async def api_merge_remote_download(request: Request, server_id: str, path: str = ""):
+    if not _authed(request):
+        return _need_auth()
+    perms, server, scopes, err = await _merge_access(request, server_id, "disk")
+    if err:
+        return err
+    resp, error = await DB.run(
+        merge_servers.open_download, server, perms.get("username", ""),
+        perms.get("role"), path, 30)
+    if not resp:
+        return JSONResponse(status_code=502, content={"error": error or "That server could not send the file."})
+    headers = {}
+    disp = resp.headers.get("content-disposition")
+    if disp:
+        headers["Content-Disposition"] = disp
+    def chunks():
+        try:
+            while True:
+                data = resp.read(65536)
+                if not data:
+                    break
+                yield data
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    return StreamingResponse(chunks(), media_type="application/octet-stream",
+                             headers=headers)
+
+
+@app.delete("/api/merge/server/{server_id}/delete")
+async def api_merge_remote_delete(request: Request, server_id: str):
+    if not _authed(request):
+        return _need_auth()
+    perms, server, scopes, err = await _merge_access(request, server_id, "disk")
+    if err:
+        return err
+    body = await _json_body(request)
+    code, data, msg = await DB.run(
+        merge_servers.call_for_user, server, perms.get("username", ""),
+        perms.get("role"), "/api/merge/delete", "DELETE",
+        {"path": body.get("path") or ""}, None, 15)
+    if code != 200:
+        return _merge_failure(code, data, msg, server)
+    return data
+
+
+@app.post("/api/merge/server/{server_id}/upload")
+async def api_merge_remote_upload(request: Request, server_id: str,
+                                  path: str = "", name: str = ""):
+    if not _authed(request):
+        return _need_auth()
+    perms, server, scopes, err = await _merge_access(request, server_id, "disk")
+    if err:
+        return err
+    limit = System.MAX_UPLOAD_BYTES
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return JSONResponse(status_code=413, content={"error": f"Use a file under {_upload_limit_text()}."})
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".argus-merge-forward-")
+    except OSError:
+        return JSONResponse(status_code=500, content={"error": "Could not stage the upload."})
+    total = 0
+    too_large = False
+    try:
+        with os.fdopen(fd, "wb") as out:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    too_large = True
+                    break
+                out.write(chunk)
+        if too_large:
+            return JSONResponse(status_code=413, content={"error": f"Use a file under {_upload_limit_text()}."})
+        with open(temp_path, "rb") as fh:
+            code, data = await DB.run(
+                merge_servers.upload_file, server, perms.get("username", ""),
+                perms.get("role"), path, name, fh, total, 3600)
+        if code != 200:
+            return _merge_failure(code, data, (data or {}).get("error", ""), server)
+        return data
+    except Exception as e:
+        logging.error(f"linked upload failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not send the upload."})
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
 # ---- services ----
 @app.get("/api/services")
 async def api_services(request: Request):
@@ -3037,9 +3899,12 @@ _USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 def _list_panel_users():
     conn = DB.get_connection()
     try:
-        return panel_users.list_users(conn)
+        users = panel_users.list_users(conn)
     finally:
         DB.release_connection(conn)
+    for user in users:
+        user["servers"] = merge_servers.get_user_access(user["username"])
+    return users
 
 @app.get("/api/config/users")
 async def api_users_list(request: Request):
@@ -3102,6 +3967,8 @@ async def api_users_create(request: Request):
     except Exception as e:
         msg = "That username is already taken." if "unique" in str(e).lower() else "Could not create the user."
         return JSONResponse(status_code=400, content={"error": msg})
+    if "servers" in body:
+        await DB.run(merge_servers.set_user_access, username, body.get("servers") or [])
     write_log("ACTION", "SECURITY", "Created panel user", actor=_admin_name(request),
               ip=_client_ip(request), target=username, detail=_grant_summary(grants))
     return {"status": "ok", "os_username": os_username}
@@ -3145,14 +4012,20 @@ async def api_users_update(request: Request, username: str):
         fields["full_name"] = str(body.get("full_name") or "")
         notes.append("name changed")
 
-    if not fields:
+    if not fields and "servers" not in body:
         return JSONResponse(status_code=400, content={"error": "Nothing to change."})
-    try:
-        ok = await DB.run(_update_panel_user, username, **fields)
-    except RuntimeError as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    if fields:
+        try:
+            ok = await DB.run(_update_panel_user, username, **fields)
+        except RuntimeError as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+    else:
+        ok = True
     if not ok:
         return JSONResponse(status_code=404, content={"error": "No such user."})
+    if "servers" in body:
+        await DB.run(merge_servers.set_user_access, username, body.get("servers") or [])
+        notes.append("server access changed")
     # Drop the cached epoch so a reset or a narrowed grant set takes hold on the
     # target's very next request rather than up to ten seconds later.
     _forget_user_epoch(username)
@@ -3177,6 +4050,7 @@ async def api_users_delete(request: Request, username: str):
     ok = await DB.run(_delete_panel_user, username)
     if not ok:
         return JSONResponse(status_code=404, content={"error": "No such user."})
+    await DB.run(merge_servers.delete_user_access, username)
     write_log("ACTION", "SECURITY", "Deleted panel user", actor=_admin_name(request),
               ip=_client_ip(request), target=username)
     return {"status": "ok"}
@@ -4893,6 +5767,14 @@ class _ManagedTerm:
             self.loop.remove_reader(self.sess.fd)
         except Exception:
             pass
+        # A server-side close (key rotation, revoked panel) must wake any
+        # websocket waiting on this session, not just stop the PTY.
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+        self.subscribers.clear()
         try:
             self.sess.close()
         except Exception:
@@ -4903,14 +5785,24 @@ def _term_close(sid):
     if mt:
         mt.close()
 
+def _close_merge_terminals(issuer=""):
+    """Close inbound linked sessions, all of them or just one issuer."""
+    prefix = f"merge:{issuer}:" if issuer else "merge:"
+    for sid, mt in list(_TERMS.items()):
+        if str(getattr(mt, "owner", "")).startswith(prefix):
+            _term_close(sid)
+
 @app.get("/api/system/terminals")
 async def list_terminals(request: Request):
     if not _authed(request):
         return _need_auth()
+    # Inbound linked sessions are owned by another panel and must never show up
+    # as tabs in this panel's local terminal list.
     return {"sessions": [
         {"id": sid, "persist": mt.persist, "alive": not mt.dead,
          "rows": mt.rows, "cols": mt.cols, "created": int(mt.created)}
-        for sid, mt in _TERMS.items()]}
+        for sid, mt in _TERMS.items()
+        if not str(getattr(mt, "owner", "")).startswith("merge:")]}
 
 @app.websocket("/ws/terminal")
 async def terminal_ws(websocket: WebSocket):
@@ -5036,6 +5928,224 @@ async def terminal_ws(websocket: WebSocket):
             _term_close(sid)
         write_log("ACTION", "TERMINAL", "PTY session " + ("detached (kept alive)" if kept else "ended"),
                   actor="terminal", ip=_client_ip_ws(websocket), target=f"sid={sid}")
+
+# ---------------------------------------------------------------------------
+# Linked terminal. The browser only ever talks to this panel; this panel holds
+# the server key and opens a second websocket to the linked panel. A staff
+# account is refused here, before any remote connection is made.
+# ---------------------------------------------------------------------------
+@app.websocket("/ws/merge-terminal")
+async def merge_terminal_ws(websocket: WebSocket):
+    if _CF_GATE_ON:
+        peer = websocket.client.host if websocket.client else ""
+        if not _ingress_allowed(peer):
+            await websocket.close(code=1008)
+            return
+    token_data = _get_token_data(websocket.cookies.get("session", ""))
+    if token_data is None:
+        await websocket.close(code=1008)
+        return
+    username = token_data.get("username", "")
+    perms = await DB.run(_resolve_permissions, username)
+    if perms.get("role") != "admin":
+        await websocket.close(code=1008)
+        return
+    server_id = (websocket.query_params.get("server") or "").strip()
+    server = await DB.run(merge_servers.get_server, server_id, False)
+    if not server or not server.get("approved"):
+        await websocket.close(code=1008)
+        return
+    sid = (websocket.query_params.get("sid") or secrets.token_hex(8)).strip()[:64]
+    rows = _safe_int(websocket.query_params.get("rows"), 24)
+    cols = _safe_int(websocket.query_params.get("cols"), 80)
+    persist = (websocket.query_params.get("persist") or "") in ("1", "true", "yes", "on")
+    token = merge_servers.make_server_token(
+        server, subject=username, role="admin", scopes=merge_servers.ADMIN_SCOPES,
+        purpose="api", ttl=120)
+    url = (merge_servers.server_ws_url(server, "/ws/merge/terminal") + "?" +
+           f"sid=mt_{sid}&rows={rows}&cols={cols}"
+           f"&persist={'1' if persist else '0'}")
+    await websocket.accept()
+    try:
+        import inspect
+        import websockets
+        # The bearer token stays in a header so it cannot end up in a proxy or
+        # access log the way a query string can. websockets renamed this keyword
+        # in 14.0, while requirements still allow 12.x.
+        try:
+            params = inspect.signature(websockets.connect).parameters
+        except (TypeError, ValueError):
+            params = {}
+        header_kw = ("additional_headers" if "additional_headers" in params
+                     else "extra_headers")
+        remote = await websockets.connect(
+            url, max_size=None, open_timeout=12, close_timeout=3,
+            **{header_kw: {"Authorization": "Bearer " + token}})
+    except Exception as e:
+        logging.warning(f"linked terminal connect failed: {e}")
+        try:
+            await websocket.send_text(f"\r\n\x1b[31mThat server terminal is unreachable.\x1b[0m\r\n")
+        except Exception:
+            pass
+        await websocket.close(code=1011)
+        return
+
+    async def browser_to_remote():
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                return
+            b = msg.get("bytes")
+            if b is not None:
+                await remote.send(b)
+                continue
+            t = msg.get("text")
+            if t:
+                await remote.send(t)
+
+    async def remote_to_browser():
+        async for msg in remote:
+            if isinstance(msg, bytes):
+                await websocket.send_bytes(msg)
+            else:
+                await websocket.send_text(msg)
+
+    tasks = [asyncio.create_task(browser_to_remote()),
+             asyncio.create_task(remote_to_browser())]
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        for task in tasks:
+            task.cancel()
+        try:
+            await remote.close()
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        write_log("ACTION", "TERMINAL", "Linked terminal closed", actor=username,
+                  ip=_client_ip_ws(websocket), target=f"server={server_id} sid={sid}")
+
+
+@app.websocket("/ws/merge/terminal")
+async def merge_remote_terminal_ws(websocket: WebSocket):
+    """The receiving side of a linked terminal. Authenticated by the server JWT
+    in the Authorization header, not by a browser session cookie."""
+    token = merge_servers._ws_token(websocket)
+    ident = await _merge_local_identity()
+    data = _merge_verify(merge_servers.verify_token(token, ident.get("key", "")), ident)
+    if not data or data.get("purpose") != "api":
+        await websocket.close(code=1008)
+        return
+    status = await DB.run(merge_servers.request_status, data.get("iss"))
+    scopes = data.get("scopes") or []
+    if status != "allowed" or "terminal" not in scopes or data.get("role") != "admin":
+        await websocket.close(code=1008)
+        return
+    qp = websocket.query_params
+    sid = "mr_" + (qp.get("sid") or secrets.token_hex(8)).strip()[:64]
+    rows = _safe_int(qp.get("rows"), 24)
+    cols = _safe_int(qp.get("cols"), 80)
+    persist = (qp.get("persist") or "") in ("1", "true", "yes", "on")
+    owner = f"merge:{data.get('iss')}:{data.get('sub')}"
+    await websocket.accept()
+    mt = _TERMS.get(sid)
+    if mt is not None and mt.dead:
+        _term_close(sid)
+        mt = None
+    if mt is not None and mt.owner != owner:
+        sid = "mr_" + secrets.token_hex(8)
+        mt = None
+    if mt is None:
+        try:
+            mt = _ManagedTerm(sid, persist, rows, cols, owner=owner)
+        except Exception as e:
+            logging.error(f"linked terminal spawn failed: {e}")
+            await websocket.close(code=1011)
+            return
+        _TERMS[sid] = mt
+    else:
+        mt.persist = persist
+    try:
+        await websocket.send_text(json.dumps({"sid": sid, "persist": mt.persist}))
+    except Exception:
+        pass
+    q: asyncio.Queue = asyncio.Queue()
+    mt.subscribers.add(q)
+    if mt.buffer:
+        try:
+            await websocket.send_bytes(bytes(mt.buffer))
+        except Exception:
+            pass
+
+    async def pump_out():
+        while True:
+            chunk = await q.get()
+            if chunk is None:
+                try:
+                    await websocket.send_bytes(b"\r\n\x1b[90m[session ended]\x1b[0m\r\n")
+                except Exception:
+                    pass
+                return
+            try:
+                await websocket.send_bytes(chunk)
+            except Exception:
+                return
+
+    out_task = asyncio.create_task(pump_out())
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            b = msg.get("bytes")
+            if b is not None:
+                mt.write(b)
+                continue
+            t = msg.get("text")
+            if not t:
+                continue
+            try:
+                ctrl = json.loads(t)
+            except Exception:
+                mt.write(t)
+                continue
+            if not isinstance(ctrl, dict):
+                continue
+            if "resize" in ctrl:
+                try:
+                    r, c = ctrl["resize"]
+                    mt.resize(int(r), int(c))
+                except Exception:
+                    pass
+            if "persist" in ctrl:
+                mt.persist = bool(ctrl["persist"])
+            if ctrl.get("kill"):
+                _term_close(sid)
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logging.error(f"linked terminal closed: {type(e).__name__}: {e}")
+    finally:
+        mt.subscribers.discard(q)
+        out_task.cancel()
+        kept = mt.persist and not mt.dead
+        if not kept and not mt.subscribers:
+            _term_close(sid)
+        write_log("ACTION", "TERMINAL",
+                  "Linked PTY " + ("detached (kept alive)" if kept else "ended"),
+                  actor=owner, ip=_client_ip_ws(websocket), target=f"sid={sid}")
+
 
 @app.get("/healthz")
 async def healthz():
