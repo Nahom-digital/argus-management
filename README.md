@@ -54,10 +54,22 @@ python3 management.py --upgrade   # git pull the latest code, then restart the s
 python3 management.py --update    # re-check and update the system structure: dependencies, tables, config, service
 python3 management.py --serve     # run in the foreground from deploy.json
 python3 management.py --status    # config / dependency / database / service report
+python3 management.py --delete    # uninstall the service, database and install
+python3 management.py --delete --yes   # uninstall without the confirmation prompt
 python3 management.py --recovery-codes   # mint new single-use recovery codes
 python3 management.py --setup     # force the wizard even without a TTY
 python3 management.py --help
 ```
+
+`--delete` is irreversible. It stops and removes the `argus-management`
+service, drops the database named in `deploy.json`, removes the dedicated
+PostgreSQL role when it is not still used by another database, removes the
+generated `argus_*` staff OS accounts, deletes `.env`, `deploy.json`, recovery/
+session/vault/SSH secrets, the virtualenv, and finally the installation
+directory itself. It deliberately leaves shared packages and third-party data alone:
+PostgreSQL, nginx, Docker, mailboxes, nginx host configs, firewall rules and
+Cloudflare tunnel credentials are not uninstalled. Run it interactively and
+type `DELETE`, or pass `--yes` for scripted removal.
 
 If you chose **not** to run as a service and want to switch later, that's
 `python3 management.py --service`. Installing a system service needs root, so run it

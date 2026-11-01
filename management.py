@@ -5,6 +5,7 @@
 #   python3 management.py --service   install + start the systemd service, then exit
 #   python3 management.py --serve     run in the foreground from deploy.json (systemd calls this)
 #   python3 management.py --status    show the service / config status
+#   python3 management.py --delete    uninstall: service, database, config and this directory
 #   python3 management.py --setup     force the wizard even without a TTY
 #
 # This file is deliberately self-sufficient: it needs nothing but a stock
@@ -52,6 +53,18 @@ ENV_PATH = os.path.join(HERE, ".env")
 VENV_DIR = os.path.join(HERE, ".venv")
 SERVICE_NAME = "argus-management"
 UNIT_PATH = f"/etc/systemd/system/{SERVICE_NAME}.service"
+TUNNEL_SERVICE_NAME = "argus-tunnel"
+TUNNEL_UNIT_PATH = f"/etc/systemd/system/{TUNNEL_SERVICE_NAME}.service"
+
+# Everything under HERE that belongs to a deployment. The whole directory is
+# removed at the end, but wiping these first guarantees credentials are gone
+# even if a source-tree removal is refused by the filesystem.
+DELETE_LOCAL_STATE = (
+    ".env", "deploy.json", ".recovery", ".session_secret", ".wallet_secret",
+    ".vault_key", "id_ed25519", "id_ed25519.pub", ".venv", "__pycache__",
+    ".pytest_cache",
+)
+PROTECTED_DB_ROLES = {"postgres"}
 
 CONNECT_TIMEOUT = 5          # seconds for a single PostgreSQL connection attempt
 SEP = "\x1f"                 # ASCII unit separator, psql field delimiter
@@ -2509,6 +2522,400 @@ def service_mode():
     sys.exit(1)
 
 
+# --------------------------------------------------------------------------- #
+# 13. --delete: remove the service, database, credentials and the checkout
+# --------------------------------------------------------------------------- #
+def _unit_active(name):
+    if not shutil.which("systemctl"):
+        return False
+    rc, out, _ = run(["systemctl", "is-active", name], timeout=30)
+    return out.strip() == "active"
+
+
+def _systemctl_sudo(*args, timeout=180):
+    if not shutil.which("systemctl"):
+        return 127, "", "systemctl: not found"
+    return run(sudo_prefix() + ["systemctl"] + list(args), timeout=timeout)
+
+
+def _stop_delete_service(name, unit_path):
+    """Stop one Argus unit without removing its definition yet."""
+    if not os.path.lexists(unit_path) and not _unit_active(name):
+        return True, f"{name} is not installed"
+    rc, _, stderr = _systemctl_sudo("stop", name)
+    if rc != 0 and _unit_active(name):
+        return False, stderr.strip()[:300] or f"could not stop {name}"
+    for _ in range(10):
+        if not _unit_active(name):
+            return True, f"{name} stopped"
+        time.sleep(0.5)
+    return False, f"{name} is still active"
+
+
+def _remove_delete_service(name, unit_path, best_effort=False):
+    """Disable and delete a unit, its enablement links and systemd's load cache."""
+    installed = os.path.lexists(unit_path)
+    active = _unit_active(name)
+    if not installed and not active:
+        return True, f"{name} is not installed"
+
+    if shutil.which("systemctl"):
+        _systemctl_sudo("disable", "--now", name)
+        _systemctl_sudo("reset-failed", name)
+    removed = True
+    try:
+        if os.path.lexists(unit_path):
+            os.remove(unit_path)
+    except OSError:
+        removed = False
+    if not removed:
+        if not can_escalate():
+            if best_effort:
+                warn(f"could not remove {unit_path} (needs root)")
+                return False, f"{unit_path} needs root"
+            return False, f"could not remove {unit_path} (needs root)"
+        rc, _, stderr = run(sudo_prefix() + ["rm", "-f", "--", unit_path], timeout=60)
+        removed = rc == 0
+        if not removed and best_effort:
+            warn(f"could not remove {unit_path}: {stderr.strip()[:200]}")
+
+    dropin = unit_path + ".d"
+    if os.path.isdir(dropin):
+        try:
+            shutil.rmtree(dropin)
+        except OSError:
+            if can_escalate():
+                run(sudo_prefix() + ["rm", "-rf", "--", dropin], timeout=60)
+
+    for link in glob.glob(f"/etc/systemd/system/*.wants/{name}.service"):
+        try:
+            os.remove(link)
+        except OSError:
+            if can_escalate():
+                run(sudo_prefix() + ["rm", "-f", "--", link], timeout=60)
+
+    if shutil.which("systemctl"):
+        _systemctl_sudo("daemon-reload", timeout=120)
+    if os.path.isdir(dropin):
+        removed = False
+    if not removed:
+        return False, f"{unit_path} still exists"
+    return True, f"{name} removed"
+
+
+def _delete_database_channel(cfg, assume_yes):
+    """Open the most privileged PostgreSQL channel we can find without guessing."""
+    channel = discover_admin_channel(cfg, quiet=True)
+    if (channel is None and can_escalate() and not sudo_is_cached()
+            and prime_sudo("reach PostgreSQL as the 'postgres' system user")):
+        channel = discover_admin_channel(cfg, quiet=True)
+    if channel is None and not assume_yes and sys.stdin.isatty():
+        channel = obtain_admin_channel(cfg)
+    return channel
+
+
+def _drop_configured_database(channel, name):
+    name = str(name or "").strip()
+    if not name:
+        return True, "no database configured"
+    if name in SYSTEM_DATABASES:
+        warn(f"refusing to drop PostgreSQL system database '{name}'")
+        return True, f"system database '{name}' left alone"
+    try:
+        exists = database_exists(channel, name)
+    except Exception as e:
+        return False, f"could not check database '{name}': {_short_pg_error(e)}"
+    if not exists:
+        return True, f"database '{name}' is already gone"
+
+    try:
+        channel.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            f"WHERE datname = {qlit(name)} AND pid <> pg_backend_pid()")
+    except Exception:
+        pass        # DROP ... WITH (FORCE) below is the fallback on PostgreSQL 13+.
+
+    try:
+        channel.execute(f"DROP DATABASE IF EXISTS {qident(name)}")
+    except Exception as first:
+        try:
+            channel.execute(f"DROP DATABASE IF EXISTS {qident(name)} WITH (FORCE)")
+        except Exception as second:
+            return False, (f"could not drop database '{name}': "
+                           f"{_short_pg_error(second if second else first)}")
+    try:
+        if database_exists(channel, name):
+            return False, f"database '{name}' still exists after DROP"
+    except Exception as e:
+        return False, f"could not verify database removal: {_short_pg_error(e)}"
+    return True, f"database '{name}' removed"
+
+
+def _drop_configured_role(channel, role, dbname):
+    """Drop the app role only when it is dedicated to this deployment.
+
+    PostgreSQL itself refuses a DROP ROLE that is still referenced by objects
+    in another database, which is the final guard against removing a role that
+    somebody else is using.
+    """
+    role = str(role or "").strip()
+    if not role:
+        return True, "no database role configured"
+    if role in PROTECTED_DB_ROLES:
+        warn(f"refusing to drop protected PostgreSQL role '{role}'")
+        return True, f"protected role '{role}' left alone"
+    if str(getattr(channel, "user", "") or "") == role:
+        warn(f"the active PostgreSQL connection is using '{role}', leaving the role in place")
+        return True, f"role '{role}' left in place"
+    try:
+        rows = channel.query(
+            f"SELECT rolsuper FROM pg_roles WHERE rolname = {qlit(role)}")
+    except Exception as e:
+        return False, f"could not inspect role '{role}': {_short_pg_error(e)}"
+    if not rows:
+        return True, f"role '{role}' is already gone"
+    if str(rows[0][0]).lower() in ("true", "t", "1"):
+        warn(f"refusing to drop superuser role '{role}'")
+        return True, f"superuser role '{role}' left alone"
+
+    try:
+        owned = channel.query(
+            "SELECT datname FROM pg_database WHERE datdba = "
+            f"(SELECT oid FROM pg_roles WHERE rolname = {qlit(role)})")
+    except Exception as e:
+        return False, f"could not inspect databases owned by '{role}': {_short_pg_error(e)}"
+    others = [r[0] for r in owned if r and r[0] != dbname]
+    if others:
+        warn(f"role '{role}' still owns {', '.join(others)}; leaving it in place")
+        return True, f"shared role '{role}' left in place"
+
+    try:
+        channel.execute(f"DROP ROLE IF EXISTS {qident(role)}")
+    except Exception as e:
+        warn(f"role '{role}' still has dependencies in PostgreSQL: {_short_pg_error(e)}")
+        return True, f"role '{role}' left in place"
+    return True, f"role '{role}' removed"
+
+
+def _staff_os_accounts(channel, dbname):
+    """Read the generated argus_* accounts before their database is removed."""
+    if not dbname or dbname in SYSTEM_DATABASES:
+        return []
+    try:
+        rows = channel.query(
+            "SELECT os_username FROM panel_user "
+            "WHERE os_username IS NOT NULL AND os_username <> ''", db=dbname)
+    except Exception:
+        return []
+    out = []
+    for row in rows:
+        name = str(row[0] if row else "").strip()
+        if (name.startswith("argus_") and len(name) <= 32
+                and re.fullmatch(r"argus_[a-z0-9_]+", name)):
+            out.append(name)
+    return sorted(set(out))
+
+
+def _remove_staff_os_accounts(names):
+    if not names:
+        return True
+    if not can_escalate():
+        warn("staff OS accounts need root to remove: " + ", ".join(names))
+        return False
+    ok_all = True
+    for name in names:
+        if not panel_users.os_account_exists(name):
+            continue
+        rc, _, stderr = run(sudo_prefix() + ["userdel", "-r", name], timeout=120)
+        if rc == 0:
+            ok(f"removed OS account {name}")
+        else:
+            ok_all = False
+            warn(f"could not remove OS account {name}: {stderr.strip()[:200]}")
+    return ok_all
+
+
+def _remove_local_state():
+    ok_all = True
+    for name in DELETE_LOCAL_STATE:
+        path = os.path.join(HERE, name)
+        if not os.path.lexists(path):
+            continue
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError:
+            if can_escalate():
+                rc, _, stderr = run(sudo_prefix() + ["rm", "-rf", "--", path], timeout=300)
+                if rc != 0:
+                    ok_all = False
+                    warn(f"could not remove {path}: {stderr.strip()[:200]}")
+            else:
+                ok_all = False
+                warn(f"could not remove {path} (needs root)")
+    return ok_all
+
+
+def _remove_install_directory():
+    """Remove the checkout itself, after proving it is the running install."""
+    target = os.path.realpath(HERE)
+    if target in ("/", os.path.expanduser("~")) or not os.path.isfile(
+            os.path.join(target, "management.py")):
+        return False, f"refusing to remove unexpected install path {target}"
+    previous_cwd = os.getcwd()
+    try:
+        os.chdir("/")
+    except OSError:
+        previous_cwd = ""
+    try:
+        shutil.rmtree(target)
+    except OSError:
+        if not can_escalate():
+            return False, f"could not remove {target} (needs root)"
+        rc, _, stderr = run(sudo_prefix() + ["rm", "-rf", "--", target], timeout=300)
+        if rc != 0:
+            return False, f"could not remove {target}: {stderr.strip()[:200]}"
+    if os.path.exists(target):
+        return False, f"{target} still exists"
+    # The normal uninstall removes the shell's working directory too, so there
+    # is nowhere to return to. Tests and partial removals still get their cwd.
+    if previous_cwd and os.path.isdir(previous_cwd):
+        try:
+            os.chdir(previous_cwd)
+        except OSError:
+            pass
+    return True, f"{target} removed"
+
+
+def _delete_confirmation(cfg, assume_yes):
+    dbname = str(cfg.get("db_name") or "") if cfg else ""
+    dbuser = str(cfg.get("db_user") or "") if cfg else ""
+    print()
+    info(f"service:   {SERVICE_NAME} ({UNIT_PATH})")
+    if dbname:
+        info(f"database:  {dbuser}@{cfg.get('db_host')}:{cfg.get('db_port')}/{dbname}")
+    else:
+        info("database:  not configured, skipping")
+    info(f"directory: {HERE} (including .env, deploy.json, secrets, virtualenv and source)")
+    warn("this permanently deletes the database, the service and the entire install directory")
+    info("shared packages and third-party data such as nginx hosts, firewall rules, "
+         "mailboxes and Cloudflare tunnel credentials are left alone")
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        err("refusing to delete without confirmation in a non-interactive shell")
+        info("re-run with --delete --yes only when you are certain")
+        return False
+    if ask("Type DELETE to continue", "") != "DELETE":
+        info("nothing was removed")
+        return False
+    return True
+
+
+def delete_mode(assume_yes=False):
+    """`--delete`: stop and remove the service, drop the configured database,
+    delete generated OS accounts and remove every deployment file and the
+    checkout itself. Shared system packages are deliberately left installed."""
+    banner()
+    head("Removing Argus Management")
+
+    cfg = None
+    if os.path.exists(CONFIG_PATH):
+        try:
+            cfg = load_config()
+        except Exception as e:
+            err(f"could not read {CONFIG_PATH}: {e}")
+            info("nothing was removed")
+            return 1
+    else:
+        warn("no deploy.json found; no database target is known")
+
+    if not _delete_confirmation(cfg, assume_yes):
+        return 1
+
+    dbname = str(cfg.get("db_name") or "") if cfg else ""
+    dbuser = str(cfg.get("db_user") or "") if cfg else ""
+    channel = None
+    staff_accounts = []
+    if dbname:
+        channel = _delete_database_channel(cfg, assume_yes)
+        if channel is None:
+            err(f"could not reach PostgreSQL at "
+                f"{cfg.get('db_host')}:{cfg.get('db_port')}; nothing was removed")
+            info("start PostgreSQL, or remove deploy.json and the install directory manually")
+            return 1
+        staff_accounts = _staff_os_accounts(channel, dbname)
+
+    system_units = [p for p in (UNIT_PATH, TUNNEL_UNIT_PATH) if os.path.lexists(p)]
+    source_writable = (os.access(HERE, os.W_OK)
+                       and os.access(os.path.dirname(os.path.abspath(HERE)), os.W_OK))
+    needs_root = bool(system_units or staff_accounts or not source_writable)
+    if needs_root and not can_escalate():
+        err("removing the service, OS accounts or install directory needs root")
+        info("re-run as root, or with sudo available")
+        return 1
+    if needs_root and not sudo_is_cached():
+        if not prime_sudo("remove the Argus service, OS accounts and install directory"):
+            err("sudo could not be primed; nothing was removed")
+            return 1
+
+    was_active = _unit_active(SERVICE_NAME)
+    ok_stop, stop_detail = _stop_delete_service(SERVICE_NAME, UNIT_PATH)
+    if not ok_stop:
+        err(stop_detail)
+        info("nothing was removed")
+        return 1
+    if was_active:
+        ok(stop_detail)
+
+    if channel and dbname:
+        dropped, detail = _drop_configured_database(channel, dbname)
+        if not dropped:
+            err(detail)
+            if was_active:
+                step("restarting the service so the deployment is still usable …")
+                wait_rc, _, wait_err = _systemctl_sudo("start", SERVICE_NAME)
+                if wait_rc == 0:
+                    info("service restarted; fix PostgreSQL and run --delete again")
+                else:
+                    warn(f"could not restart the service: {wait_err.strip()[:200]}")
+            return 1
+        ok(detail)
+
+    if channel and dbuser:
+        role_gone, detail = _drop_configured_role(channel, dbuser, dbname)
+        (info if role_gone else warn)(detail)
+
+    removed, detail = _remove_delete_service(SERVICE_NAME, UNIT_PATH)
+    if not removed:
+        err(detail)
+        info("the database is gone, but the service definition and install files remain")
+        return 1
+    ok(detail)
+
+    removed, detail = _remove_delete_service(
+        TUNNEL_SERVICE_NAME, TUNNEL_UNIT_PATH, best_effort=True)
+    if removed:
+        ok(detail)
+    else:
+        warn(detail)
+
+    if staff_accounts:
+        _remove_staff_os_accounts(staff_accounts)
+
+    _remove_local_state()
+    step(f"removing {HERE} …")
+    sys.stdout.flush()
+    removed, detail = _remove_install_directory()
+    if not removed:
+        err(detail)
+        return 1
+    print(_c("  ✓ Argus Management has been removed.", "1;32"))
+    return 0
+
+
 USAGE = """
   Argus Management, deployment front door
 
@@ -2519,6 +2926,10 @@ USAGE = """
                                       database tables, config, service
     python3 management.py --serve     run in the foreground from deploy.json
     python3 management.py --status    show configuration / database / service status
+    python3 management.py --delete    permanently remove the service, configured
+                                      database, credentials and this install directory
+    python3 management.py --delete --yes
+                                      the same, without the interactive confirmation
     python3 management.py --recovery-codes
                                       mint a new set of single-use recovery codes
     python3 management.py --setup     force the wizard even without a TTY
@@ -2531,6 +2942,8 @@ def main():
     if args & {"-h", "--help", "help"}:
         print(USAGE)
         return
+    if "--delete" in args:
+        sys.exit(delete_mode(assume_yes="--yes" in args))
     if "--status" in args:
         show_status()
         return

@@ -13,7 +13,7 @@ import management
 
 def test_every_flag_the_entry_point_knows_is_documented():
     for flag in ("--service", "--upgrade", "--update", "--serve", "--status",
-                 "--recovery-codes", "--setup", "--help"):
+                 "--delete", "--yes", "--recovery-codes", "--setup", "--help"):
         assert flag in management.USAGE, flag
 
 
@@ -33,3 +33,13 @@ def test_upgrade_still_runs_upgrade_mode(monkeypatch):
     with pytest.raises(SystemExit):
         management.main()
     assert called == ["upgrade"]
+
+
+def test_delete_routes_and_honors_yes(monkeypatch):
+    called = []
+    monkeypatch.setattr(management, "delete_mode",
+                        lambda assume_yes=False: called.append(assume_yes) or 0)
+    monkeypatch.setattr(sys, "argv", ["management.py", "--delete", "--yes"])
+    with pytest.raises(SystemExit):
+        management.main()
+    assert called == [True]
