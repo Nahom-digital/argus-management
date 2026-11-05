@@ -50,7 +50,7 @@ wizard over an existing install is safe, every step is idempotent.
 ```bash
 python3 management.py             # setup wizard, then run
 python3 management.py --service   # install + start the systemd service, then exit
-python3 management.py --upgrade   # git pull the latest code, then restart the service
+python3 management.py --upgrade   # pull the latest code (adopting a copied install), then restart
 python3 management.py --update    # re-check and update the system structure: dependencies, tables, config, service
 python3 management.py --serve     # run in the foreground from deploy.json
 python3 management.py --status    # config / dependency / database / service report
@@ -60,6 +60,12 @@ python3 management.py --recovery-codes   # mint new single-use recovery codes
 python3 management.py --setup     # force the wizard even without a TTY
 python3 management.py --help
 ```
+
+`--upgrade` also works when the directory was copied without its `.git`
+history: it converts the copy into a checkout, saves the old source on the
+local `argus-copy-backup` branch, and keeps `deploy.json`, `.env` and the other
+runtime secrets in place. It can also run as root against a checkout owned by
+another user (the usual cause of Git's "dubious ownership" refusal).
 
 `--delete` is irreversible. It stops and removes the `argus-management`
 service, drops the database named in `deploy.json`, removes the dedicated

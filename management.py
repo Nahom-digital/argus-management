@@ -55,6 +55,9 @@ SERVICE_NAME = "argus-management"
 UNIT_PATH = f"/etc/systemd/system/{SERVICE_NAME}.service"
 TUNNEL_SERVICE_NAME = "argus-tunnel"
 TUNNEL_UNIT_PATH = f"/etc/systemd/system/{TUNNEL_SERVICE_NAME}.service"
+UPGRADE_REPO_URL = "https://github.com/Nahom-digital/argus-management.git"
+UPGRADE_REPO_BRANCH = "main"
+UPGRADE_BACKUP_BRANCH = "argus-copy-backup"
 
 # Everything under HERE that belongs to a deployment. The whole directory is
 # removed at the end, but wiping these first guarantees credentials are gone
@@ -2111,11 +2114,119 @@ def announce_service(cfg):
 # 11. --upgrade: pull the latest code from GitHub and restart
 # --------------------------------------------------------------------------- #
 def git(*args, timeout=600):
-    return run(["git", "-C", HERE] + list(args), timeout=timeout)
+    # The panel is often run as root from a checkout the normal user cloned.
+    # Git refuses those unless the directory is marked safe ("dubious
+    # ownership"), so trust just this install directory for our own commands.
+    # We are already executing this file from HERE, so this adds no privilege.
+    safe_dir = os.path.realpath(HERE)
+    return run(["git", "-c", f"safe.directory={safe_dir}", "-C", HERE] + list(args),
+               timeout=timeout)
 
 def is_git_checkout():
-    rc, out, _ = git("rev-parse", "--is-inside-work-tree", timeout=60)
-    return rc == 0 and out.strip() == "true"
+    # Require HERE itself to be the repository root. A copy inside some other
+    # git project (a dotfiles repo, for example) must not make --upgrade pull
+    # and restart the parent project instead of this install.
+    rc, out, _ = git("rev-parse", "--show-toplevel", timeout=60)
+    return (rc == 0
+            and bool(out.strip())
+            and os.path.realpath(out.strip()) == os.path.realpath(HERE))
+
+def _has_git_metadata():
+    return os.path.exists(os.path.join(HERE, ".git"))
+
+def _keep_deployment_state_out_of_git():
+    """Never stage or reset deployment secrets during a copied-install adoption.
+
+    Modern versions ignore these in .gitignore, but an old copy may not. The
+    repository-local exclude file makes the rule apply regardless.
+    """
+    exclude = os.path.join(HERE, ".git", "info", "exclude")
+    try:
+        os.makedirs(os.path.dirname(exclude), exist_ok=True)
+        with open(exclude, "a") as f:
+            for name in DELETE_LOCAL_STATE:
+                f.write(f"/{name}\n")
+    except OSError:
+        pass
+
+def _snapshot_copied_install():
+    """Save the current source tree on a local branch before replacing it."""
+    rc, _, _ = git("add", "-A", timeout=300)
+    if rc != 0:
+        return False
+    rc, tree, _ = git("write-tree", timeout=60)
+    if rc != 0 or not tree.strip():
+        return False
+    rc, commit, _ = git(
+        "-c", "user.name=Argus Upgrade",
+        "-c", "user.email=argus-upgrade@localhost",
+        "commit-tree", tree.strip(),
+        "-m", "Snapshot of the copied install before conversion to git",
+        timeout=120,
+    )
+    if rc != 0 or not commit.strip():
+        return False
+    rc, _, _ = git("branch", "-f", UPGRADE_BACKUP_BRANCH, commit.strip(), timeout=60)
+    return rc == 0
+
+def adopt_git_checkout():
+    """Turn a copied install into a git checkout without losing deployment state.
+
+    A copied install has the source files but no .git directory. Initialise a
+    repository here, save the old source on a local backup branch, fetch the
+    upstream branch, then reset the working tree to it. deploy.json, .env and
+    the other ignored runtime secrets are left untouched.
+    """
+    step("this directory has no git history; converting the copy into a checkout")
+    rc, _, stderr = run(["git", "init", "-q", HERE], timeout=120)
+    if rc != 0:
+        err(f"git init failed: {stderr.strip()[:200]}")
+        return False
+    rc, _, stderr = git("symbolic-ref", "HEAD", f"refs/heads/{UPGRADE_REPO_BRANCH}",
+                        timeout=60)
+    if rc != 0:
+        err(f"could not set the git branch: {stderr.strip()[:200]}")
+        return False
+    _keep_deployment_state_out_of_git()
+
+    rc, _, stderr = git("remote", "add", "origin", UPGRADE_REPO_URL, timeout=60)
+    if rc != 0:
+        # A previous adoption may have stopped after adding the remote.
+        rc, _, stderr = git("remote", "set-url", "origin", UPGRADE_REPO_URL, timeout=60)
+    if rc != 0:
+        err(f"could not configure the git remote: {stderr.strip()[:200]}")
+        return False
+
+    step(f"fetching {UPGRADE_REPO_BRANCH} from GitHub …")
+    rc, _, stderr = git("fetch", "--prune", "origin", UPGRADE_REPO_BRANCH)
+    if rc != 0:
+        err(f"git fetch failed: {stderr.strip()[:200]}")
+        info("check this server's network connection and that GitHub is reachable")
+        return False
+
+    if not _snapshot_copied_install():
+        err("could not save a backup of the copied source files")
+        info("nothing was replaced; re-clone the project instead:")
+        info(f"  git clone {UPGRADE_REPO_URL}")
+        return False
+
+    step("replacing the copied source with the latest checkout (deployment files are kept)")
+    rc, _, stderr = git("reset", "--hard", f"origin/{UPGRADE_REPO_BRANCH}", timeout=180)
+    if rc != 0:
+        err(f"git reset failed: {stderr.strip()[:200]}")
+        info(f"your old source is still available on the local branch "
+             f"'{UPGRADE_BACKUP_BRANCH}'")
+        return False
+    rc, _, stderr = git("branch", "--set-upstream-to",
+                        f"origin/{UPGRADE_REPO_BRANCH}", UPGRADE_REPO_BRANCH,
+                        timeout=60)
+    if rc != 0:
+        warn(f"could not set the upstream branch: {stderr.strip()[:200]}")
+        info("the code is updated, but the next --upgrade may need a branch argument")
+
+    ok("converted the copied install to a git checkout")
+    info(f"the previous files are saved on the local branch '{UPGRADE_BACKUP_BRANCH}'")
+    return True
 
 def restart_service(cfg):
     """Restart the systemd unit and confirm it comes back listening."""
@@ -2170,10 +2281,22 @@ def upgrade_mode():
         err("git is not installed, cannot pull updates")
         return 1
     if not is_git_checkout():
-        err(f"{HERE} is not a git checkout, so there is nothing to pull")
-        info("this install was copied rather than cloned; re-clone it with:")
-        info("  git clone https://github.com/Nahom-digital/argus-management.git")
-        return 1
+        if _has_git_metadata():
+            rc, out, stderr = git("rev-parse", "--is-inside-work-tree", timeout=60)
+            err(f"git cannot read the checkout at {HERE}")
+            detail = (stderr or out).strip().splitlines()
+            if detail:
+                info(detail[-1][:300])
+            info("the .git directory is present, but git refused to use it")
+            info("if this is an ownership error, mark the directory safe and retry:")
+            info(f"  git config --global --add safe.directory "
+                 f"{shlex.quote(os.path.realpath(HERE))}")
+            return 1
+        if not adopt_git_checkout():
+            err("could not convert this copied install into a git checkout")
+            info("re-clone the project and keep your deploy.json/.env files:")
+            info(f"  git clone {UPGRADE_REPO_URL}")
+            return 1
 
     rc, branch, _ = git("rev-parse", "--abbrev-ref", "HEAD", timeout=60)
     branch = branch.strip() or "main"
@@ -2925,7 +3048,8 @@ USAGE = """
 
     python3 management.py             run the setup wizard, then start the panel
     python3 management.py --service   install + start the systemd service, then exit
-    python3 management.py --upgrade   git pull the latest code, then restart the service
+    python3 management.py --upgrade   pull the latest code (adopting a copied install),
+                                      then restart the service
     python3 management.py --update    re-check and update the system structure: dependencies,
                                       database tables, config, service
     python3 management.py --serve     run in the foreground from deploy.json
