@@ -28,6 +28,7 @@ import uuid
 
 import DB
 import vault
+import argus_version
 
 # Scopes a linked panel may be asked for. Terminal is never part of a staff
 # account's remote access: only the admin holds it.
@@ -56,6 +57,7 @@ SCHEMA = (
         key_id          VARCHAR(64) NOT NULL,
         server_uid      VARCHAR(64),
         remote_hostname TEXT NOT NULL DEFAULT '',
+        remote_version  VARCHAR(64) NOT NULL DEFAULT '',
         status          VARCHAR(20) NOT NULL DEFAULT 'pending',
         approved        BOOLEAN NOT NULL DEFAULT FALSE,
         last_error      TEXT NOT NULL DEFAULT '',
@@ -67,10 +69,11 @@ SCHEMA = (
     "CREATE INDEX IF NOT EXISTS idx_merge_server_pos ON merge_server(position)",
     "CREATE INDEX IF NOT EXISTS idx_merge_server_uid ON merge_server(server_uid)",
     """CREATE TABLE IF NOT EXISTS merge_request (
-        server_uid   VARCHAR(64) PRIMARY KEY,
-        hostname     TEXT NOT NULL DEFAULT '',
-        host         TEXT NOT NULL DEFAULT '',
-        status       VARCHAR(16) NOT NULL DEFAULT 'pending',
+        server_uid     VARCHAR(64) PRIMARY KEY,
+        hostname       TEXT NOT NULL DEFAULT '',
+        host           TEXT NOT NULL DEFAULT '',
+        remote_version VARCHAR(64) NOT NULL DEFAULT '',
+        status         VARCHAR(16) NOT NULL DEFAULT 'pending',
         requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
         decided_at   TIMESTAMPTZ,
@@ -89,6 +92,13 @@ SCHEMA = (
     "CREATE INDEX IF NOT EXISTS idx_merge_access_user ON merge_user_access(username, position)",
 )
 
+SCHEMA_UPGRADES = (
+    "ALTER TABLE IF EXISTS merge_server ADD COLUMN IF NOT EXISTS "
+    "remote_version VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE IF EXISTS merge_request ADD COLUMN IF NOT EXISTS "
+    "remote_version VARCHAR(64) NOT NULL DEFAULT ''",
+)
+
 _schema_ready = False
 
 
@@ -104,12 +114,35 @@ def ensure_schema(conn=None, force=False):
         cur = conn.cursor()
         for statement in SCHEMA:
             cur.execute(statement)
+        for statement in SCHEMA_UPGRADES:
+            cur.execute(statement)
         conn.commit()
         cur.close()
         _schema_ready = True
     finally:
         if own:
             DB.release_connection(conn)
+
+
+def panel_version():
+    return argus_version.version()
+
+
+def version_state(remote_version):
+    """Compare a panel's reported version with this installation's version.
+
+    A missing version is not treated as a mismatch because a panel running an
+    older release cannot report one. It is surfaced separately so the interface
+    can still tell the admin that a comparison was impossible.
+    """
+    local = panel_version()
+    remote = str(remote_version or "").strip()
+    return {
+        "local_version": local,
+        "remote_version": remote,
+        "version_mismatch": bool(remote) and remote != local,
+        "version_unknown": not bool(remote),
+    }
 
 
 def _local_label():
@@ -275,7 +308,7 @@ def request_status(server_uid):
         DB.release_connection(conn)
 
 
-def record_request(server_uid, hostname, host, note=""):
+def record_request(server_uid, hostname, host, note="", remote_version=""):
     """Record an incoming handshake. An already-allowed panel stays allowed;
     a denied one stays denied until the local admin changes it."""
     conn = DB.get_connection()
@@ -283,13 +316,16 @@ def record_request(server_uid, hostname, host, note=""):
         ensure_schema(conn)
         cur = conn.cursor()
         cur.execute(
-            """INSERT INTO merge_request (server_uid, hostname, host, note)
-               VALUES (%s, %s, %s, %s)
+            """INSERT INTO merge_request
+                   (server_uid, hostname, host, note, remote_version)
+               VALUES (%s, %s, %s, %s, %s)
                ON CONFLICT (server_uid) DO UPDATE
                  SET hostname=EXCLUDED.hostname,
                      host=EXCLUDED.host,
+                     remote_version=EXCLUDED.remote_version,
                      last_seen=now()""",
-            (server_uid, (hostname or "")[:300], (host or "")[:300], (note or "")[:1000]))
+            (server_uid, (hostname or "")[:300], (host or "")[:300],
+             (note or "")[:1000], (remote_version or "")[:64]))
         conn.commit()
         cur.execute("SELECT status FROM merge_request WHERE server_uid=%s",
                     (server_uid,))
@@ -306,8 +342,8 @@ def list_requests():
         ensure_schema(conn)
         cur = conn.cursor()
         cur.execute(
-            """SELECT server_uid, hostname, host, status, requested_at,
-                      last_seen, decided_at, decided_by, note
+            """SELECT server_uid, hostname, host, remote_version, status,
+                      requested_at, last_seen, decided_at, decided_by, note
                FROM merge_request
                ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,
                         last_seen DESC, requested_at DESC""")
@@ -315,6 +351,7 @@ def list_requests():
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
         cur.close()
         for row in rows:
+            row.update(version_state(row.get("remote_version")))
             for k in ("requested_at", "last_seen", "decided_at"):
                 if row.get(k):
                     row[k] = row[k].isoformat()
@@ -483,8 +520,8 @@ def list_servers(include_pending=True):
         clause = "" if include_pending else "WHERE m.approved = TRUE"
         cur.execute(
             f"""SELECT m.id, m.name, m.host, m.port, m.scheme, m.base_path,
-                       m.key_id, m.server_uid, m.remote_hostname, m.status,
-                       m.approved, m.last_error, m.last_seen, m.position,
+                       m.key_id, m.server_uid, m.remote_hostname, m.remote_version,
+                       m.status, m.approved, m.last_error, m.last_seen, m.position,
                        m.created_by, m.created_at, k.key_cipher
                 FROM merge_server m
                 JOIN merge_serverkey k ON k.key_id = m.key_id
@@ -495,6 +532,7 @@ def list_servers(include_pending=True):
         cur.close()
         for row in rows:
             row.pop("key_cipher", None)
+            row.update(version_state(row.get("remote_version")))
             if row.get("last_seen"):
                 row["last_seen"] = row["last_seen"].isoformat()
             if row.get("created_at"):
@@ -513,8 +551,8 @@ def get_server(server_id, include_key=False):
         cur = conn.cursor()
         cur.execute(
             """SELECT m.id, m.name, m.host, m.port, m.scheme, m.base_path,
-                      m.key_id, m.server_uid, m.remote_hostname, m.status,
-                      m.approved, m.last_error, m.last_seen, m.position,
+                      m.key_id, m.server_uid, m.remote_hostname, m.remote_version,
+                      m.status, m.approved, m.last_error, m.last_seen, m.position,
                       m.created_by, m.created_at, k.key_cipher
                FROM merge_server m
                JOIN merge_serverkey k ON k.key_id = m.key_id
@@ -528,6 +566,7 @@ def get_server(server_id, include_key=False):
         if include_key:
             out["key"] = vault.decrypt(out["key_cipher"])
         out.pop("key_cipher", None)
+        out.update(version_state(out.get("remote_version")))
         cur.close()
         return out
     finally:
@@ -536,7 +575,8 @@ def get_server(server_id, include_key=False):
 
 def update_server(server_id, **fields):
     allowed = {"name", "host", "port", "scheme", "base_path", "server_uid",
-               "remote_hostname", "status", "approved", "last_error"}
+               "remote_hostname", "remote_version", "status", "approved",
+               "last_error"}
     parts, params = [], []
     for k, v in fields.items():
         if k in allowed:
@@ -803,6 +843,7 @@ def make_server_token(server, subject="server", role="admin", scopes=None,
         "purpose": purpose,
         "host": ident.get("label") or _local_label(),
         "hostname": _local_label(),
+        "version": panel_version(),
     }
     return sign_token(_key_for_server(server), claims, ttl=ttl)
 
@@ -871,10 +912,12 @@ def handshake(server_id):
         return {"ok": False, "status": "down", "error": msg}
     status = data.get("status") or "pending"
     approved = status == "allowed"
+    remote_version = str(data.get("version") or "")[:64]
     update_server(
         server_id,
         server_uid=data.get("server_uid") or server.get("server_uid") or "",
         remote_hostname=(data.get("hostname") or "")[:300],
+        remote_version=remote_version,
         status="connected" if approved else status,
         approved=approved,
         last_error="")
@@ -888,9 +931,13 @@ def handshake(server_id):
         cur.close()
     finally:
         DB.release_connection(conn)
-    return {"ok": True, "status": "connected" if approved else status,
-            "server_uid": data.get("server_uid"),
-            "hostname": data.get("hostname") or ""}
+    result = {"ok": True, "status": "connected" if approved else status,
+              "server_uid": data.get("server_uid"),
+              "hostname": data.get("hostname") or "",
+              "version": panel_version(),
+              "remote_version": remote_version}
+    result.update(version_state(remote_version))
+    return result
 
 
 def refresh_status(server_id, timeout=5):
@@ -913,14 +960,20 @@ def refresh_status(server_id, timeout=5):
         return {"ok": False, "status": "down", "error": msg}
     status = data.get("status") or "pending"
     approved = status == "allowed"
+    remote_version = str(data.get("version") or "")[:64]
     fields = {"status": "connected" if approved else status,
-              "approved": approved, "last_error": ""}
+              "approved": approved, "last_error": "",
+              "remote_version": remote_version}
     if data.get("hostname"):
         fields["remote_hostname"] = str(data["hostname"])[:300]
     update_server(server_id, **fields)
-    return {"ok": True, "status": "connected" if approved else status,
-            "server_uid": server.get("server_uid"),
-            "hostname": data.get("hostname") or ""}
+    result = {"ok": True, "status": "connected" if approved else status,
+              "server_uid": server.get("server_uid"),
+              "hostname": data.get("hostname") or "",
+              "version": panel_version(),
+              "remote_version": remote_version}
+    result.update(version_state(remote_version))
+    return result
 
 
 def refresh_all_status(timeout=4):

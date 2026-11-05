@@ -353,3 +353,38 @@ def test_the_network_endpoint_forwards_the_established_filter(client, monkeypatc
     r = client.get("/api/system/connections?established=1")
     assert r.status_code == 200, r.status_code
     assert seen["established_only"] is True
+
+
+def test_remote_telemetry_paints_every_metric_after_cpu(client):
+    """The remote CPU block used to call renderCoreBars() with the local
+    function's old signature. The TypeError escaped before memory, network,
+    disk and load were painted, which made a connected server look empty.
+    The remote chart needs its own container id and the call has to match."""
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    assert "function renderCoreBars(cores, elementId)" in js
+    assert "renderCoreBars(d.cpu_per_core,'r-core-bars')" in js
+    assert "renderCoreBars('r-core-bars'" not in js
+    start = js.index("async function pollRemoteStats()")
+    end = js.index("function fanText(", start)
+    block = js[start:end]
+    for marker in ("d.ram.percent", "d.net.rate_in", "d.disk.percent",
+                   "d.load['1']"):
+        assert marker in block, marker
+
+
+def test_a_linked_panel_with_a_different_version_is_warned_about(client):
+    """Versions are compared but never used to block a link. The warning names
+    both sides and is shown on the Server page and in Server Configuration."""
+    page = _page_as(client, "admin")
+    assert 'id="remote-version-warn"' in page
+    assert 'id="merge-local-version"' in page
+
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    assert "function mergeVersionWarningText(s)" in js
+    assert "The client is ${remote}; yours is ${local}. Please match them." in js
+    assert "version_mismatch" in js
+
+    css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
+    for cls in (".merge-version-warn", ".remote-version-warn",
+                ".save-feedback.warn"):
+        assert cls in css, cls

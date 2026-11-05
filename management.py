@@ -1499,6 +1499,7 @@ SCHEMA = (
                key_id          VARCHAR(64) NOT NULL,
                server_uid      VARCHAR(64),
                remote_hostname TEXT NOT NULL DEFAULT '',
+               remote_version  VARCHAR(64) NOT NULL DEFAULT '',
                status          VARCHAR(20) NOT NULL DEFAULT 'pending',
                approved        BOOLEAN NOT NULL DEFAULT FALSE,
                last_error      TEXT NOT NULL DEFAULT '',
@@ -1510,10 +1511,11 @@ SCHEMA = (
         "CREATE INDEX IF NOT EXISTS idx_merge_server_pos ON merge_server(position)",
         "CREATE INDEX IF NOT EXISTS idx_merge_server_uid ON merge_server(server_uid)",
         """CREATE TABLE IF NOT EXISTS merge_request (
-               server_uid   VARCHAR(64) PRIMARY KEY,
-               hostname     TEXT NOT NULL DEFAULT '',
-               host         TEXT NOT NULL DEFAULT '',
-               status       VARCHAR(16) NOT NULL DEFAULT 'pending',
+               server_uid     VARCHAR(64) PRIMARY KEY,
+               hostname       TEXT NOT NULL DEFAULT '',
+               host           TEXT NOT NULL DEFAULT '',
+               remote_version VARCHAR(64) NOT NULL DEFAULT '',
+               status         VARCHAR(16) NOT NULL DEFAULT 'pending',
                requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
                decided_at   TIMESTAMPTZ,
@@ -1544,6 +1546,8 @@ SCHEMA_UPGRADES = (
     "ALTER TABLE IF EXISTS http_access_log ADD COLUMN IF NOT EXISTS response_body TEXT",
     "ALTER TABLE IF EXISTS http_access_log ADD COLUMN IF NOT EXISTS content_type TEXT",
     "ALTER TABLE IF EXISTS http_access_log ADD COLUMN IF NOT EXISTS response_size INTEGER",
+    "ALTER TABLE IF EXISTS merge_server ADD COLUMN IF NOT EXISTS remote_version VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE IF EXISTS merge_request ADD COLUMN IF NOT EXISTS remote_version VARCHAR(64) NOT NULL DEFAULT ''",
 )
 
 SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",

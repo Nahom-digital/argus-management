@@ -59,8 +59,13 @@ def test_a_signed_token_verifies_and_a_changed_one_does_not():
         key, {"iss": "panel-a", "aud": "panel-b", "purpose": "api"}, ttl=60)
     data = merge_servers.verify_token(token, key)
     assert data and data["iss"] == "panel-a" and data["purpose"] == "api"
-    assert merge_servers.verify_token(token[:-1] + ("A" if token[-1] != "A" else "B"),
-                                      key) is None
+    # Change a character at the start of the signature, where every bit counts.
+    # Flipping the final base64 character can decode to the same bytes because
+    # its low bits are padding, which made this assertion intermittent.
+    head, payload, sig = token.split(".", 2)
+    changed = "A" if sig[0] != "A" else "B"
+    assert merge_servers.verify_token(
+        head + "." + payload + "." + changed + sig[1:], key) is None
     assert merge_servers.verify_token(token, key + "-wrong") is None
 
 
@@ -81,6 +86,77 @@ def test_make_server_token_still_works_after_get_server_strips_the_key(db):
         token = merge_servers.make_server_token(row, subject="admin")
         data = merge_servers.verify_token(token, key)
         assert data and data["sub"] == "admin"
+        assert data["version"] == merge_servers.panel_version()
+    finally:
+        merge_servers.delete_server(server_id)
+
+
+def test_version_state_calls_out_a_different_panel():
+    """A version difference must not look like a broken link, but it has to be
+    visible with both sides named so the admin can match them."""
+    local = merge_servers.panel_version()
+    other = merge_servers.version_state("0.0.1-old")
+    assert other["local_version"] == local
+    assert other["remote_version"] == "0.0.1-old"
+    assert other["version_mismatch"] is True
+    assert other["version_unknown"] is False
+
+    same = merge_servers.version_state(local)
+    assert same["version_mismatch"] is False
+    assert same["version_unknown"] is False
+
+    unknown = merge_servers.version_state("")
+    assert unknown["version_mismatch"] is False
+    assert unknown["version_unknown"] is True
+
+
+def test_a_version_difference_does_not_hide_a_connected_server(db):
+    """Version mismatch is a warning, not a permission decision. The server
+    still has to appear in the list with its status intact."""
+    key = "version-key-" + uuid.uuid4().hex
+    server_id = merge_servers.create_server(
+        "pytest versioned", "127.0.0.1", 80, "", key)
+    try:
+        merge_servers.update_server(
+            server_id, approved=True, status="connected",
+            remote_version="0.0.1-old")
+        rows = [s for s in merge_servers.list_servers() if s["id"] == server_id]
+        assert rows and rows[0]["status"] == "connected"
+        assert rows[0]["version_mismatch"] is True
+        assert rows[0]["remote_version"] == "0.0.1-old"
+    finally:
+        merge_servers.delete_server(server_id)
+
+
+def test_a_handshake_records_the_remote_version_and_still_connects(db, monkeypatch):
+    """The response carries the other panel's version. It is stored for the
+    Config page and the Server page, and an approval still wins over a
+    mismatch: the link is connected, with a warning attached."""
+    key = "handshake-version-key-" + uuid.uuid4().hex
+    server_id = merge_servers.create_server(
+        "pytest handshake version", "127.0.0.1", 80, "", key)
+    seen = {}
+
+    def fake_call(server, path, token, method="GET", body=None, timeout=10):
+        seen["path"] = path
+        seen["token"] = token
+        return 200, {"status": "allowed", "server_uid": "remote-uid",
+                     "hostname": "remote-host", "version": "0.0.1-old"}, ""
+
+    monkeypatch.setattr(merge_servers, "http_call", fake_call)
+    try:
+        result = merge_servers.handshake(server_id)
+        assert seen["path"] == "/api/merge/handshake"
+        claims = merge_servers.verify_token(seen["token"], key)
+        assert claims["version"] == merge_servers.panel_version()
+        assert result["ok"] is True
+        assert result["status"] == "connected"
+        assert result["remote_version"] == "0.0.1-old"
+        assert result["version_mismatch"] is True
+        row = merge_servers.get_server(server_id)
+        assert row["status"] == "connected"
+        assert row["approved"] is True
+        assert row["remote_version"] == "0.0.1-old"
     finally:
         merge_servers.delete_server(server_id)
 

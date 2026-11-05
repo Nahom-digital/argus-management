@@ -918,6 +918,16 @@
     background:color-mix(in srgb, var(--danger) 7%, var(--white)) !important; }
   .merge-allow { padding:6px 12px; font-size:11px; }
   .merge-err { margin-top:5px; color:var(--danger); font-size:10.5px; line-height:1.4; overflow-wrap:anywhere; }
+  .merge-version-warn { margin-top:7px; padding:8px 10px; border:1px solid color-mix(in srgb, var(--warn) 34%, var(--gray-200));
+    border-radius:7px; background:color-mix(in srgb, var(--warn) 9%, var(--white)); color:var(--warn);
+    font-size:11px; line-height:1.45; overflow-wrap:anywhere; }
+  .merge-version-tag { color:var(--gray-500) !important; font-family:var(--mono); font-size:10px; font-weight:400; }
+  .remote-version-warn { margin-bottom:16px; padding:12px 14px; border:1px solid color-mix(in srgb, var(--warn) 34%, var(--gray-200));
+    border-radius:9px; background:color-mix(in srgb, var(--warn) 9%, var(--white)); color:var(--warn);
+    font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
+  .remote-version-warn[hidden] { display:none; }
+  .remote-version { color:var(--gray-500); font-family:var(--mono); }
+  .save-feedback.warn { color:var(--warn); }
   @media (max-width:900px) { .merge-form-grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
   @media (max-width:560px) {
     .merge-form-grid { grid-template-columns:1fr; }

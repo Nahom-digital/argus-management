@@ -946,7 +946,8 @@ def _config_sub_server():
         <div>
           <div class="field-label">This server</div>
           <div class="merge-id-line"><span id="merge-local-name">Loading&hellip;</span>
-            <code id="merge-local-id"></code></div>
+            <code id="merge-local-id"></code>
+            <code class="merge-version-tag" id="merge-local-version"></code></div>
         </div>
         <button class="db-action-btn" onclick="copyMergeKey()"><svg class="ic"><use href="#ic-copy"/></svg>Copy private key</button>
         <button class="db-action-btn merge-danger" onclick="rotateMergeKey()" title="Every linked panel must be given the new key">Rotate key</button>
@@ -1519,6 +1520,7 @@ _PANES_TEMPLATE = """
             <svg class="ic"><use href="#ic-refresh-cw"/></svg>Refresh</button>
         </div>
       </div>
+      <div class="remote-version-warn" id="remote-version-warn" hidden></div>
       <div class="remote-down" id="remote-down" hidden></div>
       <div id="remote-live">
         <div class="srv-grid" id="remote-metric-grid">
@@ -3046,6 +3048,7 @@ def _merge_servers_view():
     ident = merge_servers.ensure_local_identity()
     return {
         "identity": _merge_public_identity(ident),
+        "version": merge_servers.panel_version(),
         "servers": merge_servers.list_servers(),
         "requests": merge_servers.list_requests(),
     }
@@ -3265,15 +3268,19 @@ async def api_merge_handshake(request: Request):
     # Prefer the address this request actually came from over a self-reported
     # string: the request row is there to tell the admin where to look.
     host = _client_ip(request) or body.get("host") or data.get("host") or ""
+    # The token is signed, so its version claim cannot be invented by the
+    # request body or a middle hop.
+    remote_version = str(data.get("version") or "")[:64]
     status = await DB.run(merge_servers.record_request, data.get("iss"),
-                          hostname, host)
+                          hostname, host, "", remote_version)
     write_log("INFO", "SECURITY", "Linked server handshake",
               actor=f"merge:{str(data.get('iss'))[:12]}",
               ip=_client_ip(request), target=(hostname or host)[:200],
-              detail=f"status={status}")
+              detail=f"status={status} version={remote_version or 'unknown'}")
     return {"status": "allowed" if status == "allowed" else status,
             "server_uid": ident.get("server_uid"),
-            "hostname": ident.get("label")}
+            "hostname": ident.get("label"),
+            "version": merge_servers.panel_version()}
 
 
 @app.get("/api/merge/status")
@@ -3285,7 +3292,8 @@ async def api_merge_status(request: Request):
     ident = await _merge_local_identity()
     return {"status": "allowed" if status == "allowed" else status,
             "server_uid": ident.get("server_uid"),
-            "hostname": ident.get("label")}
+            "hostname": ident.get("label"),
+            "version": merge_servers.panel_version()}
 
 
 @app.get("/api/merge/static")
@@ -3514,7 +3522,9 @@ async def api_merge_visible_servers(request: Request):
     perms = await _current_permissions(request)
     role = perms.get("role")
     servers = await DB.run(merge_servers.servers_for_user, perms.get("username", ""), role)
-    return {"is_admin": role == "admin", "local": {
+    return {"is_admin": role == "admin",
+            "version": merge_servers.panel_version(),
+            "local": {
                 "name": await DB.run(merge_servers.local_label),
                 "server_uid": await DB.run(_merge_local_uid)},
             "servers": servers}

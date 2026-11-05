@@ -150,7 +150,10 @@ unlock.
   admin-only; encrypted remote keys are never sent back to the browser (the
   local identity key appears only on the admin-only Server Configuration card).
   Either side can replace a stored key without losing the staff rules attached
-  to that server.
+  to that server. Panels exchange their running version during the handshake
+  and status checks. A version difference does not block the link, but the
+  requesting panel shows a warning with both versions and asks the admin to
+  match them. A panel too old to report a version is called out as unknown.
 - **Service.** The systemd service list and controls that used to be their
   own tab.
 - **Database.** A row-level viewer and editor over this panel's own tables
@@ -239,6 +242,7 @@ stronger check than a code sitting in a file.
 | `ssh_vault.py`  | SSH keypair generation and encrypted storage for the Server Configuration card |
 | `panel_users.py`| staff accounts and their permission grants |
 | `merge_servers.py` | panel linking, server keys, signed server-to-server calls, linked-user scopes |
+| `argus_version.py` | release version plus the git revision, exchanged between linked panels |
 | `nginx_proxy.py`| renders, validates and manages nginx server blocks for the Proxy card |
 | `firewall.py`   | port rules, blocked addresses, and the automatic block after repeated SSH failures |
 | `static_mgmt/`  | CSS design system + panel JS + icon sprite |

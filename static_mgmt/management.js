@@ -378,7 +378,8 @@ function remoteScope(id, scope){
 }
 function renderRemoteMeta(){
   const s=remoteServer(_srvActive), el=$('remote-meta'); if(!s||!el) return;
-  el.innerHTML=`${esc(mergeTargetText(s))} · ${mergeStatusChip(s.status)}`;
+  const version=s.remote_version?` · <span class="remote-version">v${esc(s.remote_version)}</span>`:'';
+  el.innerHTML=`${esc(mergeTargetText(s))} · ${mergeStatusChip(s.status)}${version}`;
 }
 
 async function loadServerList(){
@@ -436,7 +437,7 @@ function renderServerRail(d){
       <button class="srv-chip" onclick="selectServer('${escAttr(s.id)}')">
         <span class="srv-chip-dot ${down?'down':'on'}"></span>
         <span class="srv-chip-copy"><span class="srv-chip-name">${esc(s.name||s.host)}</span>
-          <span class="srv-chip-sub">${down?'Down':esc(s.remote_hostname||s.host)}</span></span>
+          <span class="srv-chip-sub">${down?'Down':esc(s.remote_hostname||s.host)+(s.version_mismatch?' · version differs':'')}</span></span>
       </button>${actions}</div>`);
   });
   if(!_srvList.length){
@@ -453,6 +454,12 @@ function syncRemoteChrome(){
   const term=$('remote-terminal-btn');
   if(term) term.hidden=!((window.MGMT_PERMS||{}).role==='admin');
   renderRemoteMeta();
+  const versionWarn=$('remote-version-warn');
+  if(versionWarn){
+    const warning=mergeVersionWarningText(s);
+    versionWarn.hidden=!warning;
+    versionWarn.textContent=warning;
+  }
   document.querySelectorAll('#remote-metric-grid [data-remotescope]').forEach(card=>{
     card.hidden=!remoteScope(_srvActive,card.dataset.remotescope);
     card.classList.toggle('metric-clickable',remoteScope(_srvActive,card.dataset.remotescope));
@@ -536,6 +543,7 @@ function showRemoteDown(message){
   remoteStaticLoaded=false;
   const s=remoteServer(_srvActive);
   if(s&&String(s.status||'').toLowerCase()!=='down'){ s.status='down'; s.last_error=message||s.last_error; renderServerRail(); renderRemoteMeta(); }
+  syncRemoteChrome();
 }
 function showRemoteUp(){
   const down=$('remote-down'), live=$('remote-live');
@@ -545,6 +553,7 @@ function showRemoteUp(){
   if(s&&String(s.status||'').toLowerCase()!=='connected'){
     s.status='connected'; s.last_error=''; renderServerRail(); renderRemoteMeta();
   }
+  syncRemoteChrome();
 }
 async function pollRemoteStats(){
   if(_srvActive==='local'||remoteStatsBusyFor===_srvActive) return;
@@ -561,7 +570,7 @@ async function pollRemoteStats(){
       pushHist(remoteCpuHist,d.cpu_percent);
       if($('r-cpu-now')) $('r-cpu-now').textContent=d.cpu_percent.toFixed(0)+'%';
       if($('r-cpu-foot')) $('r-cpu-foot').textContent=`${d.processes||0} procs · uptime ${fmtUptime(d.uptime_seconds)}`;
-      renderCoreBars('r-core-bars',d.cpu_per_core);
+      renderCoreBars(d.cpu_per_core,'r-core-bars');
       drawLineChart('r-chart-cpu',[remoteCpuHist],100,['--black']);
     }
     if(d.ram){
@@ -784,8 +793,9 @@ function pushHist(a,v){
    threw the transition away (fresh nodes never transition) and re-laid out the
    row on every tick. scaleY on a bottom-anchored fill stays on the compositor,
    so a 16-core box animates without a single reflow. */
-function renderCoreBars(cores){
-  if(!cores) return; const el=$('core-bars'); if(!el) return;
+function renderCoreBars(cores, elementId){
+  if(!Array.isArray(cores)) return;
+  const el=$(elementId||'core-bars'); if(!el) return;
   if(el.childElementCount!==cores.length){
     el.innerHTML=cores.map(()=>'<div class="core-bar"><span></span></div>').join('');
   }
@@ -1494,6 +1504,18 @@ function mergeStatusChip(status){
               down:'Down',allowed:'Connected'}[key]||key;
   return `<span class="merge-status ${escAttr(key)}"><span class="status-dot"></span>${esc(text)}</span>`;
 }
+function mergeVersionWarningText(s){
+  if(!s) return '';
+  const status=String(s.status||'').toLowerCase();
+  if(status!=='connected'&&status!=='allowed') return '';
+  const local=String(s.local_version||'');
+  const remote=String(s.remote_version||'');
+  if(!remote){
+    return 'The device is connected, but it did not report its Argus Management version. Update that panel and this one so the versions can be compared.';
+  }
+  if(remote===local) return '';
+  return `The device is connected, but the Argus Management versions do not match. The client is ${remote}; yours is ${local}. Please match them.`;
+}
 function mergeTargetText(s){
   const scheme=String(s.scheme||'http').toLowerCase();
   const port=Number(s.port)||(scheme==='https'?443:80);
@@ -1514,6 +1536,7 @@ async function loadLinkedServers(){
       if(uid) uid.textContent=d.identity.server_uid||'';
       if(key) key.value=d.identity.key||'';
     }
+    if(d.version&&$('merge-local-version')) $('merge-local-version').textContent='v'+d.version;
     _linkedServers=d.servers||[];
     renderLinkedServers();
   }catch(e){ el.innerHTML='<div class="empty-state">Could not read linked servers.</div>'; }
@@ -1526,6 +1549,8 @@ function renderLinkedServers(){
   }
   el.innerHTML=_linkedServers.map((s,i)=>{
     const err=s.last_error?`<div class="merge-err">${esc(s.last_error)}</div>`:'';
+    const warning=mergeVersionWarningText(s);
+    const versionWarn=warning?`<div class="merge-version-warn">${esc(warning)}</div>`:'';
     const hostLine=s.approved
       ? `This host is managing it using <b>${esc(s.remote_hostname||s.host)}</b>.`
       : (s.server_uid
@@ -1535,7 +1560,7 @@ function renderLinkedServers(){
       <div class="merge-row-main">
         <div class="merge-row-top"><b>${esc(s.name||s.host)}</b>${mergeStatusChip(s.status)}</div>
         <div class="merge-row-sub">${esc(mergeTargetText(s))}</div>
-        <div class="merge-row-sub">${hostLine}</div>${err}
+        <div class="merge-row-sub">${hostLine}</div>${versionWarn}${err}
       </div>
       <div class="merge-row-actions">
         <button class="db-action-btn merge-arrow" title="Move up" onclick="moveLinkedServer('${escAttr(s.id)}',-1)"${i===0?' disabled':''}>&uarr;</button>
@@ -1557,6 +1582,8 @@ async function loadMergeRequests(){
     el.innerHTML=rows.map(r=>{
       const pending=r.status==='pending';
       const allowed=r.status==='allowed';
+      const warning=mergeVersionWarningText(r);
+      const versionWarn=warning?`<div class="merge-version-warn">${esc(warning)}</div>`:'';
       const action=pending
         ? `<button class="save-btn merge-allow" onclick="decideMergeRequest('${escAttr(r.server_uid)}','allow')">Allow</button>
            <button class="db-action-btn merge-danger" onclick="decideMergeRequest('${escAttr(r.server_uid)}','deny')">Deny</button>`
@@ -1567,7 +1594,7 @@ async function loadMergeRequests(){
         <div class="merge-row-main">
           <div class="merge-row-top"><b>${esc(r.hostname||r.host||r.server_uid)}</b>${mergeStatusChip(allowed?'connected':r.status)}</div>
           <div class="merge-row-sub">${esc(r.host||r.server_uid)}</div>
-          <div class="merge-row-sub">${allowed?'Allowed: '+esc(r.hostname||r.host||'that panel')+' may manage this server.':'Asked '+esc(String(r.requested_at||'').slice(0,19))}</div>
+          <div class="merge-row-sub">${allowed?'Allowed: '+esc(r.hostname||r.host||'that panel')+' may manage this server.':'Asked '+esc(String(r.requested_at||'').slice(0,19))}</div>${versionWarn}
         </div>
         <div class="merge-row-actions">${action}</div>
       </div>`;
@@ -1590,7 +1617,11 @@ async function addLinkedServer(){
     if(!r.ok){ fb.textContent=d.error||'Could not add that server.'; fb.classList.add('err'); }
     else{
       const hs=d.handshake||{};
-      if(hs.ok&&hs.status==='connected'){
+      const versionWarning=mergeVersionWarningText(hs);
+      if(hs.ok&&hs.status==='connected'&&versionWarning){
+        fb.textContent='Server linked. '+versionWarning;
+        fb.classList.add('warn');
+      }else if(hs.ok&&hs.status==='connected'){
         fb.textContent='Server linked. It appears in the Server page.';
         fb.classList.add('ok');
       }else if(hs.ok&&hs.status==='denied'){
@@ -1627,11 +1658,13 @@ async function retryLinkedServer(id){
     const d=await r.json();
     if(!r.ok){ appToast(d.error||'Retry failed','err'); return; }
     const st=(d.result||{}).status;
+    const versionWarning=mergeVersionWarningText(d.result||{});
     const msg=st==='connected'?'Server is connected'
       :st==='pending'?'Still waiting for approval'
       :st==='denied'?'That panel has not allowed this server'
       :(d.result&&d.result.error)||'Retry failed';
-    appToast(msg,st==='connected'?'ok':st==='pending'||st==='denied'?'info':'err',7000);
+    appToast(versionWarning?versionWarning:msg,
+             versionWarning?'err':st==='connected'?'ok':st==='pending'||st==='denied'?'info':'err',10000);
     loadLinkedServers(); loadMergeRequests();
   }catch(e){ appToast('Request failed','err'); }
 }
