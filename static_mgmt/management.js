@@ -500,7 +500,7 @@ function startRemotePolling(){
   stopRemotePolling();
   if(!remoteStaticLoaded) loadRemoteStatic();
   pollRemoteStats();
-  remotePollTimer=setInterval(pollRemoteStats,2000);
+  remotePollTimer=setInterval(pollRemoteStats,1500);
   remoteStaticTimer=setInterval(loadRemoteStatic,15000);
 }
 function refreshRemoteServer(){ if(_srvActive!=='local'){ remoteStaticLoaded=false; loadRemoteStatic(); pollRemoteStats(); } else startServerPolling(); }
@@ -853,7 +853,16 @@ let _uploadQueue=[], _uploadActive=false, _uploadCancelled=false, _uploadXhr=nul
 let _uploadFolder='', _uploadStopResolve=null, _uploadServer=null;
 let _ipDetailTarget=null, _ipProfileData=null, _lineDetailObj=null, _lineDetailTitle='';
 let _netDetailTimer=null, _netDetailBusy=false, _netOnlyEstablished=true;
-let _netSamplingKeys=new Set();
+/* The live detail keeps its own row order. New sockets are appended and rate
+   text is repainted in place, so a connection you are reading cannot be
+   shuffled by an unrelated socket opening or by the first rate sample. */
+let _netOrder=[], _netRows=new Map(), _netRowsEl=null, _netEmptyRow=null;
+let _netTableView='';
+
+function resetNetDetailView(){
+  _netOrder=[]; _netRows.clear();
+  _netRowsEl=null; _netEmptyRow=null; _netTableView='';
+}
 const _SRV_TITLES={cpu:'CPU: Top Processes',mem:'Memory: Top Processes',net:'Network: Active Connections',disk:'Disk: File Browser'};
 /* Which grant each drill-down needs. The server refuses without it either way;
    this is so the person sees a sentence instead of a failed request. */
@@ -961,11 +970,11 @@ function startNetDetailPoll(){
 }
 function stopNetDetailPoll(){
   if(_netDetailTimer){ clearInterval(_netDetailTimer); _netDetailTimer=null; }
-  _netSamplingKeys.clear();
+  resetNetDetailView();
 }
 function setNetEstablishedOnly(on){
   _netOnlyEstablished=!!on;
-  _netSamplingKeys.clear();
+  resetNetDetailView();
   renderNetDetail();
 }
 async function loadServerDetail(){
@@ -996,7 +1005,75 @@ async function renderProcDetail(by){
   }catch(e){ b.innerHTML=`<div class="empty-state">Failed: ${esc(String(e))}</div>`; }
 }
 function fmtRate(n){ return fmtBytes(n)+'/s'; }
-function netConnKey(c){ return `${c.proto}|${c.laddr}|${c.raddr}|${c.pid}`; }
+function netConnKey(c){
+  return c.key || `${c.proto}|${c.laddr}|${c.raddr}|${c.pid}`;
+}
+/* Keep the order the detail view already had. Only sockets that were not in
+   the previous poll are appended, so a new ephemeral connection cannot insert
+   itself above the row someone is reading. */
+function netOrderedConnections(conns){
+  const byKey=new Map();
+  for(const c of conns){
+    const base=netConnKey(c);
+    let key=base, n=2;
+    while(byKey.has(key)) key=base+'#'+(n++);
+    byKey.set(key,{key:key,conn:c});
+  }
+  const present=new Set(byKey.keys());
+  _netOrder=_netOrder.filter(k=>present.has(k));
+  const known=new Set(_netOrder);
+  for(const key of byKey.keys()){
+    if(!known.has(key)){ _netOrder.push(key); known.add(key); }
+  }
+  return _netOrder.map(k=>byKey.get(k));
+}
+function netRowState(c){
+  const isAuth=c.process&&c.process.includes('sshd-auth');
+  const isSess=c.process&&c.process.includes('sshd-session');
+  let background='',stateCell=esc(c.status),processCell=esc(c.process);
+  if(isAuth){
+    background='color-mix(in srgb, var(--danger) 8%, transparent)';
+    stateCell='<span style="color:var(--danger);font-weight:700;">ESTAB</span>';
+    processCell='<span style="color:var(--danger);font-weight:600;">sshd-auth</span> <span style="font-size:10px;color:var(--danger);background:color-mix(in srgb, var(--danger) 12%, transparent);border-radius:3px;padding:1px 5px;">TCP only, NOT authenticated</span>';
+  }else if(isSess){
+    background='color-mix(in srgb, var(--success) 8%, transparent)';
+    stateCell='<span style="color:var(--success);font-weight:700;">ESTAB</span>';
+    processCell=`<span style="color:var(--success);font-weight:600;">${esc(c.process)}</span> <span style="font-size:10px;color:var(--success);background:color-mix(in srgb, var(--success) 12%, transparent);border-radius:3px;padding:1px 5px;">SSH authenticated session</span>`;
+  }
+  return {background:background,stateCell:stateCell,processCell:processCell};
+}
+function paintNetRow(tr,c,rateError){
+  const state=netRowState(c);
+  tr.style.background=state.background;
+  const sig=[c.proto,c.laddr,c.raddr,c.status,c.pid,c.process].join('|');
+  if(tr.dataset.sig!==sig){
+    tr.dataset.sig=sig;
+    tr.innerHTML=`<td>${esc(c.proto)}</td><td>${esc(c.laddr)}</td><td><b>${esc(c.raddr)}</b></td>`
+      +`<td>${netRateCell(c,'rate_in','bytes_in',rateError)}</td>`
+      +`<td>${netRateCell(c,'rate_out','bytes_out',rateError)}</td>`
+      +`<td>${state.stateCell}</td><td>${esc(c.pid)}</td><td>${state.processCell}</td>`;
+  }else{
+    /* Static cells are unchanged. Repaint only the two live numbers, so the
+       browser keeps the row, its selection and the reading position. */
+    tr.children[3].innerHTML=netRateCell(c,'rate_in','bytes_in',rateError);
+    tr.children[4].innerHTML=netRateCell(c,'rate_out','bytes_out',rateError);
+  }
+}
+function buildNetDetailView(b,only,staleWarn,warn){
+  const intro=only
+    ? 'Showing established TCP connections only. In and Out are live per-socket rates, sampled every second. Rows keep their place; new connections are added at the bottom.'
+    : 'Showing all sockets. In and Out are live per-socket rates for established TCP connections, sampled every second; listeners show a hyphen. Rows keep their place; new connections are added at the bottom.';
+  b.innerHTML=`<div class="net-tools"><label class="net-filter"><input type="checkbox" ${only?'checked':''} onchange="setNetEstablishedOnly(this.checked)"> Established only</label></div>
+    <div id="net-alerts">${staleWarn}${warn}</div>
+    <div class="net-intro">${intro}</div>
+    <div class="net-legend">Per-socket TCP counters. Loopback traffic can appear on both endpoints. On port 22:
+      <span style="color:var(--danger);font-weight:600;">sshd-auth</span> = connected but not authenticated · <span style="color:var(--success);font-weight:600;">sshd-session</span> = authenticated shell.</div>
+    <table><thead><tr><th>Proto</th><th>Local</th><th>Remote IP</th><th title="Bytes received by this socket">↓ In</th><th title="Bytes sent by this socket">↑ Out</th><th>State</th><th>PID</th><th>Process</th></tr></thead>
+    <tbody></tbody></table>`;
+  _netTableView=`${_srvDetailServer||'local'}|${only?'est':'all'}`;
+  _netRowsEl=b.querySelector('tbody');
+  _netOrder=[]; _netRows.clear(); _netEmptyRow=null;
+}
 function netRateCell(c,field,bytesField,rateError){
   if(c.status!=='ESTABLISHED') return '<span class="net-rate muted">-</span>';
   if(!Object.prototype.hasOwnProperty.call(c,bytesField))
@@ -1014,7 +1091,10 @@ async function renderNetDetail(silent){
   if(_srvDetailKind!=='net'||_netDetailBusy) return;
   _netDetailBusy=true;
   const b=$('srv-detail-body'); const oldScroll=b?b.scrollTop:0;
-  if(!silent&&b) b.innerHTML='<div class="empty-state">Reading connections…</div>';
+  if(!silent){
+    resetNetDetailView();
+    if(b) b.innerHTML='<div class="empty-state">Reading connections…</div>';
+  }
   const only=_netOnlyEstablished;
   const srv=_srvDetailServer;
   const netUrl=srv
@@ -1026,51 +1106,43 @@ async function renderNetDetail(silent){
     if(_srvDetailKind!=='net'||srv!==_srvDetailServer||only!==_netOnlyEstablished) return;
     if(!nr.ok){ if(!silent&&b) b.innerHTML=`<div class="empty-state">${esc(d.error||'That server is unreachable.')}</div>`; return; }
     if(d.error){ if(!silent&&b) b.innerHTML=`<div class="empty-state">${esc(d.error)}</div>`; return; }
+    if(!b) return;
     const conns=d.connections||[];
     const staleCounters=conns.length>0 && !conns.some(c=>Object.prototype.hasOwnProperty.call(c,'bytes_in'));
-    const isSampling=c=>!d.rate_error && c.status==='ESTABLISHED' &&
-      c.bytes_in!=null && c.rate_in==null;
-    /* A new socket has no baseline yet. Keep those rows below the measured
-       ones so a fresh "sampling…" line cannot push the live list around. Once
-       its first delta arrives it is promoted to the top exactly once. */
-    const ready=conns.filter(c=>!isSampling(c));
-    const sampling=conns.filter(isSampling);
-    const promoted=[], rest=[];
-    for(const c of ready){
-      if(_netSamplingKeys.has(netConnKey(c))) promoted.push(c);
-      else rest.push(c);
-    }
-    _netSamplingKeys=new Set(sampling.map(netConnKey));
-    const netRow=c=>{
-      const isAuth=c.process&&c.process.includes('sshd-auth'), isSess=c.process&&c.process.includes('sshd-session');
-      let rowStyle='',stateCell=esc(c.status),processCell=esc(c.process);
-      if(isAuth){ rowStyle='background:color-mix(in srgb, var(--danger) 8%, transparent);'; stateCell='<span style="color:var(--danger);font-weight:700;">ESTAB</span>';
-        processCell='<span style="color:var(--danger);font-weight:600;">sshd-auth</span> <span style="font-size:10px;color:var(--danger);background:color-mix(in srgb, var(--danger) 12%, transparent);border-radius:3px;padding:1px 5px;">TCP only, NOT authenticated</span>'; }
-      else if(isSess){ rowStyle='background:color-mix(in srgb, var(--success) 8%, transparent);'; stateCell='<span style="color:var(--success);font-weight:700;">ESTAB</span>';
-        processCell=`<span style="color:var(--success);font-weight:600;">${esc(c.process)}</span> <span style="font-size:10px;color:var(--success);background:color-mix(in srgb, var(--success) 12%, transparent);border-radius:3px;padding:1px 5px;">SSH authenticated session</span>`; }
-      return `<tr style="${rowStyle}"><td>${esc(c.proto)}</td><td>${esc(c.laddr)}</td><td><b>${esc(c.raddr)}</b></td><td>${netRateCell(c,'rate_in','bytes_in',d.rate_error)}</td><td>${netRateCell(c,'rate_out','bytes_out',d.rate_error)}</td><td>${stateCell}</td><td>${esc(c.pid)}</td><td>${processCell}</td></tr>`;
-    };
-    const samplingHead=sampling.length
-      ? '<tr class="net-sampling-sep"><td colspan="8">New connections, waiting for the first rate sample</td></tr>'
-      : '';
-    const rows=promoted.map(netRow).join('')+rest.map(netRow).join('')+samplingHead+sampling.map(netRow).join('');
-    const intro=only
-      ? 'Showing established TCP connections only. In and Out are live per-socket rates, sampled every second.'
-      : 'Showing all sockets. In and Out are live per-socket rates for established TCP connections, sampled every second; listeners show a hyphen.';
     const warn=d.rate_error?`<div class="net-warn">${esc(d.rate_error)}</div>`:'';
     const staleWarn=staleCounters
       ? '<div class="net-warn">The running Argus service is still the pre-update process, so it has no per-socket counters. Restart it from a separate shell, then reopen Network: <code>sudo systemctl restart argus-management</code>.</div>'
       : '';
     const empty=only?'No established connections.':'No connections.';
-    if(b){
-      b.innerHTML=`<div class="net-tools"><label class="net-filter"><input type="checkbox" ${only?'checked':''} onchange="setNetEstablishedOnly(this.checked)"> Established only</label></div>
-        <div class="net-intro">${intro}</div>${staleWarn}${warn}
-        <div class="net-legend">Per-socket TCP counters. Loopback traffic can appear on both endpoints. On port 22:
-          <span style="color:var(--danger);font-weight:600;">sshd-auth</span> = connected but not authenticated · <span style="color:var(--success);font-weight:600;">sshd-session</span> = authenticated shell.</div>
-        <table><thead><tr><th>Proto</th><th>Local</th><th>Remote IP</th><th title="Bytes received by this socket">↓ In</th><th title="Bytes sent by this socket">↑ Out</th><th>State</th><th>PID</th><th>Process</th></tr></thead>
-        <tbody>${rows||`<tr><td colspan="8">${empty}</td></tr>`}</tbody></table>`;
-      if(silent) b.scrollTop=oldScroll;
+    const viewKey=`${srv||'local'}|${only?'est':'all'}`;
+    if(!silent || _netTableView!==viewKey || !_netRowsEl || !b.contains(_netRowsEl)){
+      buildNetDetailView(b,only,staleWarn,warn);
+    }else{
+      const alerts=b.querySelector('#net-alerts');
+      if(alerts) alerts.innerHTML=staleWarn+warn;
     }
+    const ordered=netOrderedConnections(conns);
+    const present=new Set(ordered.map(item=>item.key));
+    for(const [key,tr] of Array.from(_netRows)){
+      if(!present.has(key)){ tr.remove(); _netRows.delete(key); }
+    }
+    if(ordered.length&&_netEmptyRow){ _netEmptyRow.remove(); _netEmptyRow=null; }
+    for(const item of ordered){
+      let tr=_netRows.get(item.key);
+      if(!tr){
+        tr=document.createElement('tr');
+        tr.dataset.netKey=item.key;
+        _netRows.set(item.key,tr);
+        _netRowsEl.appendChild(tr);
+      }
+      paintNetRow(tr,item.conn,d.rate_error);
+    }
+    if(!ordered.length&&!_netEmptyRow){
+      _netEmptyRow=document.createElement('tr');
+      _netEmptyRow.innerHTML=`<td colspan="8">${empty}</td>`;
+      _netRowsEl.appendChild(_netEmptyRow);
+    }
+    if(silent) b.scrollTop=oldScroll;
   }catch(e){ if(!silent&&_srvDetailKind==='net'&&b) b.innerHTML=`<div class="empty-state">Failed: ${esc(String(e))}</div>`; }
   finally{ _netDetailBusy=false; }
 }

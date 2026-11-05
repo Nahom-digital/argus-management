@@ -288,19 +288,23 @@ def test_the_network_detail_has_live_per_socket_rates():
     each established socket. These names tie the JS renderer to the backend
     fields and to the one-second sampler it relies on."""
     js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
-    start = js.index("function netRateCell(")
+    start = js.index("function netConnKey(")
     end = js.index("/* A long name must not eat the extension.", start)
     block = js[start:end]
     for text in ("rate_in", "rate_out", "bytes_in", "bytes_out",
                  "Established only", "sampled every second", "sampling…",
                  "?established=1", "setNetEstablishedOnly", "staleCounters",
                  "pre-update process", "sudo systemctl restart argus-management",
-                 "isSampling", "_netSamplingKeys", "netConnKey", "promoted",
-                 "samplingHead", "net-sampling-sep"):
+                 "netConnKey", "netOrderedConnections", "_netOrder", "_netRows",
+                 "paintNetRow", "dataset.netKey", "buildNetDetailView",
+                 "new connections are added at the bottom", "net-alerts"):
         assert text in block, text
     assert "hasOwnProperty.call(c,'bytes_in')" in block
     assert "Live every 2s" not in block
     assert "net-live" not in block
+    assert "_netSamplingKeys" not in block
+    assert "samplingHead" not in block
+    assert "promoted" not in block
     assert "function renderNetDetail(silent)" in js
     assert "renderNetDetail(true)" in js
     assert "stopNetDetailPoll()" in js
@@ -313,9 +317,10 @@ def test_the_network_detail_has_live_per_socket_rates():
 
     css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
     for cls in (".net-tools", ".net-filter", ".net-intro",
-                ".net-warn", ".net-warn code", ".net-legend", ".net-rate",
-                ".net-sampling-sep"):
+                ".net-warn", ".net-warn code", ".net-legend", ".net-rate"):
         assert cls in css, cls
+    assert "font-variant-numeric:tabular-nums" in css
+    assert ".net-sampling-sep" not in css
     assert ".net-live" not in css
 
 
@@ -353,6 +358,15 @@ def test_the_network_endpoint_forwards_the_established_filter(client, monkeypatc
     r = client.get("/api/system/connections?established=1")
     assert r.status_code == 200, r.status_code
     assert seen["established_only"] is True
+
+
+def test_linked_and_local_telemetry_use_the_same_poll_cadence():
+    """A linked server's cards should not be a visibly older sample than its
+    own dashboard. Both now poll the shared server-side snapshot every 1.5s."""
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    assert "setInterval(pollServerStats,1500)" in js
+    assert "setInterval(pollRemoteStats,1500)" in js
+    assert "setInterval(pollRemoteStats,2000)" not in js
 
 
 def test_remote_telemetry_paints_every_metric_after_cpu(client):

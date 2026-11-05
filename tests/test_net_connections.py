@@ -88,6 +88,50 @@ def test_the_first_connection_sample_says_rates_are_not_ready(monkeypatch):
     assert rows[0]["rate_out"] is None
 
 
+def test_two_viewers_inside_one_interval_share_the_same_rate(monkeypatch):
+    monkeypatch.setattr(System, "_conn_last", {})
+    first = [{"_rate_key": "a", "bytes_in": 1000, "bytes_out": 2000}]
+    System._attach_conn_rates(first, now=10.0)
+    assert first[0]["rate_in"] is None
+
+    # A linked panel polling 0.4s later must not split the interval.
+    second = [{"_rate_key": "a", "bytes_in": 1400, "bytes_out": 2400}]
+    System._attach_conn_rates(second, now=10.4)
+    assert second[0]["rate_in"] is None
+    assert System._conn_last["a"]["t"] == 10.0
+    assert System._conn_last["a"]["recv"] == 1000
+
+    # The next eligible sample covers the full second.
+    third = [{"_rate_key": "a", "bytes_in": 2000, "bytes_out": 4000}]
+    System._attach_conn_rates(third, now=11.0)
+    assert third[0]["rate_in"] == 1000.0
+    assert third[0]["rate_out"] == 2000.0
+
+    # The other viewer immediately gets the same cached number.
+    fourth = [{"_rate_key": "a", "bytes_in": 2100, "bytes_out": 4100}]
+    System._attach_conn_rates(fourth, now=11.2)
+    assert fourth[0]["rate_in"] == 1000.0
+    assert fourth[0]["rate_out"] == 2000.0
+
+
+def test_a_long_gap_restarts_sampling_instead_of_averaging_stale_counters(monkeypatch):
+    monkeypatch.setattr(System, "_conn_last", {
+        "a": {"t": 10.0, "recv": 1000, "sent": 2000,
+              "rate_in": 10.0, "rate_out": 20.0},
+    })
+    rows = [{"_rate_key": "a", "bytes_in": 9000, "bytes_out": 12000}]
+    System._attach_conn_rates(rows, now=40.0)
+    assert rows[0]["rate_in"] is None
+    assert rows[0]["rate_out"] is None
+    assert System._conn_last["a"]["t"] == 40.0
+    assert System._conn_last["a"]["recv"] == 9000
+
+    next_rows = [{"_rate_key": "a", "bytes_in": 10000, "bytes_out": 14000}]
+    System._attach_conn_rates(next_rows, now=41.0)
+    assert next_rows[0]["rate_in"] == 1000.0
+    assert next_rows[0]["rate_out"] == 2000.0
+
+
 def test_a_counter_reset_never_produces_a_negative_rate(monkeypatch):
     monkeypatch.setattr(System, "_conn_last", {
         "a": {"t": 10.0, "recv": 5000, "sent": 9000},
@@ -154,6 +198,7 @@ def test_established_only_filters_sockets_and_attaches_ss_counters(monkeypatch):
     assert row["bytes_out"] == 123
     assert row["rate_in"] is None
     assert row["rate_out"] is None
+    assert "|127.0.0.1:2000|127.0.0.1:5000|" in row["key"]
     assert "_rate_key" not in row
 
 

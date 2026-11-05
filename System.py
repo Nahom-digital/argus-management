@@ -45,11 +45,26 @@ _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 # remembering the previous sample and dividing the delta by the elapsed time.
 _net_last = {"t": None, "sent": 0, "recv": 0}
 
+# --- Shared live telemetry ----------------------------------------------------
+# psutil's CPU and network rates are deltas from the previous call, not absolute
+# measurements. If the local page, a linked panel and the Telegram bot each call
+# live_stats(), they reset one another's baseline and report different numbers
+# for the same machine. One background sampler owns the baselines; every caller
+# reads its latest complete snapshot.
+_STATS_INTERVAL = 1.0
+_stats_lock = threading.Lock()
+_stats_cache = {"t": 0.0, "value": None}
+_stats_thread = None
+
 # The drill-down uses ss tcp_info counters per established socket. Those are
-# cumulative too, so the same delta trick works; the cache is rebuilt on every
-# detail request so closed sockets cannot accumulate here.
+# cumulative too, so the same delta trick works. The rate interval is held for
+# at least CONN_RATE_MIN_INTERVAL so two people watching the same server (the
+# local page and a linked panel) do not split one interval into two different
+# speeds for the same socket.
 _conn_last = {}
 _conn_lock = threading.Lock()
+CONN_RATE_MIN_INTERVAL = 0.8
+CONN_RATE_MAX_GAP = 15.0
 _SS_SENT_RE = re.compile(r"bytes_sent:(\d+)")
 _SS_RECV_RE = re.compile(r"bytes_received:(\d+)")
 _SS_PID_RE = re.compile(r"pid=(\d+)")
@@ -437,9 +452,13 @@ def public_ip():
     return cache["value"]
 
 
-def live_stats():
-    """Fast-changing telemetry sampled on every poll. Non-blocking psutil calls
-    (cpu_percent uses interval=None → instantaneous since the last call)."""
+def _sample_live_stats():
+    """Take one complete telemetry sample.
+
+    Only the shared sampler calls this after the first request primes it. That
+    keeps psutil's process-global CPU and network baselines on a fixed cadence
+    instead of letting every browser poll reset them.
+    """
     import psutil
 
     vm = psutil.virtual_memory()
@@ -499,6 +518,47 @@ def live_stats():
         "uptime_seconds": int(time.time() - boot),
         "ts": now,
     }
+
+
+def _live_stats_loop():
+    """Refresh the shared snapshot once a second for as long as the app runs."""
+    while True:
+        time.sleep(_STATS_INTERVAL)
+        try:
+            sample = _sample_live_stats()
+        except Exception as exc:  # keep the last good snapshot
+            logging.debug("live telemetry sample failed: %s", exc)
+            continue
+        with _stats_lock:
+            _stats_cache["t"] = time.monotonic()
+            _stats_cache["value"] = sample
+
+
+def _start_stats_sampler():
+    global _stats_thread
+    with _stats_lock:
+        if _stats_thread is not None and _stats_thread.is_alive():
+            return
+        thread = threading.Thread(target=_live_stats_loop,
+                                  name="argus-live-stats", daemon=True)
+        _stats_thread = thread
+        thread.start()
+
+
+def live_stats():
+    """The latest complete telemetry snapshot, shared by every caller.
+
+    The first request primes the snapshot synchronously so the dashboard is not
+    blank. After that a one-second background sampler advances it, and a local
+    browser, the linked panel and Telegram all read exactly the same numbers.
+    """
+    with _stats_lock:
+        if _stats_cache["value"] is None:
+            _stats_cache["value"] = _sample_live_stats()
+            _stats_cache["t"] = time.monotonic()
+        value = _stats_cache["value"]
+    _start_stats_sampler()
+    return value
 
 
 def run_command(cmd, timeout=30):
@@ -983,8 +1043,14 @@ def _ss_established():
 def _attach_conn_rates(rows, now=None):
     """Turn cumulative per-socket counters into rates between detail polls.
 
-    The cache is replaced rather than appended: a closed socket disappears on
-    the next sample, while a reused process/fd pair gets a fresh endpoint key.
+    Two viewers (this panel and a linked manager) may poll the same socket.
+    Updating the baseline on every request would give each of them half of the
+    real interval and a different speed. Instead, refresh a socket's rate only
+    once per CONN_RATE_MIN_INTERVAL; requests inside that window reuse the last
+    rate and leave the baseline alone for the next full-interval sample.
+
+    Closed sockets disappear because the cache is replaced each pass, and a
+    reused process/fd pair gets a fresh endpoint key.
     """
     global _conn_last
     now = time.monotonic() if now is None else now
@@ -998,16 +1064,49 @@ def _attach_conn_rates(rows, now=None):
             old = previous.get(key)
             if old:
                 dt = now - old["t"]
-                if dt > 0:
-                    row["rate_in"] = max(0.0, round((row["bytes_in"] - old["recv"]) / dt, 1))
-                    row["rate_out"] = max(0.0, round((row["bytes_out"] - old["sent"]) / dt, 1))
-                else:
+                if dt <= 0:
                     row["rate_in"] = 0.0
                     row["rate_out"] = 0.0
+                    fresh[key] = old
+                elif dt < CONN_RATE_MIN_INTERVAL:
+                    # Too soon to split the interval: reuse the last rate and
+                    # keep the old baseline for the next full-interval sample.
+                    row["rate_in"] = old.get("rate_in")
+                    row["rate_out"] = old.get("rate_out")
+                    fresh[key] = old
+                elif dt > CONN_RATE_MAX_GAP:
+                    # Nobody watched this socket for a long time. Averaging
+                    # since the stale baseline would be misleading, so start a
+                    # fresh sample and show "sampling…" until the next poll.
+                    row["rate_in"] = None
+                    row["rate_out"] = None
+                    fresh[key] = {
+                        "t": now,
+                        "recv": row["bytes_in"],
+                        "sent": row["bytes_out"],
+                        "rate_in": None,
+                        "rate_out": None,
+                    }
+                else:
+                    row["rate_in"] = max(0.0, round((row["bytes_in"] - old["recv"]) / dt, 1))
+                    row["rate_out"] = max(0.0, round((row["bytes_out"] - old["sent"]) / dt, 1))
+                    fresh[key] = {
+                        "t": now,
+                        "recv": row["bytes_in"],
+                        "sent": row["bytes_out"],
+                        "rate_in": row["rate_in"],
+                        "rate_out": row["rate_out"],
+                    }
             else:
                 row["rate_in"] = None
                 row["rate_out"] = None
-            fresh[key] = {"t": now, "recv": row["bytes_in"], "sent": row["bytes_out"]}
+                fresh[key] = {
+                    "t": now,
+                    "recv": row["bytes_in"],
+                    "sent": row["bytes_out"],
+                    "rate_in": None,
+                    "rate_out": None,
+                }
         _conn_last = fresh
 
 
@@ -1048,14 +1147,19 @@ def net_connections(limit=300, established_only=False):
             pname = name_cache[pid]
         laddr = f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else ""
         raddr = f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else ""
+        proto = "TCP" if c.type == socket.SOCK_STREAM else "UDP"
         row = {
-            "proto": "TCP" if c.type == socket.SOCK_STREAM else "UDP",
+            "proto": proto,
             "laddr": laddr,
             "lport": c.laddr.port if c.laddr else 0,
             "raddr": raddr,
             "status": status,
             "pid": pid or "",
             "process": pname,
+            # Stable per-socket identity for the live table. The fd keeps two
+            # sockets from the same process on the same endpoint distinct.
+            "key": f"{proto}|{laddr}|{raddr}|{pid or ''}|"
+                   f"{fd if fd is not None else ''}",
             "bytes_in": None,
             "bytes_out": None,
             "rate_in": None,
