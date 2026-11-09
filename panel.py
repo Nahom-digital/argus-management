@@ -1572,7 +1572,11 @@ _PANES_TEMPLATE = """
   <div class="pane" data-pane="terminal"><div class="pane-scroll">
     <div class="term-tabs" id="term-tabs">
       <button class="term-addbtn" id="term-add" title="Open another terminal" onclick="termAddTab()">+</button></div>
-    <div class="term-stack" id="term-stack"></div>
+    <div class="term-canvas" id="term-canvas">
+      <div class="term-stack" id="term-stack">
+        <button class="term-grip" id="term-grip" type="button" title="Drag to resize the terminal" aria-label="Drag to resize the terminal"></button>
+      </div>
+    </div>
   </div></div>
 
   <!-- LOGS -->

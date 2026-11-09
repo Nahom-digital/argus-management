@@ -341,6 +341,33 @@ def test_the_terminal_has_a_fullscreen_toggle():
         assert cls in css, cls
 
 
+def test_the_terminal_has_zoom_resize_layout_and_auto_copy():
+    """The terminal screen stays fixed while its contents stretch: zoom,
+    independent width and height, aspect presets, horizontal and vertical
+    splits, a drag grip, and a copy-on-select path that works on plain HTTP."""
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    for text in ("management_terminal_view:", "termApplyZoom", "termApplyView",
+                 "termSetRatio", "termSetLayout", "termSetExpanded",
+                 "termBeginResize", "_copyTermSelection", "termCopySelection",
+                 "_lastSelection", "termToggleSelectMode", "coreMouseService",
+                 "termEnsureCanvas", "termApplyDisplayBox", "termFillDisplayBox",
+                 "termPatchMouseMapping", "t-zoom-in", "t-copy", "t-select",
+                 "t-expand", "t-ratio", "data-term-layout"):
+        assert text in js, text
+
+    css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
+    for cls in (".term-canvas", ".term-view-panel", ".term-grip",
+                ".term-screen-box", "body.term-expanded",
+                "body.mgmt.term-expanded .mgmt-top",
+                ".term-stack.term-split-h", ".term-stack.term-split-v",
+                ".term-tool"):
+        assert cls in css, cls
+
+    page_markup = (ROOT / "panel.py").read_text(encoding="utf-8")
+    assert 'id="term-canvas"' in page_markup
+    assert 'id="term-grip"' in page_markup
+
+
 def test_the_network_endpoint_forwards_the_established_filter(client, monkeypatch):
     """The detail view defaults to established sockets; the query has to reach
     System.net_connections or the filter is only cosmetic."""

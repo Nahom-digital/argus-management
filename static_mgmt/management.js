@@ -62,6 +62,9 @@ function switchSection(name){
   document.querySelectorAll('[data-nav]').forEach(b=>b.classList.toggle('active', b.dataset.nav===name));
   document.querySelectorAll('.mtab').forEach(b=>b.classList.toggle('active', b.dataset.nav===name));
   if(name==='server'){ startServerPolling(); } else stopServerPolling();
+  // Leaving the terminal tab closes the in-window expanded view, so the
+  // terminal never floats over another section.
+  if(name!=='terminal' && termView.expanded) termSetExpanded(false);
   // fromHistory=true: arriving at the tab resets to the card grid without
   // spending a history entry, which is not the same as pressing Back.
   if(name==='config') configBack(true);
@@ -3823,7 +3826,254 @@ async function unblockWebIp(ip,btn){ btn.disabled=true; btn.textContent='…';
 
 /* ================= TERMINAL (xterm.js PTY, multi-session) ================= */
 const TERM_STORE_KEY='management_terminals';
+const TERM_VIEW_PREFIX='management_terminal_view:';
+const TERM_VIEW_DEFAULT={zoom:100,width:100,height:100,layout:'single',ratio:'free'};
 const termTabs=[]; let activeSid=null, termViewReady=false, termLibLoading=null;
+function termViewKey(){ return TERM_VIEW_PREFIX+(((window.MGMT_PERMS||{}).username)||'guest'); }
+function termViewLoad(){
+  let saved=null; try{ saved=JSON.parse(localStorage.getItem(termViewKey())); }catch(e){}
+  const v=Object.assign({},TERM_VIEW_DEFAULT,saved||{});
+  v.zoom=Math.min(240,Math.max(60,parseInt(v.zoom,10)||100));
+  v.width=Math.min(100,Math.max(30,parseInt(v.width,10)||100));
+  v.height=Math.min(100,Math.max(30,parseInt(v.height,10)||100));
+  v.layout=(v.layout==='horizontal'||v.layout==='vertical')?v.layout:'single';
+  v.ratio=['free','16:9','4:3','1:1','21:9','9:16'].indexOf(v.ratio)>=0?v.ratio:'free';
+  v.expanded=false;
+  return v;
+}
+const termView=termViewLoad();
+function termViewSave(){
+  const saved={zoom:termView.zoom,width:termView.width,height:termView.height,layout:termView.layout,ratio:termView.ratio};
+  try{ localStorage.setItem(termViewKey(),JSON.stringify(saved)); }catch(e){}
+}
+function termEnsureCanvas(){
+  let canvas=$('term-canvas');
+  const stack=$('term-stack');
+  if(canvas||!stack||!stack.parentElement) return canvas;
+  canvas=document.createElement('div'); canvas.id='term-canvas'; canvas.className='term-canvas';
+  stack.parentElement.insertBefore(canvas,stack);
+  canvas.appendChild(stack);
+  return canvas;
+}
+let termFitRaf=null;
+function termFitSoon(){
+  if(termFitRaf) return;
+  termFitRaf=requestAnimationFrame(()=>{
+    termFitRaf=null;
+    termTabs.forEach(tab=>{ if(tab.els&&tab.els.wrap.style.display!=='none') termFit(tab); });
+  });
+}
+function termSyncViewControls(tab){
+  if(!tab||!tab.els||!tab.els.wrap) return;
+  const wrap=tab.els.wrap;
+  const zoom=wrap.querySelector('.t-zoom-label'); if(zoom) zoom.textContent=termView.zoom+'%';
+  const width=wrap.querySelector('.t-width'); if(width) width.value=termView.width;
+  const height=wrap.querySelector('.t-height'); if(height) height.value=termView.height;
+  const wv=wrap.querySelector('.t-width-val'); if(wv) wv.textContent=termView.width+'%';
+  const hv=wrap.querySelector('.t-height-val'); if(hv) hv.textContent=termView.height+'%';
+  const ratio=wrap.querySelector('.t-ratio'); if(ratio) ratio.value=termView.ratio;
+  wrap.querySelectorAll('[data-term-layout]').forEach(b=>{
+    const on=b.dataset.termLayout===termView.layout;
+    b.classList.toggle('active',on); b.setAttribute('aria-pressed',on?'true':'false');
+  });
+  const selectMode=wrap.querySelector('.t-select');
+  if(selectMode){
+    selectMode.classList.toggle('active',!!tab._selectMode);
+    selectMode.setAttribute('aria-pressed',tab._selectMode?'true':'false');
+  }
+  const ex=wrap.querySelector('.t-expand');
+  if(ex){
+    ex.classList.toggle('active',!!termView.expanded);
+    ex.setAttribute('aria-pressed',termView.expanded?'true':'false');
+    ex.title=termView.expanded?'Exit expanded view':'Expand terminal in this window';
+    const label=ex.querySelector('span'); if(label) label.textContent=termView.expanded?'Collapse':'Expand';
+  }
+}
+function termSyncAllViewControls(){ termTabs.forEach(termSyncViewControls); }
+function termApplyView(save,resizing){
+  termSyncAllViewControls();
+  if(save) termViewSave();
+  if(resizing) termFitSoon(); else termRefreshDisplay();
+}
+function termSetSize(width,height,save,resizing){
+  if(termView.expanded) termSetExpanded(false);
+  termView.width=Math.min(100,Math.max(30,parseInt(width,10)||100));
+  termView.height=Math.min(100,Math.max(30,parseInt(height,10)||100));
+  termApplyView(save,resizing);
+}
+function termDisplayBox(tab){
+  const host=tab&&tab.els&&tab.els.host;
+  const box=tab&&tab.els&&tab.els.screenBox;
+  if(!host||!box) return null;
+  const W=host.clientWidth, H=host.clientHeight;
+  if(W<2||H<2) return null;
+  let baseW=W, baseH=H;
+  if(termView.ratio!=='free'){
+    const parts=String(termView.ratio).split(':');
+    const rw=parseInt(parts[0],10), rh=parseInt(parts[1],10);
+    if(rw&&rh){
+      const target=rw/rh;
+      if(W/H<=target){ baseW=W; baseH=W/target; }
+      else { baseH=H; baseW=H*target; }
+    }
+  }
+  return {width:Math.max(1,baseW*(termView.width/100)),
+          height:Math.max(1,baseH*(termView.height/100))};
+}
+function termApplyDisplayBox(tab){
+  if(!tab||!tab.els||!tab.els.screenBox) return;
+  const box=tab.els.screenBox;
+  const size=termDisplayBox(tab);
+  if(!size) return;
+  if(box._w!==size.width||box._h!==size.height){
+    box._w=size.width; box._h=size.height;
+    box.style.width=size.width+'px';
+    box.style.height=size.height+'px';
+  }
+}
+function termFillDisplayBox(tab){
+  if(!tab||!tab.term||!tab.els||!tab.els.screenBox) return;
+  const host=tab.els.host, box=tab.els.screenBox, term=tab.term;
+  const dims=term._core&&term._core._renderService&&term._core._renderService.dimensions;
+  if(!dims) return;
+  const screen=term.element&&term.element.querySelector('.xterm-screen');
+  const gridW=screen?screen.offsetWidth:term.cols*dims.css.cell.width;
+  const gridH=screen?screen.offsetHeight:term.rows*dims.css.cell.height;
+  if(gridW<1||gridH<1) return;
+  const W=host.clientWidth, H=host.clientHeight;
+  if(W<2||H<2) return;
+  const offX=screen?screen.offsetLeft:0, offY=screen?screen.offsetTop:0;
+  const sx=W/gridW, sy=H/gridH;
+  const tx=-offX*sx, ty=-offY*sy;
+  if(box._sx!==sx||box._sy!==sy){
+    box._sx=sx; box._sy=sy;
+    box.style.transform='translate('+tx+'px, '+ty+'px) scale('+sx+', '+sy+')';
+  }
+  term._stretchX=sx; term._stretchY=sy;
+}
+function termRefreshDisplay(){
+  termFitSoon();
+}
+function termSetRatio(ratio){
+  if(termView.expanded) termSetExpanded(false);
+  termView.ratio=ratio;
+  termApplyView(true,false);
+}
+function termApplyLayout(){
+  if(termView.layout!=='single'){
+    termTabs.forEach(tab=>{ if(!tab.built) termBuildPanel(tab); });
+    termTabs.forEach(tab=>{ if(!tab.ws) termTabConnect(tab); });
+  }
+  const stack=$('term-stack');
+  if(stack){
+    stack.classList.toggle('term-split',termView.layout!=='single');
+    stack.classList.toggle('term-split-h',termView.layout==='horizontal');
+    stack.classList.toggle('term-split-v',termView.layout==='vertical');
+  }
+  termTabs.forEach(tab=>{
+    if(!tab.els) return;
+    tab.els.wrap.style.display=(termView.layout!=='single'||tab.sid===activeSid)?'flex':'none';
+  });
+  setTimeout(()=>{ termRefreshDisplay(); termTabs.forEach(tab=>{ if(tab.els&&tab.els.wrap.style.display!=='none') termFitWhenReady(tab,40,false); }); },30);
+}
+function termSetLayout(layout){
+  if(termView.expanded) termSetExpanded(false);
+  const wasSplit=termView.layout==='horizontal'||termView.layout==='vertical';
+  termView.layout=(layout==='horizontal'||layout==='vertical')?layout:'single';
+  if(termTabs.length<2){
+    if(layout==='horizontal'){ termView.width=100; termView.height=72; termView.ratio='free'; }
+    else if(layout==='vertical'){ termView.width=72; termView.height=100; termView.ratio='free'; }
+    else if(wasSplit){ termView.width=100; termView.height=100; termView.ratio='free'; }
+  }
+  termViewSave(); termApplyView(false,false); termApplyLayout(); termSyncAllViewControls();
+}
+function termResetView(){
+  if(termView.expanded) termSetExpanded(false);
+  termView.width=100; termView.height=100; termView.ratio='free'; termView.layout='single';
+  termViewSave(); termApplyView(false,false); termApplyLayout(); termSyncAllViewControls();
+}
+function termApplyZoom(next,save){
+  termView.zoom=Math.min(240,Math.max(60,Math.round(next/10)*10));
+  const size=Math.max(8,Math.round(13*(termView.zoom/100)));
+  termTabs.forEach(tab=>{
+    if(!tab.term) return;
+    try{ tab.term.options.fontSize=size; }catch(e){ if(tab.term.setOption) tab.term.setOption('fontSize',size); }
+  });
+  termSyncAllViewControls();
+  if(save) termViewSave();
+  setTimeout(()=>termTabs.forEach(tab=>{ if(tab.els&&tab.els.wrap.style.display!=='none') termFitWhenReady(tab,40,false); }),30);
+}
+function termSetExpanded(on){
+  termView.expanded=!!on;
+  document.body.classList.toggle('term-expanded',termView.expanded);
+  _hideTermCopyBtn();
+  if(termView.expanded){
+    termTabs.forEach(tab=>{
+      if(!tab.els) return;
+      const panel=tab.els.wrap.querySelector('.term-view-panel'); if(panel) panel.hidden=true;
+      const btn=tab.els.wrap.querySelector('.t-view'); if(btn){ btn.classList.remove('active'); btn.setAttribute('aria-expanded','false'); }
+    });
+  }
+  termSyncAllViewControls();
+  setTimeout(()=>{ termRefreshDisplay(); termTabs.forEach(tab=>{ if(tab.els&&tab.els.wrap.style.display!=='none') termFitWhenReady(tab,40,false); }); },80);
+}
+function termToggleExpand(){ termSetExpanded(!termView.expanded); }
+function termToggleSelectMode(tab){
+  const term=tab&&tab.term;
+  const core=term&&term._core&&term._core.coreMouseService;
+  if(!core) return;
+  if(!tab._selectMode){
+    tab._savedMouseProtocol=core.activeProtocol||'NONE';
+    tab._selectMode=true;
+    if(core.activeProtocol!=='NONE') core.activeProtocol='NONE';
+    appToast('Mouse selection on. Drag over text to select it. Click Select again to restore app mouse control.','info',4600);
+  }else{
+    tab._selectMode=false;
+    const restore=tab._savedMouseProtocol||'NONE';
+    tab._savedMouseProtocol=null;
+    if(core.activeProtocol!==restore) core.activeProtocol=restore;
+  }
+  termSyncViewControls(tab);
+  try{ term.focus(); }catch(e){}
+}
+function termBeginResize(ev){
+  if(ev.button!==0) return;
+  const canvas=$('term-canvas'), stack=$('term-stack'); if(!canvas||!stack) return;
+  ev.preventDefault();
+  const rect=canvas.getBoundingClientRect();
+  const start={x:ev.clientX,y:ev.clientY,w:stack.offsetWidth,h:stack.offsetHeight};
+  const move=(e)=>{
+    const w=Math.min(rect.width,Math.max(1,start.w+(e.clientX-start.x)));
+    const h=Math.min(rect.height,Math.max(1,start.h+(e.clientY-start.y)));
+    termView.width=Math.min(100,Math.max(30,Math.round(w/rect.width*100)));
+    termView.height=Math.min(100,Math.max(30,Math.round(h/rect.height*100)));
+    termView.ratio='free';
+    termApplyView(false,true);
+  };
+  const up=()=>{
+    window.removeEventListener('pointermove',move);
+    window.removeEventListener('pointerup',up);
+    window.removeEventListener('pointercancel',up);
+    termApplyView(true,false);
+  };
+  window.addEventListener('pointermove',move);
+  window.addEventListener('pointerup',up);
+  window.addEventListener('pointercancel',up);
+}
+function termInitGrip(){
+  termEnsureCanvas();
+  const stack=$('term-stack'); if(!stack) return;
+  let grip=$('term-grip');
+  if(!grip){
+    grip=document.createElement('button'); grip.id='term-grip'; grip.className='term-grip'; grip.type='button';
+    grip.title='Drag to resize the terminal'; grip.setAttribute('aria-label','Drag to resize the terminal');
+    stack.appendChild(grip);
+  }
+  if(grip.dataset.bound) return;
+  grip.dataset.bound='1';
+  grip.addEventListener('pointerdown',termBeginResize);
+  grip.addEventListener('dblclick',termResetView);
+}
 function loadScript(src){ return new Promise((res,rej)=>{ const el=document.createElement('script'); el.src=src; el.onload=res; el.onerror=()=>rej(new Error('load '+src)); document.head.appendChild(el); }); }
 function ensureTermLib(){
   if(window.Terminal&&window.FitAddon) return Promise.resolve();
@@ -3852,7 +4102,8 @@ async function termInitNow(){
   termStoreLoad().forEach(s=>{ if(seen[s.sid]) return; if(s.persist||liveById[s.sid]){ seen[s.sid]=true; termTabs.push(termMakeTab(s.sid,s.name,s.persist||(liveById[s.sid]&&liveById[s.sid].persist))); } });
   live.forEach(s=>{ if(seen[s.id]) return; seen[s.id]=true; termTabs.push(termMakeTab(s.id,null,s.persist)); });
   if(!termTabs.length) termTabs.push(termMakeTab(genSid(),null,false));
-  termViewReady=true; termRenderTabs(); termStoreSave(); termActivate(termTabs[0].sid);
+  termInitGrip();
+  termViewReady=true; termApplyView(false,false); termRenderTabs(); termStoreSave(); termActivate(termTabs[0].sid);
 }
 function termRenderTabs(){
   const bar=$('term-tabs'); if(!bar) return; const addBtn=$('term-add');
@@ -3885,17 +4136,65 @@ function termCloseTab(sid){
   }
   termTabs.splice(idx,1);
   if(!termTabs.length){ const t=termMakeTab(genSid(),null,false); termTabs.push(t); termRenderTabs(); termStoreSave(); termActivate(t.sid); return; }
-  termRenderTabs(); termStoreSave(); if(activeSid===sid) termActivate(termTabs[Math.max(0,idx-1)].sid);
+  termRenderTabs(); termStoreSave();
+  if(activeSid===sid) termActivate(termTabs[Math.max(0,idx-1)].sid);
+  else termApplyLayout();
 }
 function termActivate(sid){
   activeSid=sid; const tab=termGetTab(sid); if(!tab) return;
   if(!tab.built) termBuildPanel(tab);
-  termTabs.forEach(t=>{ if(t.els) t.els.wrap.style.display=(t.sid===sid)?'flex':'none'; });
-  if(!tab.ws) termTabConnect(tab); termRenderTabs(); termFitWhenReady(tab);
+  termApplyLayout();
+  if(!tab.ws) termTabConnect(tab); termRenderTabs(); termSyncViewControls(tab); termFitWhenReady(tab);
+}
+function termScaledPoint(svc,event,element,sx,sy){
+  const rect=element.getBoundingClientRect();
+  const style=window.getComputedStyle(element);
+  const padLeft=parseInt(style.getPropertyValue('padding-left'))||0;
+  const padTop=parseInt(style.getPropertyValue('padding-top'))||0;
+  return [(event.clientX-rect.left)/sx-padLeft,(event.clientY-rect.top)/sy-padTop];
+}
+function termScaledCoords(svc,event,element,cols,rows,isMouseReport,sx,sy){
+  if(!svc._charSizeService.hasValidSize) return;
+  const point=termScaledPoint(svc,event,element,sx,sy);
+  const cell=svc._renderService.dimensions.css.cell;
+  let col=Math.ceil((point[0]+(isMouseReport?cell.width/2:0))/cell.width);
+  let row=Math.ceil(point[1]/cell.height);
+  col=Math.min(Math.max(col,1),cols+(isMouseReport?1:0));
+  row=Math.min(Math.max(row,1),rows);
+  return [col,row];
+}
+function termScaledReport(svc,event,element,sx,sy){
+  if(!svc._charSizeService.hasValidSize) return;
+  const point=termScaledPoint(svc,event,element,sx,sy);
+  const dim=svc._renderService.dimensions.css;
+  const x=Math.min(Math.max(point[0],0),dim.canvas.width-1);
+  const y=Math.min(Math.max(point[1],0),dim.canvas.height-1);
+  return {col:Math.floor(x/dim.cell.width),row:Math.floor(y/dim.cell.height),x:Math.floor(x),y:Math.floor(y)};
+}
+function termPatchMouseMapping(term){
+  const svc=term&&term._core&&term._core._mouseService;
+  if(!svc||svc._argusScaled) return;
+  svc._argusScaled=true;
+  const originalCoords=svc.getCoords.bind(svc);
+  const originalReport=svc.getMouseReportCoords.bind(svc);
+  svc.getCoords=function(event,element,cols,rows,isMouseReport){
+    const sx=term._stretchX||1, sy=term._stretchY||1;
+    if(sx===1&&sy===1) return originalCoords(event,element,cols,rows,isMouseReport);
+    return termScaledCoords(svc,event,element,cols,rows,isMouseReport,sx,sy);
+  };
+  svc.getMouseReportCoords=function(event,element){
+    const sx=term._stretchX||1, sy=term._stretchY||1;
+    if(sx===1&&sy===1) return originalReport(event,element);
+    return termScaledReport(svc,event,element,sx,sy);
+  };
 }
 function termFit(tab){ if(!tab||!tab.term||!tab.fit||!tab.els) return false; const host=tab.els.host;
-  if(!host||host.clientWidth<2||host.clientHeight<2) return false; try{ tab.fit.fit(); }catch(e){} return true; }
-function termFitWhenReady(tab,tries){ tries=(tries==null)?40:tries; if(termFit(tab)){ try{ tab.term.focus(); }catch(e){} return; } if(tries<=0) return; requestAnimationFrame(()=>termFitWhenReady(tab,tries-1)); }
+  if(!host||host.clientWidth<2||host.clientHeight<2) return false;
+  termApplyDisplayBox(tab);
+  try{ tab.fit.fit(); }catch(e){}
+  termFillDisplayBox(tab);
+  return true; }
+function termFitWhenReady(tab,tries,focus){ tries=(tries==null)?40:tries; if(termFit(tab)){ if(focus!==false){ try{ tab.term.focus(); }catch(e){} } return; } if(tries<=0) return; requestAnimationFrame(()=>termFitWhenReady(tab,tries-1,focus)); }
 function termFitActive(){ termFitWhenReady(termGetTab(activeSid)); }
 function termSetStatus(tab,text,cls){ if(tab&&tab.els){ tab.els.status.textContent=text; tab.els.status.className='term-status'+(cls?' '+cls:''); } }
 /* Fullscreen works both ways: the Browser Fullscreen API where it exists, and
@@ -3954,35 +4253,99 @@ document.addEventListener('keydown',(e)=>{
       changed=true;
     }
   });
-  if(changed){ document.body.classList.remove('term-fs-open'); setTimeout(termFitActive,60); }
+  if(changed){ document.body.classList.remove('term-fs-open'); setTimeout(termFitActive,60); return; }
+  if(termView.expanded) termSetExpanded(false);
 });
 function termBuildPanel(tab){
   const stack=$('term-stack'); const wrap=document.createElement('div'); wrap.className='term-wrap'+(tab.server?' term-remote':''); wrap.dataset.sid=tab.sid; wrap.style.display='none';
   const perms=window.MGMT_PERMS||{}; const termTitle=tab.server?'Linked server: '+tab.name:(perms.terminalAccess==='limited'?'Restricted terminal: your own system account':'Root terminal: live interactive shell');
-  wrap.innerHTML='<div class="term-bar"><span class="term-title">'+esc(termTitle)+'</span><span class="term-status">connecting…</span>'+
+  wrap.innerHTML='<div class="term-bar">'+
+    '<div class="term-tools">'+
+      '<button class="term-tool t-zoom-out" type="button" title="Zoom out terminal" aria-label="Zoom out terminal">−</button>'+
+      '<button class="term-tool t-zoom-label" type="button" title="Reset terminal zoom">100%</button>'+
+      '<button class="term-tool t-zoom-in" type="button" title="Zoom in terminal" aria-label="Zoom in terminal">+</button>'+
+      '<button class="term-tool t-expand" type="button" aria-pressed="false" title="Expand terminal in this window"><svg class="ic"><use href="#ic-maximize-2"/></svg><span>Expand</span></button>'+
+      '<button class="term-tool t-view" type="button" title="Terminal size and layout" aria-expanded="false"><svg class="ic"><use href="#ic-sliders-horizontal"/></svg><span>Display</span></button>'+
+      '<button class="term-tool t-select" type="button" aria-pressed="false" title="Select text with the mouse instead of sending mouse events to apps like PI or opencode"><svg class="ic"><use href="#ic-square"/></svg><span>Select</span></button>'+
+    '</div>'+
+    '<span class="term-title">'+esc(termTitle)+'</span><span class="term-status">connecting…</span>'+
     '<label class="term-stay" title="Keep this session running even after you close the site"><input type="checkbox"'+(tab.persist?' checked':'')+'><span>Stay on</span></label>'+
+    '<button class="term-clear t-copy" type="button" title="Copy the selected terminal text"><svg class="ic"><use href="#ic-copy"/></svg><span>Copy</span></button>'+
     '<button class="term-clear t-clear">Clear</button><button class="term-clear t-recon">Reconnect</button>'+
     '<button class="term-clear t-full" type="button" aria-pressed="false" title="Fullscreen terminal"><svg class="ic"><use href="#ic-maximize-2"/></svg><span>Fullscreen</span></button>'+
     '<button class="term-clear term-close t-close">Close</button></div>'+
-    '<div class="term-host"></div><div class="term-hint">A real PTY: run <code>top</code>, <code>vim</code>, anything interactive. <strong>Stay on</strong> keeps it alive after you close the site.</div>';
+    '<div class="term-view-panel" hidden>'+
+      '<label class="tvp-field">Width <input class="t-width" type="range" min="30" max="100" step="1"><span class="tvp-val t-width-val"></span></label>'+
+      '<label class="tvp-field">Height <input class="t-height" type="range" min="30" max="100" step="1"><span class="tvp-val t-height-val"></span></label>'+
+      '<label class="tvp-field">Aspect <select class="t-ratio"><option value="free">Free</option><option value="16:9">16:9</option><option value="4:3">4:3</option><option value="1:1">1:1</option><option value="21:9">21:9</option><option value="9:16">9:16</option></select></label>'+
+      '<div class="tvp-field">Layout <span class="tvp-modes">'+
+        '<button class="tvp-mode" type="button" data-term-layout="single" title="Show only the active terminal">Single</button>'+
+        '<button class="tvp-mode" type="button" data-term-layout="horizontal" title="Show all terminals side by side">Horizontal</button>'+
+        '<button class="tvp-mode" type="button" data-term-layout="vertical" title="Show all terminals stacked">Vertical</button>'+
+      '</span></div>'+
+      '<button class="term-tool t-view-reset" type="button" title="Reset terminal size and layout">Reset</button>'+
+      '<button class="term-tool t-view-close" type="button" title="Close display settings" aria-label="Close display settings">×</button>'+
+    '</div>'+
+    '<div class="term-host"></div><div class="term-hint">A real PTY: run <code>top</code>, <code>vim</code>, anything interactive. Select text to copy it automatically. For mouse apps like <code>pi</code> or <code>opencode</code>, turn on <strong>Select</strong>. <strong>Stay on</strong> keeps it alive after you close the site.</div>';
   stack.appendChild(wrap);
   const host=wrap.querySelector('.term-host'), status=wrap.querySelector('.term-status'), stay=wrap.querySelector('.term-stay input');
-  tab.els={wrap,host,status,stay};
+  const screenBox=document.createElement('div'); screenBox.className='term-screen-box'; host.appendChild(screenBox);
+  tab.els={wrap,host,status,stay,screenBox};
+  termApplyDisplayBox(tab);
   stay.addEventListener('change',()=>{ tab.persist=stay.checked; try{ if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(JSON.stringify({persist:tab.persist})); }catch(e){} termStoreSave(); termRenderTabs(); });
+  wrap.querySelector('.t-copy').onclick=()=>termCopySelection(tab);
   wrap.querySelector('.t-clear').onclick=()=>{ if(tab.term){ tab.term.clear(); tab.term.focus(); } };
   wrap.querySelector('.t-recon').onclick=()=>termTabReconnect(tab);
   wrap.querySelector('.t-full').onclick=()=>termToggleFullscreen(tab);
   wrap.querySelector('.t-close').onclick=()=>termCloseTab(tab.sid);
+  const viewPanel=wrap.querySelector('.term-view-panel'), viewBtn=wrap.querySelector('.t-view');
+  const setViewPanel=(open)=>{ viewPanel.hidden=!open; viewBtn.classList.toggle('active',!!open); viewBtn.setAttribute('aria-expanded',open?'true':'false'); setTimeout(termRefreshDisplay,0); };
+  viewBtn.onclick=()=>{
+    if(termView.expanded) termSetExpanded(false);
+    setViewPanel(viewPanel.hidden);
+  };
+  wrap.querySelector('.t-view-close').onclick=()=>setViewPanel(false);
+  wrap.querySelector('.t-zoom-out').onclick=()=>termApplyZoom(termView.zoom-10,true);
+  wrap.querySelector('.t-zoom-label').onclick=()=>termApplyZoom(100,true);
+  wrap.querySelector('.t-zoom-in').onclick=()=>termApplyZoom(termView.zoom+10,true);
+  wrap.querySelector('.t-expand').onclick=()=>termToggleExpand();
+  wrap.querySelector('.t-select').onclick=()=>termToggleSelectMode(tab);
+  const widthRange=wrap.querySelector('.t-width'), heightRange=wrap.querySelector('.t-height');
+  widthRange.oninput=()=>termSetSize(widthRange.value,heightRange.value,false,true);
+  heightRange.oninput=()=>termSetSize(widthRange.value,heightRange.value,false,true);
+  widthRange.onchange=()=>termSetSize(widthRange.value,heightRange.value,true,false);
+  heightRange.onchange=()=>termSetSize(widthRange.value,heightRange.value,true,false);
+  wrap.querySelector('.t-ratio').onchange=(e)=>termSetRatio(e.target.value);
+  wrap.querySelectorAll('[data-term-layout]').forEach(b=>{ b.onclick=()=>termSetLayout(b.dataset.termLayout); });
+  wrap.querySelector('.t-view-reset').onclick=()=>termResetView();
+  termSyncViewControls(tab);
   const isDark=document.documentElement.getAttribute('data-theme')==='dark';
-  const term=new window.Terminal({cursorBlink:true,fontFamily:'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',fontSize:13,scrollback:5000,
+  const termFont=Math.max(8,Math.round(13*(termView.zoom/100)));
+  const term=new window.Terminal({cursorBlink:true,fontFamily:'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',fontSize:termFont,scrollback:5000,
     theme:isDark?{background:'#000000',foreground:'#e0e0e0',cursor:'#7ee787'}:{background:'#0c0c0c',foreground:'#e0e0e0',cursor:'#7ee787'}});
-  const fit=new window.FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
+  const fit=new window.FitAddon.FitAddon(); term.loadAddon(fit); term.open(screenBox);
+  termPatchMouseMapping(term);
   term.onData(d=>{ if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(new TextEncoder().encode(d)); });
   term.onResize(({rows,cols})=>{ if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(JSON.stringify({resize:[rows,cols]})); });
-  term.onSelectionChange(()=>{ if(!term.hasSelection()) _hideTermCopyBtn(); });
-  host.addEventListener('mouseup',(ev)=>{ setTimeout(()=>{ if(term.hasSelection()) _showTermCopyBtn(term,ev.clientX,ev.clientY); },0); });
+  term.onSelectionChange(()=>{
+    const selected=term.hasSelection()?term.getSelection():'';
+    if(selected) term._lastSelection=selected;
+    if(!selected){ _hideTermCopyBtn(); term._lastCopiedText=''; }
+  });
+  host.addEventListener('keyup',(e)=>{ if(term.hasSelection()&&(e.shiftKey||e.key==='Shift'||e.ctrlKey||e.metaKey)) _copyTermSelection(term); });
+  if(term.attachCustomKeyEventHandler){
+    term.attachCustomKeyEventHandler((ev)=>{
+      const key=(ev.key||'').toLowerCase();
+      if(ev.type==='keydown'&&key==='c'&&(ev.ctrlKey||ev.metaKey)&&term.hasSelection()){ _copyTermSelection(term); return false; }
+      return true;
+    });
+  }
   tab.term=term; tab.fit=fit; tab.built=true;
-  if(window.ResizeObserver){ tab._ro=new ResizeObserver(()=>termFit(tab)); tab._ro.observe(host); }
+  termApplyDisplayBox(tab);
+  if(window.ResizeObserver){
+    tab._ro=new ResizeObserver(()=>{ termFit(tab); });
+    tab._ro.observe(host); tab._ro.observe(wrap);
+  }
 }
 function termTabConnect(tab){
   if(tab.ws&&(tab.ws.readyState===WebSocket.OPEN||tab.ws.readyState===WebSocket.CONNECTING)) return;
@@ -4045,14 +4408,65 @@ function _termCopyBtnEl(){
   _termCopyBtn=btn; return btn;
 }
 function _hideTermCopyBtn(){ if(_termCopyBtn) _termCopyBtn.classList.remove('show'); }
+function _copyTermText(text,term){
+  text=String(text==null?'':text);
+  if(!text) return false;
+  const done=()=>{ appToast('Selection copied','ok'); if(term) try{ term.focus(); }catch(e){} };
+  const fail=()=>{ if(term) term._lastCopiedText=''; appToast('Copy failed. Use Ctrl+Shift+C.','err'); if(term) try{ term.focus(); }catch(e){} };
+  if(navigator.clipboard&&navigator.clipboard.writeText&&window.isSecureContext){
+    navigator.clipboard.writeText(text).then(done,()=>_execCopy(text,done,fail));
+  } else _execCopy(text,done,fail);
+  return true;
+}
+function _copyTermSelection(term){
+  const text=term&&term.getSelection?term.getSelection():'';
+  if(!text) return false;
+  if(term._lastCopiedText===text) return true;
+  term._lastCopiedText=text;
+  return _copyTermText(text,term);
+}
+function termCopySelection(tab){
+  const term=tab&&tab.term;
+  const text=(term&&term.getSelection?term.getSelection():'')||(term&&term._lastSelection)||'';
+  if(!text){ appToast('Select text in the terminal first','err'); if(term) try{ term.focus(); }catch(e){} return; }
+  if(term) term._lastCopiedText='';
+  _copyTermText(text,term);
+}
+document.addEventListener('mouseup',(e)=>{
+  const host=e.target&&e.target.closest?e.target.closest('.term-host'):null;
+  if(!host) return;
+  const wrap=host.closest('.term-wrap');
+  const tab=termTabs.find(t=>t.els&&t.els.wrap===wrap);
+  if(!tab||!tab.term) return;
+  const text=tab.term.getSelection();
+  if(!text) return;
+  tab.term._lastSelection=text;
+  _showTermCopyBtn(tab.term,e.clientX,e.clientY);
+  _copyTermText(text,tab.term);
+},true);
 function _showTermCopyBtn(term,x,y){
   const btn=_termCopyBtnEl();
   btn.style.left=Math.max(8,x-30)+'px'; btn.style.top=Math.max(8,y-40)+'px';
-  btn.onclick=(e)=>{ e.stopPropagation(); copyVal(term.getSelection(),'Selection'); _hideTermCopyBtn(); };
+  btn.onclick=(e)=>{
+    e.stopPropagation();
+    const tab=termTabs.find(t=>t.term===term);
+    if(tab) termCopySelection(tab);
+    else { term._lastCopiedText=''; _copyTermSelection(term); }
+    _hideTermCopyBtn();
+  };
   btn.classList.add('show');
 }
-window.addEventListener('resize',()=>{ if(CURRENT==='terminal') termFitActive(); });
-window.addEventListener('orientationchange',()=>{ if(CURRENT==='terminal') setTimeout(termFitActive,60); });
+document.addEventListener('keydown',(e)=>{
+  if(!(e.ctrlKey||e.metaKey)||(e.key||'').toLowerCase()!=='c') return;
+  const wrap=e.target&&e.target.closest?e.target.closest('.term-wrap'):null;
+  if(!wrap) return;
+  const tab=termTabs.find(t=>t.els&&t.els.wrap===wrap);
+  if(!tab||!tab.term||!tab.term.hasSelection()) return;
+  e.preventDefault(); e.stopPropagation();
+  termCopySelection(tab);
+},true);
+window.addEventListener('resize',()=>{ if(CURRENT==='terminal'){ termRefreshDisplay(); termFitActive(); } });
+window.addEventListener('orientationchange',()=>{ if(CURRENT==='terminal') setTimeout(()=>{ termRefreshDisplay(); termFitActive(); },60); });
 
 /* ================= boot ================= */
 /* ================= TELEGRAM BOT =================
@@ -4214,6 +4628,9 @@ async function clearTelegramLog(){
 
 (function init(){
   applyTheme(localStorage.getItem('theme')==='dark');
+  termEnsureCanvas();
+  termInitGrip();
+  termApplyView(false,false);
   document.querySelectorAll('[data-nav]').forEach(b=>b.addEventListener('click',()=>switchSection(b.dataset.nav)));
   const ss=$('svc-search'); if(ss) ss.addEventListener('input',renderServices);
   /* The Add proxy host button opens the form from an inline onclick. The
