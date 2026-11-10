@@ -2406,8 +2406,10 @@ async def api_account_password(request: Request):
             # theirs must not, so their row's own epoch is bumped instead, which
             # update_user already did.
             await DB.run(_bump_auth_epoch)
+            _close_local_terminals()
         else:
             _forget_user_epoch(username)
+            _close_local_terminals(username)
     except Exception as e:
         logging.error(f"password change failed: {e}")
         return JSONResponse(status_code=500, content={"error": "Could not update the password."})
@@ -2748,6 +2750,7 @@ async def api_recover(request: Request):
         await DB.run(_bump_auth_epoch)      # evict anyone already signed in
     except Exception as e:
         logging.error(f"epoch bump after recovery failed: {e}")
+    _close_local_terminals()
 
     write_log("ACTION", "SECURITY", "Password reset with a recovery code", actor=username,
               ip=ip, detail=f"{left} code(s) remaining; all sessions signed out")
@@ -3214,6 +3217,9 @@ async def api_merge_server_delete(request: Request, server_id: str):
     ok = await DB.run(merge_servers.delete_server, server_id)
     if not ok:
         return JSONResponse(status_code=404, content={"error": "No such server."})
+    # The row is gone, so nothing can reattach to those shells. End the live
+    # proxies instead of leaving remote root terminals running behind it.
+    await _end_merge_proxies(server_id)
     write_log("ACTION", "SERVER", "Removed linked server", actor=_admin_name(request),
               ip=_client_ip(request), target=(row or {}).get("host", server_id))
     return {"status": "ok"}
@@ -4000,6 +4006,14 @@ def _update_panel_user(username, **fields):
     finally:
         DB.release_connection(conn)
 
+def _panel_user_grants(username):
+    conn = DB.get_connection()
+    try:
+        user = panel_users.get_user(conn, username)
+        return user["grants"] if user else None
+    finally:
+        DB.release_connection(conn)
+
 @app.post("/api/config/users/{username}")
 async def api_users_update(request: Request, username: str):
     """Edit one staff account: their grants, their password, their display
@@ -4028,6 +4042,8 @@ async def api_users_update(request: Request, username: str):
 
     if not fields and "servers" not in body:
         return JSONResponse(status_code=400, content={"error": "Nothing to change."})
+    old_grants = (await DB.run(_panel_user_grants, username)
+                  if "grants" in fields else None)
     if fields:
         try:
             ok = await DB.run(_update_panel_user, username, **fields)
@@ -4043,6 +4059,10 @@ async def api_users_update(request: Request, username: str):
     # Drop the cached epoch so a reset or a narrowed grant set takes hold on the
     # target's very next request rather than up to ten seconds later.
     _forget_user_epoch(username)
+    narrowed = (old_grants is not None and "grants" in fields
+                and panel_users._is_narrowing(old_grants, fields["grants"]))
+    if narrowed or "password" in fields:
+        _close_local_terminals(username)
     write_log("ACTION", "SECURITY", "Updated panel user", actor=_admin_name(request),
               ip=_client_ip(request), target=username, detail="; ".join(notes))
     return {"status": "ok"}
@@ -4064,6 +4084,7 @@ async def api_users_delete(request: Request, username: str):
     ok = await DB.run(_delete_panel_user, username)
     if not ok:
         return JSONResponse(status_code=404, content={"error": "No such user."})
+    _close_local_terminals(username)
     await DB.run(merge_servers.delete_user_access, username)
     write_log("ACTION", "SECURITY", "Deleted panel user", actor=_admin_name(request),
               ip=_client_ip(request), target=username)
@@ -5538,6 +5559,10 @@ async def api_ssh_toggle(request: Request):
 # ---- terminal: PTY WebSocket (ported from Main.py) ----
 _TERMS = {}
 _TERM_BUF_MAX = 256 * 1024
+# A browser that stops reading must not grow its queue without limit. 64
+# chunks is about 4MB of pending output; past that the client is dropped
+# instead of the panel holding the backlog in memory forever.
+_TERM_QUEUE_MAX_CHUNKS = 64
 
 # ---------------------------------------------------------------------------
 # Telegram bot.
@@ -5725,12 +5750,31 @@ def _safe_int(v, default):
     except (TypeError, ValueError):
         return default
 
+# A browser cannot ask for a 100000-column pty: the winsize fields are 16 bit
+# and a huge grid only makes the shell allocate and redraw for nothing.
+_TERM_ROWS_MIN, _TERM_ROWS_MAX = 1, 1000
+_TERM_COLS_MIN, _TERM_COLS_MAX = 1, 2000
+
+
+def _clamp_term_dims(rows, cols):
+    """Return (rows, cols) safe for TIOCSWINSZ, with the usual defaults.
+
+    Anything unparsable keeps the old 24x80 default, and an absurd or negative
+    value is pulled into range instead of reaching the ioctl.
+    """
+    r = _safe_int(rows, 24)
+    c = _safe_int(cols, 80)
+    r = max(_TERM_ROWS_MIN, min(_TERM_ROWS_MAX, r))
+    c = max(_TERM_COLS_MIN, min(_TERM_COLS_MAX, c))
+    return r, c
+
 class _ManagedTerm:
     def __init__(self, sid, persist, rows, cols, owner="", run_as=None, jail=False):
         self.sid = sid
         self.persist = bool(persist)
         self.owner = owner
         self.run_as = run_as
+        self.jail = bool(jail)
         self.sess = System.PtySession(run_as=run_as, jail=jail)
         self.sess.spawn(rows=rows, cols=cols)
         self.rows, self.cols = rows, cols
@@ -5745,6 +5789,10 @@ class _ManagedTerm:
         def _on_readable():
             try:
                 data = os.read(self.sess.fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                # The master is non-blocking: a wakeup with nothing to read is
+                # normal, not the shell exiting.
+                return
             except OSError:
                 data = b""
             if not data:
@@ -5753,6 +5801,18 @@ class _ManagedTerm:
                     self.loop.remove_reader(self.sess.fd)
                 except Exception:
                     pass
+                if not self.subscribers:
+                    # Nobody is watching, so no pump will ever notice the
+                    # exit. Release the fd and the child now instead of
+                    # holding them in _TERMS until some future reconnect.
+                    # The identity check makes a session respawned under the
+                    # same sid before this runs untouched.
+                    try:
+                        self.loop.call_soon(_term_close_if, self.sid, self)
+                    except Exception:
+                        # A loop that is already shutting down refuses new
+                        # callbacks; release the session now instead.
+                        _term_close_if(self.sid, self)
                 for q in list(self.subscribers):
                     q.put_nowait(None)
                 return
@@ -5761,6 +5821,16 @@ class _ManagedTerm:
                 del self.buffer[:overflow]
             self.buffer += data
             for q in list(self.subscribers):
+                if getattr(q, "_term_overflowed", False):
+                    # Already told to stop; later reads must not grow it again.
+                    continue
+                if q.qsize() >= _TERM_QUEUE_MAX_CHUNKS:
+                    # This viewer stopped draining. Cap its backlog and wake
+                    # its pump with the normal end sentinel so it drains and
+                    # closes; the shell and other viewers are unaffected.
+                    q._term_overflowed = True
+                    q.put_nowait(None)
+                    continue
                 q.put_nowait(data)
         try:
             self.loop.add_reader(self.sess.fd, _on_readable)
@@ -5772,8 +5842,10 @@ class _ManagedTerm:
         self.sess.write(data)
 
     def resize(self, rows, cols):
-        self.rows, self.cols = rows, cols
-        self.sess.set_winsize(rows, cols)
+        # Only remember a size the pty actually accepted, so a failed ioctl
+        # cannot make the panel report a grid the shell never got.
+        if self.sess.set_winsize(rows, cols):
+            self.rows, self.cols = rows, cols
 
     def close(self):
         self.dead = True
@@ -5784,6 +5856,9 @@ class _ManagedTerm:
         # A server-side close (key rotation, revoked panel) must wake any
         # websocket waiting on this session, not just stop the PTY.
         for q in list(self.subscribers):
+            if getattr(q, "_term_overflowed", False):
+                # Its sentinel is already queued; a second one is pointless.
+                continue
             try:
                 q.put_nowait(None)
             except Exception:
@@ -5799,6 +5874,75 @@ def _term_close(sid):
     if mt:
         mt.close()
 
+def _term_close_if(sid, mt):
+    """Close by sid only while that sid still maps to this session.
+
+    A reconnect can replace a session under the same sid (a narrowed grant
+    respawns it), and an old handler's finally must not kill the replacement.
+    """
+    if _TERMS.get(sid) is mt:
+        _term_close(sid)
+
+
+# Live outbound linked terminals, keyed by the linked server's row id.
+# Deleting the row cannot reach a proxy that is already connected, so the
+# delete route looks them up here and asks each remote shell to end.
+_MERGE_LIVE = {}
+
+
+class _MergeProxy:
+    __slots__ = ("server_id", "browser", "remote", "sid", "gone")
+
+    def __init__(self, server_id, browser, sid):
+        self.server_id = server_id
+        self.browser = browser
+        self.remote = None
+        self.sid = sid
+        self.gone = False
+
+
+def _merge_proxy_open(server_id, browser, sid):
+    proxy = _MergeProxy(server_id, browser, sid)
+    _MERGE_LIVE.setdefault(server_id, []).append(proxy)
+    return proxy
+
+
+def _merge_proxy_done(proxy):
+    live = _MERGE_LIVE.get(proxy.server_id)
+    if not live:
+        return
+    if proxy in live:
+        live.remove(proxy)
+    if not live:
+        _MERGE_LIVE.pop(proxy.server_id, None)
+
+
+async def _end_merge_proxy(proxy):
+    """Ask the remote panel to end this proxy's shell, then drop the link.
+
+    The proxy's own finally closes the browser side once the outbound socket
+    is gone. A proxy that is still opening is only flagged; its handler closes
+    the link as soon as the connection is up.
+    """
+    remote = proxy.remote
+    if remote is None:
+        proxy.gone = True
+        return
+    try:
+        await remote.send(json.dumps({"kill": True, "force": True}))
+    except Exception:
+        pass
+    try:
+        await remote.close()
+    except Exception:
+        pass
+
+
+async def _end_merge_proxies(server_id):
+    """Close the live outbound terminals of a linked server that was removed."""
+    for proxy in list(_MERGE_LIVE.get(server_id, ())):
+        await _end_merge_proxy(proxy)
+
 def _close_merge_terminals(issuer=""):
     """Close inbound linked sessions, all of them or just one issuer."""
     prefix = f"merge:{issuer}:" if issuer else "merge:"
@@ -5806,17 +5950,63 @@ def _close_merge_terminals(issuer=""):
         if str(getattr(mt, "owner", "")).startswith(prefix):
             _term_close(sid)
 
+def _close_local_terminals(username=None):
+    """Close local PTY sessions, all of them or just one account's.
+
+    Inbound linked sessions are not local tabs and are closed by
+    _close_merge_terminals instead.
+    """
+    for sid, mt in list(_TERMS.items()):
+        owner = str(getattr(mt, "owner", ""))
+        if owner.startswith("merge:"):
+            continue
+        if username is None or owner == username:
+            _term_close(sid)
+
 @app.get("/api/system/terminals")
 async def list_terminals(request: Request):
     if not _authed(request):
         return _need_auth()
-    # Inbound linked sessions are owned by another panel and must never show up
-    # as tabs in this panel's local terminal list.
+    username = _admin_name(request)
+    perms = await DB.run(_resolve_permissions, username)
+    if perms.get("terminal", panel_users.TERMINAL_NONE) == panel_users.TERMINAL_NONE:
+        return JSONResponse(status_code=403, content={"error": "Not permitted."})
+    # Only this account's live local sessions are tabs here. Inbound linked
+    # sessions are owned by another panel, and another account's session id is
+    # not this caller's to see or reattach to.
     return {"sessions": [
         {"id": sid, "persist": mt.persist, "alive": not mt.dead,
          "rows": mt.rows, "cols": mt.cols, "created": int(mt.created)}
         for sid, mt in _TERMS.items()
-        if not str(getattr(mt, "owner", "")).startswith("merge:")]}
+        if not mt.dead and str(getattr(mt, "owner", "")) == username
+        and not str(getattr(mt, "owner", "")).startswith("merge:")]}
+
+async def _term_pump_out(websocket: WebSocket, q: asyncio.Queue):
+    """Forward PTY output to the browser, then close the socket.
+
+    The reader queues None when the shell exits, and a send can fail when the
+    browser is gone. Either way the handler's receive loop has nothing left to
+    wait for: closing makes the browser run onclose, and the handler's finally
+    can drop the session instead of holding the fd and the scrollback buffer
+    until the tab is closed. A close that was already sent is harmless.
+    """
+    while True:
+        chunk = await q.get()
+        if chunk is None:
+            try:
+                await websocket.send_bytes(b"\r\n\x1b[90m[session ended]\x1b[0m\r\n")
+            except Exception:
+                pass
+            break
+        try:
+            await websocket.send_bytes(chunk)
+        except Exception:
+            break
+    try:
+        await websocket.close()
+    except Exception:
+        pass
+
 
 @app.websocket("/ws/terminal")
 async def terminal_ws(websocket: WebSocket):
@@ -5837,7 +6027,11 @@ async def terminal_ws(websocket: WebSocket):
         return
     limited = terminal_access == panel_users.TERMINAL_LIMITED
     run_as = perms.get("os_username") if limited else None
-    is_admin = perms.get("role") == "admin"
+    if limited and not run_as:
+        # Without an OS account there is nothing to jail the shell to, and
+        # PtySession would silently fall back to an unconfined panel-user shell.
+        await websocket.close(code=1008)
+        return
     if limited and not System.jail_available():
         # A limited terminal is meant to be confined to its own home directory.
         # Install what does that rather than quietly handing out a shell that can
@@ -5849,16 +6043,26 @@ async def terminal_ws(websocket: WebSocket):
     qp = websocket.query_params
     sid = (qp.get("sid") or "").strip()[:64]
     persist = (qp.get("persist") or "") in ("1", "true", "yes", "on")
-    rows = _safe_int(qp.get("rows"), 24)
-    cols = _safe_int(qp.get("cols"), 80)
+    rows, cols = _clamp_term_dims(qp.get("rows"), qp.get("cols"))
     mt = _TERMS.get(sid) if sid else None
+    if mt is not None and mt.owner != username:
+        # A session belongs to the account that opened it, admin included.
+        # Guessing or reusing somebody else's sid is refused rather than
+        # answered with a fresh session whose id the caller never learns.
+        await websocket.close(code=1008)
+        return
     if mt is not None and mt.dead:
         _term_close(sid)
         mt = None
-    if mt is not None and not is_admin and mt.owner != username:
-        # A restricted user cannot attach to someone else's terminal by
-        # guessing/reusing a session id, so start a fresh one instead.
-        sid = secrets.token_hex(8)
+    if (mt is not None
+            and not str(getattr(mt, "owner", "")).startswith("merge:")
+            and (mt.run_as != run_as
+                 or bool(getattr(mt, "jail", False)) != limited)):
+        # The terminal grant changed since this shell was opened. A narrowed
+        # account must not keep a privileged PTY just by reconnecting, so close
+        # it and spawn under the privilege resolved for this connection, keeping
+        # the same sid so the browser reconnects cleanly.
+        _term_close(sid)
         mt = None
     if mt is None:
         if not sid:
@@ -5872,39 +6076,35 @@ async def terminal_ws(websocket: WebSocket):
             return
         _TERMS[sid] = mt
     else:
-        mt.persist = persist
-        # Re-attaching to a session that outlived its first browser: the PTY
-        # still has the old size, so take the one the connecting view reports.
-        mt.resize(rows, cols)
+        if persist and not mt.persist:
+            # Attaching must not downgrade Stay. The window that asked for it
+            # is not the one that just connected, and only an explicit persist
+            # control message may turn it off.
+            mt.persist = True
+        # Re-attaching to a session that outlived its first browser: only take
+        # the connecting view's size when nobody else is watching. Resizing a
+        # pty another browser is actively using would reflow its screen.
+        if not mt.subscribers:
+            mt.resize(rows, cols)
+    # Snapshot the buffer and subscribe in one synchronous block: the reader
+    # runs on this loop, so nothing can be produced between the two. Output
+    # before the snapshot is replayed once, output after it is only queued.
+    q: asyncio.Queue = asyncio.Queue()
+    snapshot = bytes(mt.buffer)
+    mt.subscribers.add(q)
     try:
         await websocket.send_text(json.dumps({"sid": sid, "persist": mt.persist}))
+        if snapshot:
+            await websocket.send_bytes(snapshot)
     except Exception:
         pass
-    q: asyncio.Queue = asyncio.Queue()
-    mt.subscribers.add(q)
-    if mt.buffer:
-        try:
-            await websocket.send_bytes(bytes(mt.buffer))
-        except Exception:
-            pass
 
-    async def pump_out():
-        while True:
-            data = await q.get()
-            if data is None:
-                try:
-                    await websocket.send_bytes(b"\r\n\x1b[90m[session ended]\x1b[0m\r\n")
-                except Exception:
-                    pass
-                return
-            try:
-                await websocket.send_bytes(data)
-            except Exception:
-                return
-
-    out_task = asyncio.create_task(pump_out())
+    out_task = asyncio.create_task(_term_pump_out(websocket, q))
     try:
-        while True:
+        # Those sends awaited, and a revoke or key rotation can close the
+        # session in that window. Re-read the mapping before using it again and
+        # leave nothing waiting on a pty that is already gone.
+        while _TERMS.get(sid) is mt and not mt.dead:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
@@ -5923,15 +6123,24 @@ async def terminal_ws(websocket: WebSocket):
             if not isinstance(ctrl, dict):
                 continue
             if "resize" in ctrl:
-                try:
-                    r, c = ctrl["resize"]
-                    mt.resize(int(r), int(c))
-                except Exception:
-                    pass
+                # A newly opened view fits its own screen and reports that as
+                # "initial". It must not resize a shell another view already
+                # uses; untagged resizes are real local fits and still apply.
+                if not (ctrl.get("initial") and len(mt.subscribers) > 1):
+                    try:
+                        r, c = ctrl["resize"]
+                        mt.resize(*_clamp_term_dims(r, c))
+                    except Exception:
+                        pass
             if "persist" in ctrl:
                 mt.persist = bool(ctrl["persist"])
             if ctrl.get("kill"):
-                _term_close(sid)
+                if not ctrl.get("force") and len(mt.subscribers) > 1:
+                    # Another window is attached to this shell. Closing one
+                    # view of it must not end the session it is using. A
+                    # forced kill (linked server deleted) ends it regardless.
+                    break
+                _term_close_if(sid, mt)
                 break
     except WebSocketDisconnect:
         pass
@@ -5942,7 +6151,7 @@ async def terminal_ws(websocket: WebSocket):
         out_task.cancel()
         kept = mt.persist and not mt.dead
         if not kept and not mt.subscribers:
-            _term_close(sid)
+            _term_close_if(sid, mt)
         write_log("ACTION", "TERMINAL", "PTY session " + ("detached (kept alive)" if kept else "ended"),
                   actor="terminal", ip=_client_ip_ws(websocket), target=f"sid={sid}")
 
@@ -5973,8 +6182,8 @@ async def merge_terminal_ws(websocket: WebSocket):
         await websocket.close(code=1008)
         return
     sid = (websocket.query_params.get("sid") or secrets.token_hex(8)).strip()[:64]
-    rows = _safe_int(websocket.query_params.get("rows"), 24)
-    cols = _safe_int(websocket.query_params.get("cols"), 80)
+    rows, cols = _clamp_term_dims(websocket.query_params.get("rows"),
+                                  websocket.query_params.get("cols"))
     persist = (websocket.query_params.get("persist") or "") in ("1", "true", "yes", "on")
     token = merge_servers.make_server_token(
         server, subject=username, role="admin", scopes=merge_servers.ADMIN_SCOPES,
@@ -5983,6 +6192,8 @@ async def merge_terminal_ws(websocket: WebSocket):
            f"sid=mt_{sid}&rows={rows}&cols={cols}"
            f"&persist={'1' if persist else '0'}")
     await websocket.accept()
+    proxy = _merge_proxy_open(server_id, websocket, sid)
+    remote = None
     try:
         import inspect
         import websockets
@@ -5999,6 +6210,7 @@ async def merge_terminal_ws(websocket: WebSocket):
             url, max_size=None, open_timeout=12, close_timeout=3,
             **{header_kw: {"Authorization": "Bearer " + token}})
     except Exception as e:
+        _merge_proxy_done(proxy)
         logging.warning(f"linked terminal connect failed: {e}")
         try:
             await websocket.send_text(f"\r\n\x1b[31mThat server terminal is unreachable.\x1b[0m\r\n")
@@ -6006,6 +6218,8 @@ async def merge_terminal_ws(websocket: WebSocket):
             pass
         await websocket.close(code=1011)
         return
+
+    proxy.remote = remote
 
     async def browser_to_remote():
         while True:
@@ -6027,9 +6241,14 @@ async def merge_terminal_ws(websocket: WebSocket):
             else:
                 await websocket.send_text(msg)
 
-    tasks = [asyncio.create_task(browser_to_remote()),
-             asyncio.create_task(remote_to_browser())]
+    tasks = []
     try:
+        if proxy.gone:
+            # The row was deleted while this link was still opening. End the
+            # remote shell now instead of leaving it behind the removed server.
+            await _end_merge_proxy(proxy)
+        tasks = [asyncio.create_task(browser_to_remote()),
+                 asyncio.create_task(remote_to_browser())]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
@@ -6049,6 +6268,7 @@ async def merge_terminal_ws(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+        _merge_proxy_done(proxy)
         write_log("ACTION", "TERMINAL", "Linked terminal closed", actor=username,
                   ip=_client_ip_ws(websocket), target=f"server={server_id} sid={sid}")
 
@@ -6070,17 +6290,18 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
         return
     qp = websocket.query_params
     sid = "mr_" + (qp.get("sid") or secrets.token_hex(8)).strip()[:64]
-    rows = _safe_int(qp.get("rows"), 24)
-    cols = _safe_int(qp.get("cols"), 80)
+    rows, cols = _clamp_term_dims(qp.get("rows"), qp.get("cols"))
     persist = (qp.get("persist") or "") in ("1", "true", "yes", "on")
     owner = f"merge:{data.get('iss')}:{data.get('sub')}"
     await websocket.accept()
     mt = _TERMS.get(sid)
+    if mt is not None and mt.owner != owner:
+        # The sid is already bound to a different linked account. Reassigning
+        # it would orphan the original session, so refuse this attachment.
+        await websocket.close(code=1008)
+        return
     if mt is not None and mt.dead:
         _term_close(sid)
-        mt = None
-    if mt is not None and mt.owner != owner:
-        sid = "mr_" + secrets.token_hex(8)
         mt = None
     if mt is None:
         try:
@@ -6091,39 +6312,32 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
             return
         _TERMS[sid] = mt
     else:
-        mt.persist = persist
-        # Re-attaching to a session that outlived its first browser: the PTY
-        # still has the old size, so take the one the connecting view reports.
-        mt.resize(rows, cols)
+        if persist and not mt.persist:
+            # Attaching must not downgrade Stay: only an explicit persist
+            # control message from a view may turn it off.
+            mt.persist = True
+        # Re-attaching to a session that outlived its first browser: only take
+        # the connecting view's size when nobody else is watching. Resizing a
+        # pty another browser is actively using would reflow its screen.
+        if not mt.subscribers:
+            mt.resize(rows, cols)
+    # Snapshot and subscribe in one synchronous block so the replay cannot
+    # overlap the live queue, then send the handshake and that snapshot.
+    q: asyncio.Queue = asyncio.Queue()
+    snapshot = bytes(mt.buffer)
+    mt.subscribers.add(q)
     try:
         await websocket.send_text(json.dumps({"sid": sid, "persist": mt.persist}))
+        if snapshot:
+            await websocket.send_bytes(snapshot)
     except Exception:
         pass
-    q: asyncio.Queue = asyncio.Queue()
-    mt.subscribers.add(q)
-    if mt.buffer:
-        try:
-            await websocket.send_bytes(bytes(mt.buffer))
-        except Exception:
-            pass
 
-    async def pump_out():
-        while True:
-            chunk = await q.get()
-            if chunk is None:
-                try:
-                    await websocket.send_bytes(b"\r\n\x1b[90m[session ended]\x1b[0m\r\n")
-                except Exception:
-                    pass
-                return
-            try:
-                await websocket.send_bytes(chunk)
-            except Exception:
-                return
-
-    out_task = asyncio.create_task(pump_out())
+    out_task = asyncio.create_task(_term_pump_out(websocket, q))
     try:
-        while True:
+        # Re-read the mapping after those awaits: the linked session may have
+        # been closed (revoked, key rotated) while the frames were in flight.
+        while _TERMS.get(sid) is mt and not mt.dead:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
@@ -6142,15 +6356,24 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
             if not isinstance(ctrl, dict):
                 continue
             if "resize" in ctrl:
-                try:
-                    r, c = ctrl["resize"]
-                    mt.resize(int(r), int(c))
-                except Exception:
-                    pass
+                # A newly opened view fits its own screen and reports that as
+                # "initial". It must not resize a shell another view already
+                # uses; untagged resizes are real local fits and still apply.
+                if not (ctrl.get("initial") and len(mt.subscribers) > 1):
+                    try:
+                        r, c = ctrl["resize"]
+                        mt.resize(*_clamp_term_dims(r, c))
+                    except Exception:
+                        pass
             if "persist" in ctrl:
                 mt.persist = bool(ctrl["persist"])
             if ctrl.get("kill"):
-                _term_close(sid)
+                if not ctrl.get("force") and len(mt.subscribers) > 1:
+                    # Another view of this linked shell is attached; closing
+                    # this one must not end the shell it is using. A forced
+                    # kill ends it regardless.
+                    break
+                _term_close_if(sid, mt)
                 break
     except WebSocketDisconnect:
         pass
@@ -6161,7 +6384,7 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
         out_task.cancel()
         kept = mt.persist and not mt.dead
         if not kept and not mt.subscribers:
-            _term_close(sid)
+            _term_close_if(sid, mt)
         write_log("ACTION", "TERMINAL",
                   "Linked PTY " + ("detached (kept alive)" if kept else "ended"),
                   actor=owner, ip=_client_ip_ws(websocket), target=f"sid={sid}")

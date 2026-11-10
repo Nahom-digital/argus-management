@@ -1141,8 +1141,8 @@
   .term-view-panel .tvp-mode:hover { background:var(--gray-100); color:var(--black); }
   .term-view-panel .tvp-mode.active { background:var(--accent); color:#fbf2e2; border-color:transparent; }
   [data-theme="dark"] .term-view-panel .tvp-mode.active { color:#20160c; }
-  .term-grip { position:absolute; right:0; bottom:0; width:18px; height:18px; z-index:5; border:none; padding:0; cursor:nwse-resize; background:linear-gradient(135deg, transparent 42%, var(--gray-400) 43%, var(--gray-400) 50%, transparent 51%, transparent 62%, var(--gray-400) 63%, var(--gray-400) 70%, transparent 71%); opacity:.6; }
-  .term-grip:hover { opacity:1; }
+  .term-grip { position:absolute; right:0; bottom:0; width:10px; height:10px; z-index:5; border:none; padding:0; cursor:nwse-resize; background:linear-gradient(135deg, transparent 35%, var(--gray-500) 36%, var(--gray-500) 44%, transparent 45%, transparent 55%, var(--gray-500) 56%, var(--gray-500) 64%, transparent 65%); opacity:.35; }
+  .term-grip:hover, .term-grip:focus-visible { opacity:.9; }
   body.term-expanded { overflow:hidden; }
   body.mgmt.term-expanded .mgmt-top,
   body.mgmt.term-expanded .mobile-tabbar,
@@ -1151,11 +1151,22 @@
   body.term-expanded .term-canvas { background:#0c0c0c; }
   body.term-expanded .term-stack { width:100%; height:100%; min-width:0; min-height:0; }
   body.term-expanded .term-grip { display:none; }
+  body.term-fs-open .term-grip { display:none; }
   .term-close:hover { color:var(--danger); border-color:var(--danger); }
   /* Fullscreen terminal. The API path uses the top layer; the term-fs class is
      the fallback for webviews that refuse requestFullscreen. */
   .term-wrap:fullscreen, .term-wrap:-webkit-full-screen { position:fixed; inset:0; width:100%; height:100%; }
   .term-wrap.term-fs { position:fixed; inset:0; z-index:3200; width:100%; height:100%; }
+  /* The split rules above are more specific than :fullscreen and .term-fs, and
+     would keep a pane inside the flex row/column. In either split layout the
+     fullscreen pane has to leave the flow and cover the viewport, or the
+     fallback covers nothing while body.term-fs-open still blocks scrolling. */
+  .term-stack.term-split .term-wrap:fullscreen,
+  .term-stack.term-split .term-wrap:-webkit-full-screen,
+  .term-stack.term-split .term-wrap.term-fs {
+    position:fixed; inset:0; flex:none; width:100%; height:100%;
+    max-width:none; max-height:none;
+  }
   body.term-fs-open { overflow:hidden; }
 
   /* Floating "Copy" button that appears next to a terminal text selection. */

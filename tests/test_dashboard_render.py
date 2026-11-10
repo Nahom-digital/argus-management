@@ -339,6 +339,10 @@ def test_the_terminal_has_a_fullscreen_toggle():
     for cls in (".term-wrap:fullscreen", ".term-wrap.term-fs",
                 "body.term-fs-open", ".term-clear.t-full"):
         assert cls in css, cls
+    # The split pane rule outranks :fullscreen and .term-fs, so fullscreen needs
+    # its own higher-specificity rules or it stays inside the flex row/column.
+    assert ".term-stack.term-split .term-wrap:fullscreen" in css
+    assert ".term-stack.term-split .term-wrap.term-fs" in css
 
 
 def test_the_terminal_has_zoom_resize_layout_and_auto_copy():
@@ -355,6 +359,9 @@ def test_the_terminal_has_zoom_resize_layout_and_auto_copy():
                  "t-expand", "t-ratio", "data-term-layout",
                  "resize:[tab.term.rows,tab.term.cols]"):
         assert text in js, text
+    # The fitted grid is stretched across the whole host, so changing width,
+    # height or aspect never leaves a black area beside the terminal.
+    assert "const W=host.clientWidth, H=host.clientHeight;" in js
 
     css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
     for cls in (".term-canvas", ".term-view-panel", ".term-grip",
@@ -367,6 +374,51 @@ def test_the_terminal_has_zoom_resize_layout_and_auto_copy():
     page_markup = (ROOT / "panel.py").read_text(encoding="utf-8")
     assert 'id="term-canvas"' in page_markup
     assert 'id="term-grip"' in page_markup
+
+
+def test_a_single_tab_split_shrinks_the_axis_it_splits():
+    """Side by side means less width; stacked means less height. A single tab
+    has nothing to split, so the chosen mode only shrinks that one axis."""
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    start = js.index("function termSetLayout")
+    body = js[start:js.index("function termResetView")]
+    assert ("layout==='horizontal'" in body
+            and "termView.width=72; termView.height=100;" in body)
+    assert ("layout==='vertical'" in body
+            and "termView.width=100; termView.height=72;" in body)
+    # Switching back to single restores both axes.
+    assert "termView.width=100; termView.height=100;" in body
+
+
+def test_manual_reconnect_focuses_only_the_socket_it_replaced():
+    """The Reconnect button leaves focus on itself, so typing goes nowhere.
+    The replacement socket focuses the terminal once it is really open, and
+    auto reconnects never ask for focus."""
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    reconnect = js[js.index("function termTabReconnect"):
+                   js.index("function openRemoteTerminal")]
+    assert "tab._focusOnOpen=!!tab.ws;" in reconnect
+
+    opened = js[js.index("ws.onopen=()=>{ if(tab.ws!==ws) return;"):
+                 js.index("ws.onmessage=ev=>")]
+    assert "if(tab._focusOnOpen)" in opened
+    assert "tab.term.focus();" in opened
+
+    auto = js[js.index("function termEnsureConnected"):
+              js.index("function termTabConnect")]
+    assert "_focusOnOpen" not in auto
+
+
+def test_the_terminal_grip_is_a_small_corner_handle():
+    """The hint bar used to keep the grip clear of text. With it gone, the
+    handle has to be small and faint, and still hidden when the view expands."""
+    css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")
+    line = next(l for l in css.splitlines()
+                if l.strip().startswith(".term-grip {"))
+    assert "width:10px" in line and "height:10px" in line
+    assert "opacity:.35" in line
+    assert "body.term-expanded .term-grip" in css
+    assert "body.term-fs-open .term-grip" in css
 
 
 def test_the_network_endpoint_forwards_the_established_filter(client, monkeypatch):
@@ -430,3 +482,27 @@ def test_a_linked_panel_with_a_different_version_is_warned_about(client):
     for cls in (".merge-version-warn", ".remote-version-warn",
                 ".save-feedback.warn"):
         assert cls in css, cls
+
+
+def test_terminal_tabs_and_sockets_are_scoped_and_guarded():
+    """One browser key for tabs leaked the previous account's sids after a
+    logout/login. A socket superseded by Reconnect or Close must not act on the
+    tab, Stay toggled while connecting is sent on open, auto-reconnect resets
+    once before the scrollback replay, and closing during CONNECTING still
+    kills the shell the server spawned."""
+    js = (ROOT / "static_mgmt" / "management.js").read_text(encoding="utf-8")
+    assert "management_terminals:" in js
+    assert "function termStoreKey(){ return TERM_STORE_PREFIX+termUserKey(); }" in js
+    assert "localStorage.getItem(TERM_STORE_KEY)" not in js
+    assert "localStorage.setItem(TERM_STORE_KEY" not in js
+    # Every handler of a live socket checks that it still owns the tab.
+    assert js.count("if(tab.ws!==ws) return;") >= 3
+    assert "_persistDirty" in js
+    assert "_needsReset" in js
+    assert "_pendingClose" in js
+    # Select mode remembers the app's own protocol through xterm's event and
+    # keeps the forced NONE out of that memory.
+    assert "_mouseSub=core.onProtocolChange" in js
+    assert "_forcingNone" in js
+    assert "_appMouseProtocol" in js
+    assert "term._core.coreMouseService" in js

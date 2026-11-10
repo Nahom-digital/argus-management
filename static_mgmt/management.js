@@ -3825,11 +3825,17 @@ async function unblockWebIp(ip,btn){ btn.disabled=true; btn.textContent='…';
   catch{ btn.disabled=false; btn.textContent='Error'; } }
 
 /* ================= TERMINAL (xterm.js PTY, multi-session) ================= */
-const TERM_STORE_KEY='management_terminals';
+/* Tabs and view settings are per account. One browser can be logged into
+   another panel user, and a tab list is that user's sessions, not the
+   browser's. The old global tab key is not migrated: it carries no owner, so
+   there is no way to know whose sids it holds. */
+const TERM_STORE_PREFIX='management_terminals:';
 const TERM_VIEW_PREFIX='management_terminal_view:';
 const TERM_VIEW_DEFAULT={zoom:100,width:100,height:100,layout:'single',ratio:'free'};
 const termTabs=[]; let activeSid=null, termViewReady=false, termLibLoading=null;
-function termViewKey(){ return TERM_VIEW_PREFIX+(((window.MGMT_PERMS||{}).username)||'guest'); }
+function termUserKey(){ return ((window.MGMT_PERMS||{}).username)||'guest'; }
+function termViewKey(){ return TERM_VIEW_PREFIX+termUserKey(); }
+function termStoreKey(){ return TERM_STORE_PREFIX+termUserKey(); }
 function termViewLoad(){
   let saved=null; try{ saved=JSON.parse(localStorage.getItem(termViewKey())); }catch(e){}
   const v=Object.assign({},TERM_VIEW_DEFAULT,saved||{});
@@ -3940,13 +3946,17 @@ function termFillDisplayBox(tab){
   const gridW=screen?screen.offsetWidth:term.cols*dims.css.cell.width;
   const gridH=screen?screen.offsetHeight:term.rows*dims.css.cell.height;
   if(gridW<1||gridH<1) return;
+  /* Stretch the fitted grid across the whole host, not just the display box.
+     Width, height and aspect choose the grid shape (columns and rows); the
+     contents then stretch to fill the pane, so there is no black area beside
+     or below the terminal. */
   const W=host.clientWidth, H=host.clientHeight;
   if(W<2||H<2) return;
   const offX=screen?screen.offsetLeft:0, offY=screen?screen.offsetTop:0;
   const sx=W/gridW, sy=H/gridH;
   const tx=-offX*sx, ty=-offY*sy;
-  if(box._sx!==sx||box._sy!==sy){
-    box._sx=sx; box._sy=sy;
+  if(box._sx!==sx||box._sy!==sy||box._tx!==tx||box._ty!==ty){
+    box._sx=sx; box._sy=sy; box._tx=tx; box._ty=ty;
     box.style.transform='translate('+tx+'px, '+ty+'px) scale('+sx+', '+sy+')';
   }
   term._stretchX=sx; term._stretchY=sy;
@@ -3962,7 +3972,7 @@ function termSetRatio(ratio){
 function termApplyLayout(){
   if(termView.layout!=='single'){
     termTabs.forEach(tab=>{ if(!tab.built) termBuildPanel(tab); });
-    termTabs.forEach(tab=>{ if(!tab.ws) termTabConnect(tab); });
+    termTabs.forEach(tab=>{ if(!tab.ws) termEnsureConnected(tab); });
   }
   const stack=$('term-stack');
   if(stack){
@@ -3981,8 +3991,9 @@ function termSetLayout(layout){
   const wasSplit=termView.layout==='horizontal'||termView.layout==='vertical';
   termView.layout=(layout==='horizontal'||layout==='vertical')?layout:'single';
   if(termTabs.length<2){
-    if(layout==='horizontal'){ termView.width=100; termView.height=72; termView.ratio='free'; }
-    else if(layout==='vertical'){ termView.width=72; termView.height=100; termView.ratio='free'; }
+    /* Side by side shrinks width; stacked shrinks height. */
+    if(layout==='horizontal'){ termView.width=72; termView.height=100; termView.ratio='free'; }
+    else if(layout==='vertical'){ termView.width=100; termView.height=72; termView.ratio='free'; }
     else if(wasSplit){ termView.width=100; termView.height=100; termView.ratio='free'; }
   }
   termViewSave(); termApplyView(false,false); termApplyLayout(); termSyncAllViewControls();
@@ -4018,20 +4029,42 @@ function termSetExpanded(on){
   setTimeout(()=>{ termRefreshDisplay(); termTabs.forEach(tab=>{ if(tab.els&&tab.els.wrap.style.display!=='none') termFitWhenReady(tab,40,false); }); },80);
 }
 function termToggleExpand(){ termSetExpanded(!termView.expanded); }
+/* While select mode is on, force the app's mouse protocol to NONE. The guard
+   keeps the forced NONE from being remembered as the app's own request. */
+function termForceSelectNone(tab,core){
+  if(!core||core.activeProtocol==='NONE') return;
+  tab._forcingNone=true;
+  try{ core.activeProtocol='NONE'; }catch(e){} finally{ tab._forcingNone=false; }
+}
+function termWatchMouseProtocol(tab,core){
+  if(!core||typeof core.onProtocolChange!=='function'||tab._mouseSub) return;
+  /* Apps like pi and opencode re-send the mouse-enable sequence while they
+     draw. Remembering their latest request and forcing NONE back keeps the
+     screen selectable instead of silently switching to app mouse reporting
+     under a button that still says Select. */
+  tab._mouseSub=core.onProtocolChange(()=>{
+    if(!tab._selectMode||tab._forcingNone) return;
+    tab._appMouseProtocol=core.activeProtocol||'NONE';
+    termForceSelectNone(tab,core);
+  });
+}
 function termToggleSelectMode(tab){
   const term=tab&&tab.term;
   const core=term&&term._core&&term._core.coreMouseService;
   if(!core) return;
   if(!tab._selectMode){
-    tab._savedMouseProtocol=core.activeProtocol||'NONE';
+    tab._appMouseProtocol=core.activeProtocol||'NONE';
     tab._selectMode=true;
-    if(core.activeProtocol!=='NONE') core.activeProtocol='NONE';
+    termForceSelectNone(tab,core);
     appToast('Mouse selection on. Drag over text to select it. Click Select again to restore app mouse control.','info',4600);
   }else{
     tab._selectMode=false;
-    const restore=tab._savedMouseProtocol||'NONE';
-    tab._savedMouseProtocol=null;
-    if(core.activeProtocol!==restore) core.activeProtocol=restore;
+    const restore=tab._appMouseProtocol||'NONE';
+    tab._appMouseProtocol=null;
+    if(core.activeProtocol!==restore){
+      tab._forcingNone=true;
+      try{ core.activeProtocol=restore; }catch(e){} finally{ tab._forcingNone=false; }
+    }
   }
   termSyncViewControls(tab);
   try{ term.focus(); }catch(e){}
@@ -4084,8 +4117,8 @@ function ensureTermLib(){
 }
 function genSid(){ const a=new Uint8Array(8); (window.crypto||window.msCrypto).getRandomValues(a); return Array.from(a,b=>b.toString(16).padStart(2,'0')).join(''); }
 function termGetTab(sid){ return termTabs.find(t=>t.sid===sid)||null; }
-function termStoreSave(){ try{ localStorage.setItem(TERM_STORE_KEY,JSON.stringify(termTabs.filter(t=>!t.server).map(t=>({sid:t.sid,name:t.name,persist:t.persist})))); }catch(e){} }
-function termStoreLoad(){ try{ return JSON.parse(localStorage.getItem(TERM_STORE_KEY))||[]; }catch(e){ return []; } }
+function termStoreSave(){ try{ localStorage.setItem(termStoreKey(),JSON.stringify(termTabs.filter(t=>!t.server).map(t=>({sid:t.sid,name:t.name,persist:t.persist})))); }catch(e){} }
+function termStoreLoad(){ try{ return JSON.parse(localStorage.getItem(termStoreKey()))||[]; }catch(e){ return []; } }
 function termMakeTab(sid,name,persist){ return {sid,name:name||('Terminal '+(termTabs.length+1)),persist:!!persist,term:null,fit:null,ws:null,els:null,built:false}; }
 let termInitPromise=null;
 function initTerminal(){
@@ -4119,8 +4152,27 @@ function termRenderTabs(){
 function termAddTab(){ const tab=termMakeTab(genSid(),null,false); termTabs.push(tab); termRenderTabs(); termStoreSave(); termActivate(tab.sid); }
 function termCloseTab(sid){
   const idx=termTabs.findIndex(t=>t.sid===sid); if(idx<0) return; const tab=termTabs[idx];
-  try{ if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(JSON.stringify({kill:true})); }catch(e){}
-  if(tab.ws){ try{ tab.ws.onclose=null; tab.ws.close(); }catch(e){} }
+  if(tab.ws){
+    const ws=tab.ws;
+    if(ws.readyState===WebSocket.OPEN) termKillSocket(ws);
+    else if(ws.readyState===WebSocket.CONNECTING){
+      /* The server may still be spawning a shell this browser has not
+         attached to yet. Closing the handshake cancels it and can leave a
+         Stay-on shell behind with no tab that knows its sid, so keep only
+         onopen and kill the shell as soon as the socket is up. This also
+         covers a socket that opens after the tab was removed. */
+      tab._pendingClose=true;
+      ws.onmessage=null; ws.onclose=null; ws.onerror=null;
+      ws.onopen=()=>{
+        if(!tab._pendingClose) return;
+        tab._pendingClose=false;
+        termKillSocket(ws);
+      };
+    }else termCloseSocket(ws);
+    tab.ws=null;
+  }
+  termDropRetiring(tab);
+  if(tab._mouseSub){ try{ tab._mouseSub.dispose(); }catch(e){} tab._mouseSub=null; }
   if(tab._ro){ try{ tab._ro.disconnect(); }catch(e){} tab._ro=null; }
   if(tab.term){ try{ tab.term.dispose(); }catch(e){} }
   if(tab.els&&tab.els.wrap){
@@ -4145,7 +4197,7 @@ function termActivate(sid){
   if(!tab.built) termBuildPanel(tab);
   termApplyLayout();
   termRenderTabs(); termSyncViewControls(tab); termFitWhenReady(tab);
-  if(!tab.ws) termTabConnect(tab);
+  termEnsureConnected(tab);
 }
 function termScaledPoint(svc,event,element,sx,sy){
   const rect=element.getBoundingClientRect();
@@ -4217,6 +4269,16 @@ function termSyncFullscreenButton(tab){
 function termFallbackFullscreen(tab,on){
   const wrap=tab&&tab.els&&tab.els.wrap; if(!wrap) return;
   _hideTermCopyBtn();
+  if(on){
+    /* Only the pane that asked is fullscreen: a second fixed pane would sit on
+       top of it and hold the scroll lock after the first one exits. */
+    termTabs.forEach(t=>{
+      if(t!==tab&&t.els&&t.els.wrap.classList.contains('term-fs')){
+        t.els.wrap.classList.remove('term-fs');
+        termSyncFullscreenButton(t);
+      }
+    });
+  }
   wrap.classList.toggle('term-fs',!!on);
   document.body.classList.toggle('term-fs-open',!!on);
   termSyncFullscreenButton(tab);
@@ -4239,8 +4301,19 @@ function termToggleFullscreen(tab){
 }
 function termSyncAllFullscreenButtons(){
   _hideTermCopyBtn();
-  termTabs.forEach(tab=>termSyncFullscreenButton(tab));
-  setTimeout(termFitActive,60);
+  const fs=termFsElement();
+  let fallback=false;
+  termTabs.forEach(tab=>{
+    const wrap=tab.els&&tab.els.wrap; if(!wrap) return;
+    /* A native fullscreen pane replaces the fallback one, so drop the class
+       from the others instead of leaving them fixed (and scroll-locked). */
+    if(fs&&wrap!==fs&&wrap.classList.contains('term-fs')) wrap.classList.remove('term-fs');
+    if(wrap.classList.contains('term-fs')) fallback=true;
+    termSyncFullscreenButton(tab);
+  });
+  document.body.classList.toggle('term-fs-open',fallback);
+  setTimeout(()=>{ const tab=fs?termTabs.find(t=>t.els&&t.els.wrap===fs):null;
+    if(tab) termFitWhenReady(tab,40,false); else termFitActive(); },60);
 }
 document.addEventListener('fullscreenchange',termSyncAllFullscreenButtons);
 document.addEventListener('webkitfullscreenchange',termSyncAllFullscreenButtons);
@@ -4293,7 +4366,14 @@ function termBuildPanel(tab){
   const screenBox=document.createElement('div'); screenBox.className='term-screen-box'; host.appendChild(screenBox);
   tab.els={wrap,host,status,stay,screenBox};
   termApplyDisplayBox(tab);
-  stay.addEventListener('change',()=>{ tab.persist=stay.checked; try{ if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(JSON.stringify({persist:tab.persist})); }catch(e){} termStoreSave(); termRenderTabs(); });
+  stay.addEventListener('change',()=>{
+    tab.persist=stay.checked;
+    if(tab.ws&&tab.ws.readyState===WebSocket.OPEN){
+      try{ tab.ws.send(JSON.stringify({persist:tab.persist})); }catch(e){}
+      tab._persistDirty=false;
+    }else tab._persistDirty=true;  /* sent from onopen, once the socket is up */
+    termStoreSave(); termRenderTabs();
+  });
   wrap.querySelector('.t-copy').onclick=()=>termCopySelection(tab);
   wrap.querySelector('.t-clear').onclick=()=>{ if(tab.term){ tab.term.clear(); tab.term.focus(); } };
   wrap.querySelector('.t-recon').onclick=()=>termTabReconnect(tab);
@@ -4326,8 +4406,9 @@ function termBuildPanel(tab){
     theme:isDark?{background:'#000000',foreground:'#e0e0e0',cursor:'#7ee787'}:{background:'#0c0c0c',foreground:'#e0e0e0',cursor:'#7ee787'}});
   const fit=new window.FitAddon.FitAddon(); term.loadAddon(fit); term.open(screenBox);
   termPatchMouseMapping(term);
+  termWatchMouseProtocol(tab,term._core&&term._core.coreMouseService);
   term.onData(d=>{ if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(new TextEncoder().encode(d)); });
-  term.onResize(({rows,cols})=>{ if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(JSON.stringify({resize:[rows,cols]})); });
+  term.onResize(({rows,cols})=>{ if(tab._suppressResize) return; if(tab.ws&&tab.ws.readyState===WebSocket.OPEN) tab.ws.send(JSON.stringify({resize:[rows,cols]})); });
   term.onSelectionChange(()=>{
     const selected=term.hasSelection()?term.getSelection():'';
     if(selected) term._lastSelection=selected;
@@ -4348,6 +4429,37 @@ function termBuildPanel(tab){
     tab._ro.observe(host); tab._ro.observe(wrap);
   }
 }
+function termDetachSocket(ws){
+  if(!ws) return;
+  ws.onopen=null; ws.onmessage=null; ws.onclose=null; ws.onerror=null;
+}
+function termCloseSocket(ws){
+  if(!ws) return;
+  termDetachSocket(ws);
+  try{ ws.close(); }catch(e){}
+}
+/* Ask the server to end this tab's shell before dropping the socket. */
+function termKillSocket(ws){
+  if(!ws) return;
+  try{ if(ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({kill:true})); }catch(e){}
+  termCloseSocket(ws);
+}
+/* The old socket of a manual Reconnect is closed once the replacement is up. */
+function termDropRetiring(tab){
+  const old=tab&&tab._retiring; if(!old) return;
+  tab._retiring=null;
+  termCloseSocket(old);
+}
+/* Auto-reconnect: the server replays its scrollback, so reset once first or
+   switching away and back would append the same output to the old screen. */
+function termEnsureConnected(tab){
+  if(!tab||tab.ws) return;
+  if(tab._needsReset){
+    tab._needsReset=false;
+    if(tab.term) try{ tab.term.reset(); }catch(e){}
+  }
+  termTabConnect(tab);
+}
 function termTabConnect(tab){
   if(tab.ws&&(tab.ws.readyState===WebSocket.OPEN||tab.ws.readyState===WebSocket.CONNECTING)) return;
   termSetStatus(tab,'connecting…');
@@ -4357,17 +4469,73 @@ function termTabConnect(tab){
     ? '/ws/merge-terminal?server='+encodeURIComponent(tab.server)+'&'+qs.slice(1)
     : '/ws/terminal'+qs;
   const ws=new WebSocket(proto+'://'+location.host+BASE+path); ws.binaryType='arraybuffer'; tab.ws=ws;
-  ws.onopen=()=>{ termSetStatus(tab,'connected','ok'); termFit(tab);
+  /* Every handler checks that it still owns the tab: a socket replaced by a
+     Reconnect or a Close must never write, refit, or mark the tab connected. */
+  ws.onopen=()=>{ if(tab.ws!==ws) return;
+    if(tab._pendingClose){
+      tab._pendingClose=false; termKillSocket(ws); return;
+    }
+    termSetStatus(tab,'connected','ok');
+    /* The fit below can fire onResize, and a second view must not resize a
+       shell another view is using. Suppress those, and send the explicit
+       onopen size tagged initial so the server can ignore it when shared. */
+    tab._suppressResize=true;
+    try{ termFit(tab); } finally{ tab._suppressResize=false; }
+    /* A manual Reconnect can be followed by typing straight away, so put the
+       cursor back only when that replacement socket is really open. Auto and
+       background reconnects never set the flag, so they do not steal focus. */
+    if(tab._focusOnOpen){
+      tab._focusOnOpen=false;
+      if(tab.els&&tab.els.wrap.style.display!=='none'&&tab.term){
+        try{ tab.term.focus(); }catch(e){}
+      }
+    }
     /* Fit before the socket opens cannot send anything: onResize fired while
        tab.ws was still null. A session that was already running keeps its old
        PTY size, and re-fitting now is a no-op, so the shell is never told the
        real grid. Send the current size explicitly on every open. */
-    if(tab.term){ try{ ws.send(JSON.stringify({resize:[tab.term.rows,tab.term.cols]})); }catch(e){} } };
-  ws.onmessage=ev=>{ if(typeof ev.data==='string'){ try{ JSON.parse(ev.data); }catch(e){ tab.term.write(ev.data); } return; } tab.term.write(new Uint8Array(ev.data)); };
-  ws.onclose=()=>{ termSetStatus(tab,'disconnected','dead'); if(tab.term) tab.term.write('\r\n\x1b[90m[disconnected, press Reconnect]\x1b[0m\r\n'); if(tab.ws===ws) tab.ws=null; };
-  ws.onerror=()=>termSetStatus(tab,'error','dead');
+    if(tab.term){ try{ ws.send(JSON.stringify({resize:[tab.term.rows,tab.term.cols],initial:true})); }catch(e){} }
+    /* Stay was toggled while this socket was still connecting: localStorage
+       says on, but the PTY was spawned with the query string's old value.
+       Only a tab that actually toggled sends it, so a second window attaching
+       with Stay off cannot silently turn off a session another window keeps. */
+    if(tab._persistDirty){ tab._persistDirty=false; try{ ws.send(JSON.stringify({persist:!!tab.persist})); }catch(e){} }
+    termDropRetiring(tab);
+  };
+  ws.onmessage=ev=>{ if(tab.ws!==ws||!tab.term) return;
+    if(typeof ev.data==='string'){ try{ JSON.parse(ev.data); }catch(e){ tab.term.write(ev.data); } return; }
+    tab.term.write(new Uint8Array(ev.data)); };
+  ws.onclose=()=>{ if(tab.ws!==ws) return;
+    tab.ws=null;
+    tab._focusOnOpen=false;
+    tab._needsReset=true;
+    termSetStatus(tab,'disconnected','dead');
+    if(tab.term) try{ tab.term.write('\r\n\x1b[90m[disconnected, press Reconnect]\x1b[0m\r\n'); }catch(e){}
+    termDropRetiring(tab);
+  };
+  ws.onerror=()=>{ if(tab.ws!==ws) return; termSetStatus(tab,'error','dead'); };
 }
-function termTabReconnect(tab){ if(tab.ws){ try{ tab.ws.onclose=null; tab.ws.close(); }catch(e){} tab.ws=null; } if(tab.term) tab.term.reset(); termTabConnect(tab); }
+function termTabReconnect(tab){
+  if(!tab) return;
+  const old=tab.ws;
+  if(old) termDetachSocket(old);
+  termDropRetiring(tab);
+  tab.ws=null;
+  tab._needsReset=false; tab._pendingClose=false;
+  tab._focusOnOpen=false;
+  if(tab.term) try{ tab.term.reset(); }catch(e){}
+  termTabConnect(tab);
+  /* Only remember the request when a replacement socket actually exists. */
+  tab._focusOnOpen=!!tab.ws;
+  if(!old) return;
+  if(!tab.ws){ termCloseSocket(old); return; }
+  /* Keep the old socket open until the replacement is actually connected.
+     The server ends a Stay-off shell when its last subscriber goes away, and
+     the replacement has not subscribed yet, so closing first would lose the
+     shell in the gap. Its handlers are already detached, so it cannot write
+     or refit the tab in the meantime. */
+  tab._retiring=old;
+}
 
 /* A linked terminal is opened from the Server page. The browser still only
    talks to this panel; the local proxy holds the server key. */

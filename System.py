@@ -16,11 +16,13 @@ import re
 import sys
 import time
 import shlex
+import select
 import platform
 import shutil
 import subprocess
 import logging
 import threading
+from collections import deque
 from datetime import datetime
 
 # --- Server launch defaults ---------------------------------------------------
@@ -743,6 +745,61 @@ def _jail_command(home, rc_path):
     return args
 
 
+# A limited terminal must not inherit the panel's own environment: DB.py loads
+# .env into os.environ, so `env` in a staff shell would print DB_PASSWORD. Only
+# these names are copied across, plus the values set in limited_child_env().
+_LIMITED_ENV_PASSTHROUGH = ("TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_JAIL_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+
+
+def _admin_child_env(base=None):
+    """The full environment an admin terminal has always started with."""
+    env = dict(os.environ if base is None else base)
+    env.update({
+        "TERM": "xterm-256color",
+        "COLORTERM": "truecolor",
+        "LANG": env.get("LANG") or "C.UTF-8",
+        # Make the project's bundled `claude` and vendored bins reachable.
+        "PATH": _PROJECT_DIR + os.pathsep
+                + os.path.join(_PROJECT_DIR, "vendor", "bin") + os.pathsep
+                + env.get("PATH", _SYSTEM_PATH),
+    })
+    return env
+
+
+def limited_child_env(run_as, home, base=None, overrides=None, jailed=False):
+    """Build the allowlisted environment for a limited (run_as) shell.
+
+    Nothing is inherited unless it is named here, so DB_*, MGMT_*, SSH_*
+    agents, tokens and cookies in the panel's environment stay out of the
+    child. Pure: base defaults to os.environ but a dict can be passed in tests.
+    """
+    src = os.environ if base is None else base
+    env = {}
+    for key in _LIMITED_ENV_PASSTHROUGH:
+        value = src.get(key)
+        if value:
+            env[key] = value
+    # Same terminal description the limited shell always had: an inherited
+    # TERM of "dumb" (systemd, cron) would break xterm.js controls.
+    env["TERM"] = "xterm-256color"
+    env["COLORTERM"] = "truecolor"
+    env["LANG"] = src.get("LANG") or "C.UTF-8"
+    env["HOME"] = home or "/"
+    env["USER"] = run_as
+    env["LOGNAME"] = run_as
+    env["SHELL"] = src.get("SHELL") or "/bin/bash"
+    env["PATH"] = _JAIL_PATH if jailed else _SYSTEM_PATH
+    if overrides:
+        env.update(overrides)
+    if jailed:
+        # The panel's own directory is not in the sandbox, so leaving it on
+        # PATH would only produce commands that are not there.
+        env["PATH"] = _JAIL_PATH
+    return env
+
+
 class PtySession:
     """A login shell running on its own pseudo-terminal.
 
@@ -752,6 +809,7 @@ class PtySession:
     """
 
     SHELL = ["bash", "-il"]  # interactive login shell -> reads profile, shows prompt
+    WRITE_QUEUE_MAX = 4 * 1024 * 1024  # bound a shell that has stopped reading
 
     def __init__(self, cwd=None, env=None, run_as=None, jail=False):
         self.cwd = cwd or _PROJECT_DIR
@@ -763,6 +821,15 @@ class PtySession:
         self.jailed = False   # whether the namespace actually took
         self.pid = None
         self.fd = None
+        # Browser input is queued and written by a daemon thread. os.write() on
+        # a pty whose reader has stopped fills the kernel buffer and blocks;
+        # doing that on the event loop would freeze every terminal and request.
+        self._wcond = threading.Condition()
+        self._wqueue = deque()
+        self._wbytes = 0
+        self._wclosed = False
+        self._writer = None
+        self._closed = False
 
     def _drop_privileges(self):
         """Runs in the forked child, still as root: switch to self.run_as before
@@ -818,24 +885,8 @@ class PtySession:
                     os.chdir(_PROJECT_DIR if not self.run_as else "/")
                 except Exception:
                     pass
-            env = dict(os.environ)
-            env.update({
-                "TERM": "xterm-256color",
-                "COLORTERM": "truecolor",
-                "LANG": env.get("LANG") or "C.UTF-8",
-                # Make the project's bundled `claude` and vendored bins reachable.
-                "PATH": _PROJECT_DIR + os.pathsep
-                        + os.path.join(_PROJECT_DIR, "vendor", "bin") + os.pathsep
-                        + env.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
-            })
-            if self.run_as:
-                env.update({"HOME": home or "/", "USER": self.run_as, "LOGNAME": self.run_as})
-            if self.env:
-                env.update(self.env)
+            env = self.child_env(home=home)
             if self.jail:
-                # The panel's own directory is not in the sandbox, so leaving it
-                # on PATH would only produce commands that are not there.
-                env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
                 argv = self._jail_argv(home or "/", rc_path)
                 try:
                     os.execvpe(argv[0], argv, env)
@@ -852,39 +903,140 @@ class PtySession:
         else:
             self.pid = pid
             self.fd = fd
+            # The parent side never blocks: the event loop reads when notified
+            # and the writer thread handles a full pty send buffer.
+            try:
+                os.set_blocking(fd, False)
+            except OSError as e:
+                logging.warning(f"could not make the pty non-blocking: {e}")
             self.set_winsize(rows, cols)
+            self._start_writer(fd)
             return self
 
     def set_winsize(self, rows, cols):
-        """Tell the pty its window size so full-screen TUIs lay out correctly."""
+        """Tell the pty its window size so full-screen TUIs lay out correctly.
+
+        Returns True only when the ioctl succeeded, so callers can tell a
+        rejected size from an applied one instead of assuming it worked.
+        """
         if self.fd is None:
-            return
+            return False
         try:
             import fcntl
             import termios
             import struct
             winsize = struct.pack("HHHH", int(rows), int(cols), 0, 0)
             fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            logging.debug(f"set_winsize failed: {e}")
+            return False
+
+    def child_env(self, home=None, base=None):
+        """The environment the forked shell starts with. Admin sessions keep
+        the panel's full environment; limited sessions get the allowlist."""
+        if not self.run_as:
+            env = _admin_child_env(base)
+            if self.env:
+                env.update(self.env)
+            return env
+        return limited_child_env(self.run_as, home, base=base,
+                                 overrides=self.env, jailed=self.jail)
+
+    def _start_writer(self, fd):
+        self._writer = threading.Thread(target=self._writer_loop, args=(fd,),
+                                        name=f"pty-writer-{self.pid}", daemon=True)
+        self._writer.start()
+
+    def _writer_loop(self, fd):
+        """Drain the queue in order, tolerating partial writes and EAGAIN."""
+        while True:
+            with self._wcond:
+                while not self._wqueue and not self._wclosed:
+                    self._wcond.wait()
+                if self._wclosed:
+                    return
+                data = self._wqueue[0]
+            done = 0
+            while done < len(data):
+                with self._wcond:
+                    if self._wclosed:
+                        return
+                try:
+                    n = os.write(fd, data[done:])
+                except (BlockingIOError, InterruptedError):
+                    n = 0
+                except OSError:
+                    # The shell is gone: nothing will ever read this input.
+                    with self._wcond:
+                        self._wqueue.clear()
+                        self._wbytes = 0
+                        self._wclosed = True
+                    return
+                if n > 0:
+                    done += n
+                    continue
+                try:
+                    select.select([], [fd], [], 0.1)
+                except OSError:
+                    return
+            with self._wcond:
+                if self._wqueue and self._wqueue[0] is data:
+                    self._wqueue.popleft()
+                    self._wbytes -= len(data)
+
+    def _stop_writer(self):
+        """Stop accepting writes and wait for the writer before the fd closes."""
+        with self._wcond:
+            self._wclosed = True
+            self._wqueue.clear()
+            self._wbytes = 0
+            self._wcond.notify_all()
+        writer = self._writer
+        if writer is not None and writer is not threading.current_thread():
+            writer.join(2.0)
+            if writer.is_alive():
+                logging.warning("a pty writer thread did not stop in time")
+        self._writer = None
 
     def write(self, data):
-        """Feed keystrokes (bytes) from the browser into the shell."""
+        """Queue keystrokes (bytes) from the browser for the shell.
+
+        Returns immediately: the public signature is unchanged, but the actual
+        os.write() now happens on the writer thread so a stalled pty cannot
+        block the event loop.
+        """
         if self.fd is None:
             return
         if isinstance(data, str):
             data = data.encode("utf-8", "replace")
-        try:
-            os.write(self.fd, data)
-        except OSError:
-            pass
+        if not data:
+            return
+        with self._wcond:
+            if self._wclosed:
+                return
+            if self._wbytes + len(data) > self.WRITE_QUEUE_MAX:
+                # The shell has stopped reading. Dropping input is better than
+                # letting one session grow the panel's memory without limit.
+                return
+            self._wqueue.append(data)
+            self._wbytes += len(data)
+            self._wcond.notify()
 
     def read(self, max_bytes=65536):
-        """Read available shell output (bytes). Empty bytes => shell exited."""
+        """Read available shell output (bytes).
+
+        b"" means the shell is gone or, on the non-blocking master, that there
+        is nothing to read right now; callers on the event loop should treat
+        BlockingIOError as a no-op rather than EOF. This helper is only kept
+        for compatibility, the panel reads the fd directly.
+        """
         if self.fd is None:
             return b""
         try:
             return os.read(self.fd, max_bytes)
+        except (BlockingIOError, InterruptedError):
+            return b""
         except OSError:
             return b""
 
@@ -899,23 +1051,55 @@ class PtySession:
         except Exception:
             return True
 
-    def close(self):
-        """Terminate the shell and release the pty."""
+    def _reap_shell(self, pid):
+        """Signal and reap one child, on a daemon thread of its own.
+
+        close() used to send three signals with a single non-blocking waitpid
+        between them and then forget the pid, so a shell that outlived that
+        window became a zombie. This polls between signals and ends with a
+        blocking waitpid once SIGKILL has been sent; that wait is on this
+        thread, never the event loop.
+        """
         import signal
-        if self.pid:
-            for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
+        for sig, grace in ((signal.SIGHUP, 0.3), (signal.SIGTERM, 0.3),
+                           (signal.SIGKILL, 1.0)):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
                 try:
-                    os.kill(self.pid, sig)
-                except ProcessLookupError:
-                    break
-                except Exception:
-                    pass
-                try:
-                    wpid, _ = os.waitpid(self.pid, os.WNOHANG)
-                    if wpid != 0:
-                        break
-                except Exception:
-                    break
+                    wpid, _ = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    return   # already reaped elsewhere (alive() or an old close)
+                except OSError:
+                    return
+                if wpid == pid:
+                    return
+                time.sleep(0.02)
+        try:
+            os.waitpid(pid, 0)
+        except (ChildProcessError, OSError):
+            pass
+
+    def close(self):
+        """Terminate the shell and release the pty.
+
+        The writer stops before the fd is closed, and the shell is signalled
+        and reaped on a daemon thread so the caller (the event loop) returns
+        immediately and no zombie is left behind.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_writer()
+        pid = self.pid
+        if pid:
+            threading.Thread(target=self._reap_shell, args=(pid,),
+                             name=f"pty-reaper-{pid}", daemon=True).start()
         if self.fd is not None:
             try:
                 os.close(self.fd)
