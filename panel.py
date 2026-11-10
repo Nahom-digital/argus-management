@@ -5873,6 +5873,9 @@ async def terminal_ws(websocket: WebSocket):
         _TERMS[sid] = mt
     else:
         mt.persist = persist
+        # Re-attaching to a session that outlived its first browser: the PTY
+        # still has the old size, so take the one the connecting view reports.
+        mt.resize(rows, cols)
     try:
         await websocket.send_text(json.dumps({"sid": sid, "persist": mt.persist}))
     except Exception:
@@ -6089,6 +6092,9 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
         _TERMS[sid] = mt
     else:
         mt.persist = persist
+        # Re-attaching to a session that outlived its first browser: the PTY
+        # still has the old size, so take the one the connecting view reports.
+        mt.resize(rows, cols)
     try:
         await websocket.send_text(json.dumps({"sid": sid, "persist": mt.persist}))
     except Exception:

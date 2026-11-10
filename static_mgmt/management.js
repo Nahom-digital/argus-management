@@ -4144,7 +4144,8 @@ function termActivate(sid){
   activeSid=sid; const tab=termGetTab(sid); if(!tab) return;
   if(!tab.built) termBuildPanel(tab);
   termApplyLayout();
-  if(!tab.ws) termTabConnect(tab); termRenderTabs(); termSyncViewControls(tab); termFitWhenReady(tab);
+  termRenderTabs(); termSyncViewControls(tab); termFitWhenReady(tab);
+  if(!tab.ws) termTabConnect(tab);
 }
 function termScaledPoint(svc,event,element,sx,sy){
   const rect=element.getBoundingClientRect();
@@ -4286,7 +4287,7 @@ function termBuildPanel(tab){
       '<button class="term-tool t-view-reset" type="button" title="Reset terminal size and layout">Reset</button>'+
       '<button class="term-tool t-view-close" type="button" title="Close display settings" aria-label="Close display settings">×</button>'+
     '</div>'+
-    '<div class="term-host"></div><div class="term-hint">A real PTY: run <code>top</code>, <code>vim</code>, anything interactive. Select text to copy it automatically. For mouse apps like <code>pi</code> or <code>opencode</code>, turn on <strong>Select</strong>. <strong>Stay on</strong> keeps it alive after you close the site.</div>';
+    '<div class="term-host"></div>';
   stack.appendChild(wrap);
   const host=wrap.querySelector('.term-host'), status=wrap.querySelector('.term-status'), stay=wrap.querySelector('.term-stay input');
   const screenBox=document.createElement('div'); screenBox.className='term-screen-box'; host.appendChild(screenBox);
@@ -4356,7 +4357,12 @@ function termTabConnect(tab){
     ? '/ws/merge-terminal?server='+encodeURIComponent(tab.server)+'&'+qs.slice(1)
     : '/ws/terminal'+qs;
   const ws=new WebSocket(proto+'://'+location.host+BASE+path); ws.binaryType='arraybuffer'; tab.ws=ws;
-  ws.onopen=()=>{ termSetStatus(tab,'connected','ok'); termFit(tab); };
+  ws.onopen=()=>{ termSetStatus(tab,'connected','ok'); termFit(tab);
+    /* Fit before the socket opens cannot send anything: onResize fired while
+       tab.ws was still null. A session that was already running keeps its old
+       PTY size, and re-fitting now is a no-op, so the shell is never told the
+       real grid. Send the current size explicitly on every open. */
+    if(tab.term){ try{ ws.send(JSON.stringify({resize:[tab.term.rows,tab.term.cols]})); }catch(e){} } };
   ws.onmessage=ev=>{ if(typeof ev.data==='string'){ try{ JSON.parse(ev.data); }catch(e){ tab.term.write(ev.data); } return; } tab.term.write(new Uint8Array(ev.data)); };
   ws.onclose=()=>{ termSetStatus(tab,'disconnected','dead'); if(tab.term) tab.term.write('\r\n\x1b[90m[disconnected, press Reconnect]\x1b[0m\r\n'); if(tab.ws===ws) tab.ws=null; };
   ws.onerror=()=>termSetStatus(tab,'error','dead');

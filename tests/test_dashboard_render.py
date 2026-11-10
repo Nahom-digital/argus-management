@@ -352,7 +352,8 @@ def test_the_terminal_has_zoom_resize_layout_and_auto_copy():
                  "_lastSelection", "termToggleSelectMode", "coreMouseService",
                  "termEnsureCanvas", "termApplyDisplayBox", "termFillDisplayBox",
                  "termPatchMouseMapping", "t-zoom-in", "t-copy", "t-select",
-                 "t-expand", "t-ratio", "data-term-layout"):
+                 "t-expand", "t-ratio", "data-term-layout",
+                 "resize:[tab.term.rows,tab.term.cols]"):
         assert text in js, text
 
     css = (ROOT / "static_mgmt" / "dash.css").read_text(encoding="utf-8")

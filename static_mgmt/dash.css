@@ -1121,8 +1121,6 @@
   .term-screen-box .xterm { width:100%; height:100%; padding:0; }
   .term-screen-box .xterm-viewport { scrollbar-width:none; }
   .term-screen-box .xterm-viewport::-webkit-scrollbar { width:0; height:0; }
-  .term-hint { padding:6px 12px; background:var(--gray-50); border-top:1px solid var(--gray-200); font-size:11px; color:var(--gray-500); flex-shrink:0; }
-  .term-hint code { font-family:var(--mono); background:var(--gray-100); padding:1px 5px; border-radius:3px; color:var(--gray-800); }
   .term-clear { padding:5px 12px; border:1px solid var(--gray-200); background:var(--white); border-radius:4px; font-size:11px; cursor:pointer; color:var(--gray-600); flex-shrink:0; display:inline-flex; align-items:center; gap:5px; }
   .term-clear:hover { background:var(--gray-100); color:var(--black); }
   .term-clear .ic { width:12px; height:12px; }
@@ -1152,14 +1150,12 @@
   body.mgmt.term-expanded .pane[data-pane="terminal"] { position:fixed; top:0; left:0; right:0; bottom:0; z-index:2400; background:var(--white); }
   body.term-expanded .term-canvas { background:#0c0c0c; }
   body.term-expanded .term-stack { width:100%; height:100%; min-width:0; min-height:0; }
-  body.term-expanded .term-hint { display:none; }
   body.term-expanded .term-grip { display:none; }
   .term-close:hover { color:var(--danger); border-color:var(--danger); }
   /* Fullscreen terminal. The API path uses the top layer; the term-fs class is
      the fallback for webviews that refuse requestFullscreen. */
   .term-wrap:fullscreen, .term-wrap:-webkit-full-screen { position:fixed; inset:0; width:100%; height:100%; }
   .term-wrap.term-fs { position:fixed; inset:0; z-index:3200; width:100%; height:100%; }
-  .term-wrap:fullscreen .term-hint, .term-wrap:-webkit-full-screen .term-hint, .term-wrap.term-fs .term-hint { display:none; }
   body.term-fs-open { overflow:hidden; }
 
   /* Floating "Copy" button that appears next to a terminal text selection. */
@@ -1277,7 +1273,6 @@
 
     /* Terminal */
     .term-title { display:none; }
-    .term-hint  { font-size: 10px; }
     .term-bar   { flex-wrap: wrap; row-gap: 6px; }
     .term-tools { order:-1; flex-wrap:wrap; }
     .term-tool span { display:none; }
