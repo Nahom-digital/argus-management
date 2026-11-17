@@ -4,7 +4,10 @@ The network side is exercised by hand between two installs; these pin the
 parsing, the token format and the one-directional approval rule that keeps a
 pending or allowed incoming request from silently approving an outgoing link.
 """
+import time
 import uuid
+
+import pytest
 
 import merge_servers
 
@@ -75,18 +78,28 @@ def test_an_expired_token_is_refused():
 
 
 def test_make_server_token_still_works_after_get_server_strips_the_key(db):
-    """Route handlers deliberately read a server without its key. Minting a
-    token has to look the key up instead of assuming the field is present."""
+    """Route handlers deliberately read a server without its key. The bootstrap
+    token (handshake and status) has to look the key up instead of assuming the
+    field is present, while a data token uses this panel's own key."""
     key = "stripped-row-key-" + uuid.uuid4().hex
     server_id = merge_servers.create_server(
         "pytest linked", "127.0.0.1", 80, "", key)
     try:
         row = merge_servers.get_server(server_id, False)
         assert "key" not in row and "key_cipher" not in row
-        token = merge_servers.make_server_token(row, subject="admin")
+        token = merge_servers.make_server_token(row, subject="admin",
+                                                bootstrap=True)
         data = merge_servers.verify_token(token, key)
         assert data and data["sub"] == "admin"
         assert data["version"] == merge_servers.panel_version()
+
+        own = merge_servers.make_server_token(row, subject="admin")
+        local_key = merge_servers.ensure_local_identity()["key"]
+        link_key = merge_servers.get_server(server_id, True)["link_key"]
+        assert link_key and link_key != local_key
+        assert merge_servers.verify_token(own, link_key)
+        assert merge_servers.verify_token(own, local_key) is None
+        assert merge_servers.verify_token(own, key) is None
     finally:
         merge_servers.delete_server(server_id)
 
@@ -246,4 +259,244 @@ def test_access_alone_grants_the_overview_but_no_metrics(db):
         assert merge_servers.scopes_for(username, "staff", visible[0]) == []
     finally:
         merge_servers.delete_user_access(username)
+        merge_servers.delete_server(server_id)
+
+
+def test_a_long_base_path_is_rejected_before_a_key_is_stored(db):
+    merge_servers.ensure_schema()
+    name = "pytest-long-path-" + uuid.uuid4().hex
+    key = "long-path-key-" + uuid.uuid4().hex
+    conn = db.get_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            with pytest.raises(ValueError):
+                merge_servers.create_server(
+                    name, "127.0.0.1", 80, "/" + "a" * 200, key)
+            cur.execute(
+                "SELECT COUNT(*) FROM merge_serverkey WHERE label=%s", (name,))
+            assert cur.fetchone()[0] == 0
+            cur.execute(
+                "SELECT COUNT(*) FROM merge_server WHERE name=%s", (name,))
+            assert cur.fetchone()[0] == 0
+        finally:
+            cur.execute("DELETE FROM merge_serverkey WHERE label=%s", (name,))
+            cur.execute("DELETE FROM merge_server WHERE name=%s", (name,))
+            cur.close()
+    finally:
+        db.release_connection(conn)
+
+
+def test_create_server_rolls_back_the_key_when_the_server_insert_fails(db):
+    merge_servers.ensure_schema()
+    name = "pytest-atomic-" + uuid.uuid4().hex
+    key = "atomic-key-" + uuid.uuid4().hex
+    conn = db.get_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            with pytest.raises(Exception):
+                merge_servers.create_server(
+                    name, "127.0.0.1", 80, "", key, created_by="x" * 101)
+            cur.execute(
+                "SELECT COUNT(*) FROM merge_serverkey WHERE label=%s", (name,))
+            assert cur.fetchone()[0] == 0
+            cur.execute(
+                "SELECT COUNT(*) FROM merge_server WHERE name=%s", (name,))
+            assert cur.fetchone()[0] == 0
+        finally:
+            cur.execute("DELETE FROM merge_serverkey WHERE label=%s", (name,))
+            cur.execute("DELETE FROM merge_server WHERE name=%s", (name,))
+            cur.close()
+    finally:
+        db.release_connection(conn)
+
+
+class _BigResponse:
+    status = 200
+
+    def __init__(self, body):
+        self.body = body
+        self.offset = 0
+
+    def read(self, size=-1):
+        end = len(self.body)
+        if size is not None and size >= 0:
+            end = min(end, self.offset + size)
+        chunk = self.body[self.offset:end]
+        self.offset = end
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_a_truncated_http_body_is_an_error_not_a_success(monkeypatch):
+    body = b"x" * (5_000_000 + 1)
+    monkeypatch.setattr(
+        merge_servers, "_open_request", lambda *args, **kwargs: _BigResponse(body))
+    server = {"scheme": "http", "host": "127.0.0.1", "port": 80,
+              "base_path": ""}
+    code, data, err = merge_servers.http_call(
+        server, "/api/merge/list", "token")
+    assert code == 502
+    assert isinstance(data, dict)
+    assert data.get("error")
+    assert "raw" not in data
+    assert err
+
+
+@pytest.mark.parametrize("body", [b"", b'{"status"', b"[]"])
+def test_a_short_or_non_object_http_body_is_an_error(monkeypatch, body):
+    monkeypatch.setattr(
+        merge_servers, "_open_request", lambda *args, **kwargs: _BigResponse(body))
+    server = {"scheme": "http", "host": "127.0.0.1", "port": 80,
+              "base_path": ""}
+    code, data, err = merge_servers.http_call(server, "/api/merge/status", "token")
+    assert code == 502, body
+    assert isinstance(data, dict) and data.get("error")
+    assert err
+
+
+def test_refresh_all_status_checks_servers_concurrently(monkeypatch):
+    servers = [{"id": f"pytest-refresh-{i}", "server_uid": f"uid-{i}"}
+               for i in range(5)]
+    prune_calls = []
+
+    def slow_refresh(server_id, timeout=4):
+        time.sleep(0.2)
+        return {"ok": True, "status": "connected"}
+
+    monkeypatch.setattr(merge_servers, "list_servers", lambda: servers)
+    monkeypatch.setattr(merge_servers, "prune_requests",
+                        lambda: prune_calls.append(1))
+    monkeypatch.setattr(merge_servers, "refresh_status", slow_refresh)
+    started = time.monotonic()
+    out = merge_servers.refresh_all_status(timeout=2)
+    elapsed = time.monotonic() - started
+    assert elapsed < 1
+    assert list(out) == [s["id"] for s in servers]
+    assert all(row["ok"] for row in out.values())
+    assert len(prune_calls) == 1
+
+
+def test_refresh_all_status_honors_an_overall_deadline(monkeypatch):
+    servers = [{"id": f"pytest-deadline-{i}", "server_uid": f"uid-{i}"}
+               for i in range(3)]
+
+    def slow_refresh(server_id, timeout=4):
+        time.sleep(0.5)
+        return {"ok": True, "status": "connected"}
+
+    monkeypatch.setattr(merge_servers, "list_servers", lambda: servers)
+    monkeypatch.setattr(merge_servers, "prune_requests", lambda: 0)
+    monkeypatch.setattr(merge_servers, "refresh_status", slow_refresh)
+    monkeypatch.setattr(merge_servers, "update_server", lambda *a, **k: None)
+    started = time.monotonic()
+    out = merge_servers.refresh_all_status(timeout=0.1)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.5
+    assert list(out) == [s["id"] for s in servers]
+    assert all(not row["ok"] and row["status"] == "down"
+               for row in out.values())
+
+
+def test_prune_requests_removes_only_old_pending_and_denied(db):
+    merge_servers.ensure_schema()
+    prefix = "pytest-prune-old-" + uuid.uuid4().hex[:8] + "-"
+    old_pending = prefix + "old-pending"
+    old_denied = prefix + "old-denied"
+    old_allowed = prefix + "old-allowed"
+    recent_pending = prefix + "recent-pending"
+    conn = db.get_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("DELETE FROM merge_request WHERE server_uid LIKE %s",
+                        (prefix + "%",))
+            cur.executemany(
+                """INSERT INTO merge_request
+                       (server_uid, status, requested_at, last_seen)
+                   VALUES (%s, %s, now() - interval '31 days',
+                           now() - interval '31 days')""",
+                [(old_pending, "pending"), (old_denied, "denied"),
+                 (old_allowed, "allowed")])
+            cur.execute(
+                """INSERT INTO merge_request (server_uid, status)
+                   VALUES (%s, 'pending')""", (recent_pending,))
+            merge_servers.prune_requests(prefix)
+            cur.execute(
+                "SELECT server_uid FROM merge_request WHERE server_uid LIKE %s",
+                (prefix + "%",))
+            left = {row[0] for row in cur.fetchall()}
+            assert old_pending not in left
+            assert old_denied not in left
+            assert old_allowed in left
+            assert recent_pending in left
+        finally:
+            cur.execute("DELETE FROM merge_request WHERE server_uid LIKE %s",
+                        (prefix + "%",))
+            cur.close()
+    finally:
+        db.release_connection(conn)
+
+
+def test_prune_requests_keeps_the_newest_200_pending(db):
+    merge_servers.ensure_schema()
+    prefix = "pytest-prune-cap-" + uuid.uuid4().hex[:8] + "-"
+    uids = [prefix + f"{i:03d}" for i in range(205)]
+    conn = db.get_connection()
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("DELETE FROM merge_request WHERE server_uid LIKE %s",
+                        (prefix + "%",))
+            cur.executemany(
+                """INSERT INTO merge_request
+                       (server_uid, status, requested_at, last_seen)
+                   VALUES (%s, 'pending',
+                           now() + interval '1 day' + (%s * interval '1 second'),
+                           now() + interval '1 day' + (%s * interval '1 second'))""",
+                [(uid, i, i) for i, uid in enumerate(uids)])
+            merge_servers.prune_requests(prefix)
+            cur.execute(
+                "SELECT server_uid FROM merge_request WHERE server_uid LIKE %s",
+                (prefix + "%",))
+            left = {row[0] for row in cur.fetchall()}
+            assert len(left) == 200
+            assert not any(uid in left for uid in uids[:5])
+            assert all(uid in left for uid in uids[5:])
+        finally:
+            cur.execute("DELETE FROM merge_request WHERE server_uid LIKE %s",
+                        (prefix + "%",))
+            cur.close()
+    finally:
+        db.release_connection(conn)
+
+
+def test_a_legacy_server_row_without_a_link_key_still_uses_the_old_key(db):
+    """Rows created before per-link keys must keep working: their data calls
+    fall back to the local identity key, which the peer already bound."""
+    key = "legacy-row-key-" + uuid.uuid4().hex
+    server_id = merge_servers.create_server(
+        "pytest legacy row", "127.0.0.1", 80, "", key)
+    try:
+        conn = db.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE merge_server SET link_key_cipher='' WHERE id=%s",
+                        (server_id,))
+            conn.commit()
+            cur.close()
+        finally:
+            db.release_connection(conn)
+        row = merge_servers.get_server(server_id, True)
+        assert row["link_key"] == ""
+        token = merge_servers.make_server_token(row, subject="admin")
+        assert merge_servers.verify_token(
+            token, merge_servers.ensure_local_identity()["key"])
+    finally:
         merge_servers.delete_server(server_id)

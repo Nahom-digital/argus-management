@@ -27,7 +27,6 @@ PROBES = {
     "disk_upload":   ("POST", "/api/system/upload"),
     "disk_delete":   ("DELETE", "/api/system/delete"),
     "db_read":       ("GET", "/api/config/db/tables"),
-    "db_write":      ("POST", "/api/config/db/table/system_settings/column"),
     "net_proxy":     ("GET", "/api/config/proxy/hosts"),
     "svc_status":    ("GET", "/api/services"),
     # A name _norm_service rejects, so the grant check still runs but systemctl
@@ -42,8 +41,9 @@ PROBES = {
 }
 
 # Grants with no endpoint of their own: terminal is a websocket, disk_scope is a
-# modifier the disk probes carry, and db_log has no reader until phase 6.
-NO_HTTP_PROBE = {"terminal", "disk_scope", "db_log"}
+# modifier the disk probes carry, db_log has no reader until phase 6, and db_write
+# is admin-only (the table list reports write only for the admin role).
+NO_HTTP_PROBE = {"terminal", "disk_scope", "db_log", "db_write"}
 
 ADMIN_ONLY = [
     "/api/config/users",
@@ -106,6 +106,9 @@ def test_grant_unlocks_only_its_own_endpoint(client, conn, grant):
 
 def test_every_grant_has_a_probe_or_a_documented_exemption():
     assert set(PROBES) | NO_HTTP_PROBE == set(pu.GRANT_KEYS)
+    # Exact set: moving a live grant into the exemption list must not silently
+    # pass. db_write is admin-only, so it has no staff probe of its own.
+    assert NO_HTTP_PROBE == {"terminal", "disk_scope", "db_log", "db_write"}
 
 
 def test_admin_only_endpoints_reject_every_staff_grant(client, conn):

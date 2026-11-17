@@ -194,7 +194,7 @@ endpoint honours, or an endpoint gated on something the admin cannot grant.
 |-------|--------|
 | Terminal | none, own account only, or root |
 | Disk | reach nothing / their own files / the whole filesystem, plus download, upload and delete as separate switches |
-| Database | read tables, change rows, view the change log |
+| Database | read tables, view the change log; changing rows is admin-only |
 | Network | connection detail in the Server section, manage proxy hosts, manage firewall settings |
 | CPU and memory | the top-process lists behind both meters |
 | Services | see status, start and restart, stop |
@@ -228,8 +228,16 @@ Four things worth knowing about how this is enforced:
   network and disk. Access alone still shows the hardware overview; the metric
   cards need their own scope. Those scopes are stored in `merge_user_access`,
   not in the ordinary permission registry, and are re-checked by the other panel
-  from signed claims. Linked terminals are never delegable, and remote disk
-  access is the whole filesystem for admins and permitted staff alike.
+  from signed claims. Linked terminals are never delegable. Remote browsing,
+  download and delete are the whole filesystem for admins and permitted staff
+  alike; a staff upload still refuses the system paths the local staff policy
+  protects, such as `/etc` and `/root`.
+
+  A linked terminal ends when its browser tab closes; "stay on" applies to
+  local tabs only. Each new link gets its own key, so one peer cannot speak for
+  another. Links created before per-peer link keys may ask their admin to allow
+  them once more after an upgrade; remove and re-add an old link to give it its
+  own key.
 
 Recovery codes belong to the admin account alone. A staff member who forgets
 their password asks an admin, who resets it from the user list, which is a

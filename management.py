@@ -1500,6 +1500,7 @@ SCHEMA = (
                scheme          VARCHAR(8) NOT NULL DEFAULT 'http',
                base_path       VARCHAR(200) NOT NULL DEFAULT '',
                key_id          VARCHAR(64) NOT NULL,
+               link_key_cipher TEXT NOT NULL DEFAULT '',
                server_uid      VARCHAR(64),
                remote_hostname TEXT NOT NULL DEFAULT '',
                remote_version  VARCHAR(64) NOT NULL DEFAULT '',
@@ -1523,7 +1524,8 @@ SCHEMA = (
                last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
                decided_at   TIMESTAMPTZ,
                decided_by   VARCHAR(100) NOT NULL DEFAULT '',
-               note         TEXT NOT NULL DEFAULT ''
+               note         TEXT NOT NULL DEFAULT '',
+               peer_key_cipher TEXT NOT NULL DEFAULT ''
            )""",
         "CREATE INDEX IF NOT EXISTS idx_merge_request_status ON merge_request(status)",
         """CREATE TABLE IF NOT EXISTS merge_user_access (
@@ -1550,7 +1552,9 @@ SCHEMA_UPGRADES = (
     "ALTER TABLE IF EXISTS http_access_log ADD COLUMN IF NOT EXISTS content_type TEXT",
     "ALTER TABLE IF EXISTS http_access_log ADD COLUMN IF NOT EXISTS response_size INTEGER",
     "ALTER TABLE IF EXISTS merge_server ADD COLUMN IF NOT EXISTS remote_version VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE IF EXISTS merge_server ADD COLUMN IF NOT EXISTS link_key_cipher TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE IF EXISTS merge_request ADD COLUMN IF NOT EXISTS remote_version VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE IF EXISTS merge_request ADD COLUMN IF NOT EXISTS peer_key_cipher TEXT NOT NULL DEFAULT ''",
 )
 
 SCHEMA_TABLES = ("admin", "admin_recovery_code", "system_settings",

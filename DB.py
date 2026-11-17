@@ -51,11 +51,14 @@ _POOL_MIN = 2
 _POOL_MAX = 32          # < Postgres max_connections (100); headroom for >1 worker
 
 _CONN_POOL = None
+_CLOSED = False
 
 _POOL_LOCK = threading.Lock()
 
 def _get_pool():
     global _CONN_POOL
+    if _CLOSED:
+        raise RuntimeError("database is shutting down")
     if _CONN_POOL is None:
         with _POOL_LOCK:
             if _CONN_POOL is None:   # double-checked: build exactly one pool under concurrency
@@ -65,11 +68,28 @@ def _get_pool():
 def init_pool():
     """Warm the pool eagerly at startup so the first request never pays the
     connect+auth latency and the lazy-init race can never happen under load."""
+    global _CLOSED
+    _CLOSED = False
     _get_pool()
 
+def close_net_pool():
+    """Stop the outbound linked-server executor without touching the DB pool.
+
+    The lifespan calls this: a checked-out connection may still belong to a
+    test or an in-flight request, and closing the whole pool there would break
+    it. The process exit releases the DB connections.
+    """
+    global _NET_EXECUTOR
+    with _NET_LOCK:
+        net, _NET_EXECUTOR = _NET_EXECUTOR, None
+    if net is not None:
+        net.shutdown(wait=False, cancel_futures=True)
+
 def close_pool():
-    """Close every pooled connection on graceful shutdown."""
-    global _CONN_POOL
+    """Close every pooled connection and the network executor on shutdown."""
+    global _CONN_POOL, _CLOSED
+    _CLOSED = True
+    close_net_pool()
     with _POOL_LOCK:
         if _CONN_POOL is not None:
             try:
@@ -90,6 +110,22 @@ def release_connection(conn):
 
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="db")
 
+# Linked-server HTTP calls have long timeouts and can hang on a dead peer, so
+# they get their own small pool. They must never consume the DB workers that
+# every ordinary panel request depends on.
+_NET_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="argus-net")
+_NET_LOCK = threading.Lock()
+
+def _get_net_executor():
+    global _NET_EXECUTOR
+    if _CLOSED:
+        raise RuntimeError("database is shutting down")
+    if _NET_EXECUTOR is None:
+        with _NET_LOCK:
+            if _NET_EXECUTOR is None:
+                _NET_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="argus-net")
+    return _NET_EXECUTOR
+
 async def run(fn, *args, **kwargs):
     """Offload a synchronous DB call off the event loop:
         user = await DB.run(DB.get_user, tid)
@@ -97,6 +133,13 @@ async def run(fn, *args, **kwargs):
     loop = asyncio.get_running_loop()
     call = fn if not kwargs else functools.partial(fn, **kwargs)
     return await loop.run_in_executor(_DB_EXECUTOR, call, *args)
+
+async def run_net(fn, *args, **kwargs):
+    """Offload an outbound linked-server call to the network executor.
+    Same semantics as run(), but a slow or hung peer cannot starve DB work."""
+    loop = asyncio.get_running_loop()
+    call = fn if not kwargs else functools.partial(fn, **kwargs)
+    return await loop.run_in_executor(_get_net_executor(), call, *args)
 
 def _hash_pw(password: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), b"botcontrol", 260000).hex()

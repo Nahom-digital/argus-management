@@ -1380,18 +1380,66 @@ def net_connections(limit=300, established_only=False):
 # actually catastrophic ones (e.g. the wallet-encryption key).
 _DL_BLOCK_EXT = {".py", ".pyc", ".pyo", ".pyw", ".pem", ".key"}
 _DL_BLOCK_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
-                   ".wallet_secret", ".session_secret", "shadow", "gshadow"}
+                   ".wallet_secret", ".session_secret", ".vault_key",
+                   ".pgpass", ".netrc", "authorized_keys", "shadow", "gshadow"}
+# Backups and renamed copies (id_rsa.bak, .vault_key.old, authorized_keys2)
+# must not slip past an exact-name check.
+_DL_BLOCK_STEMS = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+                   ".wallet_secret", ".session_secret", ".vault_key",
+                   ".pgpass", ".netrc", "authorized_keys", "ssh_host_")
+
+# Whole trees that must never be downloadable: the panel's own install
+# directory (it holds .vault_key, .env and the source) and the small set of
+# places PostgreSQL keeps its data and credentials.
+def _path_key(path):
+    """A comparable absolute path. Case-folding only matters where a
+    filesystem is case-insensitive (macOS/Windows); on Linux it just makes a
+    blocklist slightly stricter, never looser."""
+    return os.path.normcase(os.path.realpath(path)).casefold()
+
+
+def _inside(path_key, prefix_key):
+    """True when an already-keyed path is the prefix or below it.
+    commonpath handles "/" and sibling names (/var/lib/postgresql2)."""
+    try:
+        return os.path.commonpath([path_key, prefix_key]) == prefix_key
+    except ValueError:
+        return False
+
+
+def _real_prefixes(prefixes):
+    return tuple(_path_key(p) for p in prefixes)
+
+
+_DL_BLOCK_DIRS = _real_prefixes((
+    os.path.dirname(os.path.abspath(__file__)),
+    "/var/lib/postgresql",
+    "/var/lib/postgres",
+    "/var/lib/pgsql",
+    "/var/db/postgres",
+    "/usr/local/pgsql/data",
+    "/usr/local/var/postgres",
+    "/opt/homebrew/var/postgres",
+))
 
 def _download_blocked(path):
-    b = os.path.basename(path).lower()
+    full = os.path.realpath(path)
+    b = os.path.basename(full).lower()
     _, ext = os.path.splitext(b)
     if ext in _DL_BLOCK_EXT:
         return True
     if b in _DL_BLOCK_NAMES:
         return True
+    if b.startswith(_DL_BLOCK_STEMS):
+        return True
     if "secret" in b or b.startswith(".env"):
         return True
-    return False
+    if b.startswith(("shadow.", "gshadow.")):
+        return True
+    if b.startswith("ssh_host_") and b.endswith("_key"):
+        return True
+    key = os.path.normcase(full).casefold()
+    return any(_inside(key, prefix) for prefix in _DL_BLOCK_DIRS)
 
 
 def _sandbox_root(root):
@@ -1407,7 +1455,10 @@ def _within(root, full):
     """
     if not root:
         return True
-    return full == root or full.startswith(root + os.sep)
+    try:
+        return os.path.commonpath([full, root]) == root
+    except ValueError:
+        return False
 
 
 def list_dir(path=None, root=None):
@@ -1470,16 +1521,18 @@ def resolve_download(path, root=None):
 
 # Whole subtrees a delete must never touch, even for an admin, because a misclick
 # here is not recoverable the way an accidental download is.
-_DELETE_DENY_PREFIXES = ("/etc", "/boot", "/sys", "/proc", "/dev", "/bin", "/sbin",
-                          "/lib", "/lib64", "/usr", "/var/lib/postgresql")
-_DELETE_DENY_EXACT = {"/", "/root", "/home"}
+_DELETE_DENY_PREFIXES = _real_prefixes(
+    ("/etc", "/boot", "/sys", "/proc", "/dev", "/bin", "/sbin",
+     "/lib", "/lib64", "/usr", "/var/lib/postgresql", "/root",
+     "/var/spool/cron", "/var/spool/at"))
+_DELETE_DENY_EXACT = {_path_key(p) for p in ("/", "/root", "/home")}
 
 def _delete_blocked(path):
-    if path in _DELETE_DENY_EXACT:
+    if _path_key(path) in _DELETE_DENY_EXACT:
         return True
-    for prefix in _DELETE_DENY_PREFIXES:
-        if path == prefix or path.startswith(prefix + "/"):
-            return True
+    key = os.path.normcase(os.path.realpath(path)).casefold()
+    if any(_inside(key, prefix) for prefix in _DELETE_DENY_PREFIXES):
+        return True
     return _download_blocked(path)  # never delete secrets, keys, or source either
 
 
@@ -1520,16 +1573,14 @@ MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
 # The panel writes as root, so a staff account must not be able to aim an upload
 # at a place where root or a service would later execute it. The admin already
 # has a root terminal, so these extra destinations are refused for staff only.
-_UPLOAD_STAFF_DENY_PREFIXES = _DELETE_DENY_PREFIXES + (
-    "/root", "/var/spool/cron", "/var/spool/at",
-)
+_UPLOAD_STAFF_DENY_PREFIXES = (_DELETE_DENY_PREFIXES + _DL_BLOCK_DIRS +
+                              _real_prefixes(("/root", "/var/spool/cron",
+                                              "/var/spool/at")))
 
 
 def _upload_staff_blocked(path):
-    for prefix in _UPLOAD_STAFF_DENY_PREFIXES:
-        if path == prefix or path.startswith(prefix + "/"):
-            return True
-    return False
+    key = os.path.normcase(os.path.realpath(path)).casefold()
+    return any(_inside(key, prefix) for prefix in _UPLOAD_STAFF_DENY_PREFIXES)
 
 
 def resolve_upload(path, name, root=None, staff=False):

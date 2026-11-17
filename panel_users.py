@@ -182,6 +182,15 @@ SCHEMA = (
     "ALTER TABLE panel_user ADD COLUMN IF NOT EXISTS grants JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE panel_user ADD COLUMN IF NOT EXISTS auth_epoch INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE panel_user ADD COLUMN IF NOT EXISTS full_name VARCHAR(120)",
+    # A deleted account has no panel_user row left to carry its epoch, so the
+    # name is tombstoned here instead. auth_epoch_for() answers a tombstone with
+    # an epoch no token for that name was ever minted under, and create_user()
+    # reuses the stored value so an old token cannot come back with the name.
+    """CREATE TABLE IF NOT EXISTS panel_user_revoked (
+        username    VARCHAR(100) PRIMARY KEY,
+        auth_epoch  INTEGER NOT NULL DEFAULT 0,
+        revoked_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
 )
 
 # A row written before v2 has an empty grants object. New rows always store a
@@ -305,13 +314,20 @@ def create_user(conn, username, password, grants, created_by):
             raise RuntimeError(f"could not create system account: {err}")
 
     cur = conn.cursor()
+    # A name that was deleted before starts after its tombstoned epoch, so a
+    # token minted while the account existed stays dead after it is recreated.
+    cur.execute("SELECT auth_epoch FROM panel_user_revoked WHERE username = %s",
+                (username,))
+    row = cur.fetchone()
+    auth_epoch = int(row[0]) + 1 if row else 0
     cur.execute(
         """INSERT INTO panel_user
-           (username, password_hash, os_username, grants, created_by)
-           VALUES (%s, %s, %s, %s, %s)""",
+           (username, password_hash, os_username, grants, created_by, auth_epoch)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
         (username, recovery.hash_password(password), os_username,
-         json.dumps(grants), created_by),
+         json.dumps(grants), created_by, auth_epoch),
     )
+    cur.execute("DELETE FROM panel_user_revoked WHERE username = %s", (username,))
     conn.commit()
     cur.close()
     return os_username
@@ -383,12 +399,43 @@ def verify_login(conn, username, password):
 
 def auth_epoch_for(conn, username):
     """The session generation for one identity. A token minted before the
-    current value is stale and must be rejected."""
+    current value is stale and must be rejected.
+
+    A deleted name has no panel_user row, so the tombstone supplies one past
+    the epoch it had when it was removed. Returning 0 for a miss, as this used
+    to, made every token minted under epoch 0 look current forever.
+    """
+    ensure_table(conn)
     cur = conn.cursor()
     cur.execute("SELECT auth_epoch FROM panel_user WHERE username = %s", (username,))
     row = cur.fetchone()
+    if row:
+        cur.close()
+        return int(row[0])
+    cur.execute("SELECT auth_epoch FROM panel_user_revoked WHERE username = %s",
+                (username,))
+    row = cur.fetchone()
     cur.close()
-    return int(row[0]) if row else 0
+    return int(row[0]) + 1 if row else 0
+
+
+def epoch_map(conn):
+    """Every known session epoch, including names that were deleted.
+
+    The panel rebuilds its in-memory epoch cache from this map. Reading only
+    panel_user would drop a deleted name and make _user_epoch return 0 for it,
+    which would revalidate a token minted under epoch 0 until the next change.
+    """
+    ensure_table(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT username, auth_epoch FROM panel_user")
+    out = {name: int(epoch or 0) for name, epoch in cur.fetchall()}
+    cur.execute("SELECT username, auth_epoch FROM panel_user_revoked")
+    for name, epoch in cur.fetchall():
+        if name not in out:
+            out[name] = int(epoch or 0) + 1
+    cur.close()
+    return out
 
 
 def _is_narrowing(old, new):
@@ -458,6 +505,17 @@ def delete_user(conn, username):
     if not user:
         return False
     cur = conn.cursor()
+    # Record the epoch before the row disappears. The tombstone makes the
+    # deletion revoke that person's sessions immediately and only theirs.
+    cur.execute(
+        """INSERT INTO panel_user_revoked (username, auth_epoch)
+           VALUES (%s, %s)
+           ON CONFLICT (username) DO UPDATE
+             SET auth_epoch = GREATEST(panel_user_revoked.auth_epoch,
+                                       EXCLUDED.auth_epoch),
+                 revoked_at = now()""",
+        (username, user["auth_epoch"]),
+    )
     cur.execute("DELETE FROM panel_user WHERE username = %s", (username,))
     conn.commit()
     cur.close()
@@ -470,7 +528,7 @@ def resolve_permissions(conn, username):
     """The single source of truth for what a signed-in identity may do.
 
     Every grant key sits at the top level of the returned dict, so a request
-    handler asks perms["db_write"] and never has to know how it was stored.
+    handler asks for the grant it needs and never has to know how it was stored.
     The primary admin is always every grant at its widest, computed from the
     registry rather than written out, so adding a permission can never
     accidentally withhold it from the admin.

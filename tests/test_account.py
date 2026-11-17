@@ -5,6 +5,7 @@ about what the panel does with the result: who may write it, who may read it,
 what headers it goes out under, and which cards each kind of account is shown.
 """
 import struct
+import tempfile
 import zlib
 
 import pytest
@@ -121,6 +122,25 @@ def test_an_oversized_upload_is_refused_by_size_alone(client):
     assert r.status_code == 413
 
 
+def test_an_oversized_chunked_upload_stops_at_the_cap_and_leaves_no_file(
+        client, monkeypatch, tmp_path):
+    """No Content-Length means the route must enforce the cap as it reads."""
+    as_user(client, STAFF)
+    monkeypatch.setattr(identity, "MAX_UPLOAD", 1024)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    def body():
+        yield identity._PNG_MAGIC
+        for _ in range(8):
+            yield b"x" * 512
+
+    r = client.post("/api/account/avatar", content=body(),
+                    headers={"Content-Type": "image/png"})
+    assert r.status_code == 413
+    assert "1 KB" in r.json()["error"]
+    assert list(tmp_path.iterdir()) == [], "the staging file must be removed"
+
+
 # --- whose account is it ---------------------------------------------------- #
 
 def test_an_upload_only_ever_changes_your_own_picture(client):
@@ -195,10 +215,12 @@ def test_a_staff_member_can_change_their_own_password(client, db):
     try:
         assert pu.verify_login(conn, STAFF, "N3wAcct!pass")
         assert pu.verify_login(conn, STAFF, PASSWORD) is None
-        # Put it back so the ordering of tests in this file cannot matter.
-        pu.update_user(conn, STAFF, password=PASSWORD)
     finally:
-        db.release_connection(conn)
+        # Put it back even if an assertion fails, so test ordering cannot matter.
+        try:
+            pu.update_user(conn, STAFF, password=PASSWORD)
+        finally:
+            db.release_connection(conn)
     panel._forget_user_epoch(STAFF)
 
 

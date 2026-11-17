@@ -5,7 +5,9 @@ The panel used to carry a single global epoch, which would have signed the
 admin out of their own session every time they reset a staff password.
 """
 import pytest
+from fastapi import Request
 
+import DB
 import panel
 import panel_users as pu
 from fastapi.testclient import TestClient
@@ -69,3 +71,20 @@ def test_a_forged_token_for_another_user_is_rejected(clients):
     with TestClient(panel.app, client=("127.0.0.1", 51003)) as forger:
         forger.cookies.set("session", panel._create_session_token(STAFF) + "x")
         assert forger.get("/api/services").status_code == 401
+
+
+def test_the_epoch_cache_does_not_query_db_on_the_request_path(monkeypatch):
+    panel._refresh_epoch_cache()
+    token = panel._create_session_token("admin")
+
+    def fail(*args, **kwargs):
+        raise AssertionError("auth hot path touched the database")
+
+    monkeypatch.setattr(DB, "get_setting", fail)
+    monkeypatch.setattr(DB, "get_connection", fail)
+    request = Request({"type": "http",
+                       "headers": [(b"cookie", f"session={token}".encode())]})
+
+    assert panel._authed(request) is True
+    assert panel._authed(request) is True
+    assert panel._admin_name(request) == "admin"

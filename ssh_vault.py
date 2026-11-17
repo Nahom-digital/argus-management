@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 
 import vault
 
@@ -181,6 +182,37 @@ def _target_home(username="root"):
         return ("/root" if username == "root" else f"/home/{username}"), 0, 0
 
 
+_MANAGED_KEY_COMMENT = "argus-management"
+_KEY_TYPE_RE = re.compile(r"^(?:ssh-|ecdsa-|sk-)")
+
+
+def _key_fields(line):
+    """Return (key type index, fields) for an authorized_keys line, or
+    (None, fields) when the line does not look like a key entry. Options, if
+    any, come before the key type, so the comment is found after both."""
+    fields = line.rstrip("\r\n").split()
+    for i, field in enumerate(fields[:-2]):
+        if _KEY_TYPE_RE.match(field):
+            return i, fields
+    return None, fields
+
+
+def _is_managed_key(line):
+    i, fields = _key_fields(line)
+    return i is not None and " ".join(fields[i + 2:]) == _MANAGED_KEY_COMMENT
+
+
+def _key_blob(line):
+    i, fields = _key_fields(line)
+    return fields[i + 1] if i is not None else None
+
+
+def _strip_managed_keys(text):
+    """Drop Argus-generated key lines and keep every other byte as it was."""
+    return "".join(line for line in text.splitlines(keepends=True)
+                   if not _is_managed_key(line))
+
+
 def install_public_key(public_key, username="root"):
     """Put the public key where sshd will actually read it.
 
@@ -208,13 +240,51 @@ def install_public_key(public_key, username="root"):
 
         existing = ""
         if os.path.exists(auth_file):
-            with open(auth_file) as f:
+            # newline="" keeps CRLF line endings intact when the file is
+            # rewritten; the default universal-newline mode would silently
+            # convert them.
+            with open(auth_file, newline="") as f:
                 existing = f.read()
 
-        if public_key.split()[1] in existing:
+        blob = public_key.split()[1]
+        managed = [line for line in existing.splitlines(keepends=True)
+                   if _is_managed_key(line)]
+        stale = [line for line in managed if _key_blob(line) != blob]
+
+        if stale:
+            updated = _strip_managed_keys(existing)
+            appended = blob not in updated
+            if appended:
+                if updated and not updated.endswith("\n"):
+                    updated += "\n"
+                updated += public_key + "\n"
+            # Replace atomically: truncating the live file first would wipe
+            # every authorized key if the write failed halfway through.
+            fd, temp_path = tempfile.mkstemp(
+                prefix=".authorized_keys.", dir=auth_dir)
+            try:
+                with os.fdopen(fd, "w", newline="") as f:
+                    f.write(updated)
+                os.chmod(temp_path, stat.S_IRUSR | stat.S_IWUSR)
+                try:
+                    os.chown(temp_path, uid, gid)
+                except (OSError, AttributeError) as e:
+                    problems.append(
+                        f"could not set ownership to {username}: {e}")
+                os.replace(temp_path, auth_file)
+            except OSError:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
+            steps.append("removed the previous Argus key")
+            if appended:
+                steps.append(f"appended the key to {auth_file}")
+        elif managed or blob in existing:
             steps.append("key was already authorized")
         else:
-            with open(auth_file, "a") as f:
+            with open(auth_file, "a", newline="") as f:
                 if existing and not existing.endswith("\n"):
                     f.write("\n")
                 f.write(public_key + "\n")

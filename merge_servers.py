@@ -2,11 +2,14 @@
 #
 # Each installation owns one random "private key" generated on first start and
 # kept encrypted in merge_serverkey. To manage another panel, an admin adds its
-# host and that panel's key. The first call introduces this panel (a handshake);
-# the receiving panel records a request, and nothing is served until its admin
-# allows it. Every later call carries a short-lived JWT signed with the
-# receiving panel's key, in an Authorization header and in the argus_merge
-# cookie. That is deliberately separate from the browser session in panel.py.
+# host and that panel's key. The first call introduces this panel (a handshake)
+# carrying this panel's own key as link_key; the receiving panel records a
+# request together with that key, and nothing is served until its admin allows
+# it. Every later data call carries a short-lived JWT signed with this panel's
+# own key, in an Authorization header and in the argus_merge cookie. Only the
+# handshake and the status poll are signed with the receiving panel's key, so an
+# unbound peer can still introduce itself. That is deliberately separate from
+# the browser session in panel.py.
 #
 # No database or network work happens at import time. management.py imports
 # every top-level module, so all of it lives inside functions.
@@ -55,6 +58,7 @@ SCHEMA = (
         scheme          VARCHAR(8) NOT NULL DEFAULT 'http',
         base_path       VARCHAR(200) NOT NULL DEFAULT '',
         key_id          VARCHAR(64) NOT NULL,
+        link_key_cipher TEXT NOT NULL DEFAULT '',
         server_uid      VARCHAR(64),
         remote_hostname TEXT NOT NULL DEFAULT '',
         remote_version  VARCHAR(64) NOT NULL DEFAULT '',
@@ -78,7 +82,8 @@ SCHEMA = (
         last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
         decided_at   TIMESTAMPTZ,
         decided_by   VARCHAR(100) NOT NULL DEFAULT '',
-        note         TEXT NOT NULL DEFAULT ''
+        note         TEXT NOT NULL DEFAULT '',
+        peer_key_cipher TEXT NOT NULL DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS idx_merge_request_status ON merge_request(status)",
     """CREATE TABLE IF NOT EXISTS merge_user_access (
@@ -95,8 +100,12 @@ SCHEMA = (
 SCHEMA_UPGRADES = (
     "ALTER TABLE IF EXISTS merge_server ADD COLUMN IF NOT EXISTS "
     "remote_version VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE IF EXISTS merge_server ADD COLUMN IF NOT EXISTS "
+    "link_key_cipher TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE IF EXISTS merge_request ADD COLUMN IF NOT EXISTS "
     "remote_version VARCHAR(64) NOT NULL DEFAULT ''",
+    "ALTER TABLE IF EXISTS merge_request ADD COLUMN IF NOT EXISTS "
+    "peer_key_cipher TEXT NOT NULL DEFAULT ''",
 )
 
 _schema_ready = False
@@ -180,7 +189,8 @@ def ensure_local_identity():
             if not vault.decrypt(cipher):
                 # The vault key was rotated or the row predates this vault. A
                 # key nobody can read is worse than a new one, and links on the
-                # other side will say why they stopped working.
+                # other side will say why they stopped working. Peers already
+                # bound to the old key stay bound and must be re-approved.
                 cipher = vault.encrypt(_new_key())
                 cur.execute(
                     "UPDATE merge_serverkey SET key_cipher=%s, rotated_at=now() "
@@ -215,7 +225,13 @@ def local_key():
 
 def rotate_local_key():
     """Mint a new local key. Existing linked panels must be given the new key;
-    calls they make with the old one stop verifying immediately."""
+    calls they make with the old one stop verifying immediately.
+
+    A link that is already bound keeps the key it presented. Rotating the local
+    key does not rebind it: the peer must be removed and re-approved from both
+    sides. There is deliberately no automatic re-bind, because accepting a new
+    key on presentation is exactly how a peer could steal another peer's link.
+    """
     ident = ensure_local_identity()
     key = _new_key()
     conn = DB.get_connection()
@@ -284,6 +300,53 @@ def _token_from_request(request):
     return request.cookies.get("argus_merge", "")
 
 
+# A token is accepted once. The pair lives only in this process, bounded, and
+# is purged as its TTL passes; a restart forgetting it is harmless.
+def _new_lock():
+    # Imported here so the module's import block stays as it is.
+    import threading
+    return threading.Lock()
+
+
+_replay_lock = _new_lock()
+_replay_seen = {}
+_REPLAY_LIMIT = 4096
+
+
+def _remember_jti(issuer, jti, exp):
+    """True when this (iss, jti) pair was already used inside its lifetime."""
+    if not jti:
+        return False
+    now = int(time.time())
+    key = (str(issuer), str(jti))
+    with _replay_lock:
+        for old in [k for k, until in _replay_seen.items() if until <= now]:
+            _replay_seen.pop(old, None)
+        until = _replay_seen.get(key)
+        if until and until > now:
+            return True
+        _replay_seen[key] = int(exp or (now + 120))
+        while len(_replay_seen) > _REPLAY_LIMIT:
+            _replay_seen.pop(min(_replay_seen, key=_replay_seen.get), None)
+    return False
+
+
+def _reset_replay_cache():
+    """Drop every consumed (iss, jti) pair. Used by tests."""
+    with _replay_lock:
+        _replay_seen.clear()
+
+
+def _unverified_claims(token):
+    """The payload of a token with its signature still unchecked."""
+    try:
+        payload = token.split(".", 2)[1]
+        data = json.loads(_b64d(payload))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _ws_token(websocket):
     tok = (websocket.query_params.get("token") or "").strip()
     if tok:
@@ -308,32 +371,191 @@ def request_status(server_uid):
         DB.release_connection(conn)
 
 
-def record_request(server_uid, hostname, host, note="", remote_version=""):
-    """Record an incoming handshake. An already-allowed panel stays allowed;
-    a denied one stays denied until the local admin changes it."""
+def request_record(server_uid):
+    """The decision and the bound key for one peer.
+
+    peer_key is decrypted here and used only to verify that peer's tokens. It is
+    never returned to a route handler's caller and never logged.
+    """
     conn = DB.get_connection()
     try:
         ensure_schema(conn)
         cur = conn.cursor()
         cur.execute(
+            "SELECT status, peer_key_cipher FROM merge_request WHERE server_uid=%s",
+            (server_uid,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return {"status": None, "has_peer_key": False, "peer_key": ""}
+        key = vault.decrypt(row[1] or "")
+        return {"status": row[0], "has_peer_key": bool(key), "peer_key": key}
+    finally:
+        DB.release_connection(conn)
+
+
+_UID_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+class PeerKeyConflict(Exception):
+    """A peer presented a different link key than the one already bound."""
+
+
+def _checked_server_uid(server_uid):
+    uid = server_uid if isinstance(server_uid, str) else ""
+    if not 8 <= len(uid) <= 64:
+        raise ValueError("A server id must be 8 to 64 characters.")
+    if not set(uid) <= _UID_ALLOWED:
+        raise ValueError(
+            "A server id may only contain letters, numbers, _ and -.")
+    return uid
+
+
+def record_request(server_uid, hostname, host, note="", remote_version="",
+                   link_key=None):
+    """Record an incoming handshake and bind the key it presented.
+
+    An already-allowed panel stays allowed and a denied one stays denied until
+    the local admin changes it. The first non-empty link_key wins: a later
+    handshake for the same uid may repeat that key but can never replace it, so
+    one peer cannot inherit another peer's approval by announcing a new key.
+    """
+    server_uid = _checked_server_uid(server_uid)
+    link_key = link_key or ""
+    if link_key:
+        if not 16 <= len(link_key) <= 200 or \
+                any(ord(ch) < 32 or ord(ch) == 127 for ch in link_key):
+            raise ValueError("The link key is not valid.")
+    new_cipher = vault.encrypt(link_key) if link_key else ""
+    conn = DB.get_connection()
+    try:
+        ensure_schema(conn)
+        cur = conn.cursor()
+        # If the vault key rotated, the stored cipher may no longer decrypt.
+        # Treat that as an unbound link and clear it with a compare-and-set on
+        # the exact ciphertext, so a concurrent handshake is not overwritten.
+        cur.execute(
+            "SELECT peer_key_cipher FROM merge_request WHERE server_uid=%s",
+            (server_uid,))
+        found = cur.fetchone()
+        if found and found[0] and not vault.decrypt(found[0]):
+            cur.execute(
+                "UPDATE merge_request SET peer_key_cipher='' "
+                "WHERE server_uid=%s AND peer_key_cipher=%s",
+                (server_uid, found[0]))
+        # One statement, so concurrent handshakes cannot interleave between a
+        # read and a write. The existing key (if any) always wins; an empty one
+        # is filled by the key this handshake presented. A link that was
+        # allowed or denied before per-peer keys is moved back to pending so an
+        # admin re-approves the key instead of inheriting the old decision.
+        cur.execute(
             """INSERT INTO merge_request
-                   (server_uid, hostname, host, note, remote_version)
-               VALUES (%s, %s, %s, %s, %s)
+                   (server_uid, hostname, host, note, remote_version,
+                    peer_key_cipher)
+               VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (server_uid) DO UPDATE
-                 SET hostname=EXCLUDED.hostname,
-                     host=EXCLUDED.host,
-                     remote_version=EXCLUDED.remote_version,
-                     last_seen=now()""",
+                 SET peer_key_cipher = CASE
+                         WHEN merge_request.peer_key_cipher = ''
+                         THEN EXCLUDED.peer_key_cipher
+                         ELSE merge_request.peer_key_cipher END,
+                     status = CASE
+                         WHEN merge_request.peer_key_cipher = ''
+                              AND EXCLUDED.peer_key_cipher <> ''
+                              AND merge_request.status = 'allowed'
+                         THEN 'pending'
+                         ELSE merge_request.status END
+               RETURNING status, peer_key_cipher""",
             (server_uid, (hostname or "")[:300], (host or "")[:300],
-             (note or "")[:1000], (remote_version or "")[:64]))
+             (note or "")[:1000], (remote_version or "")[:64], new_cipher))
+        status, stored_cipher = cur.fetchone()
+        stored_key = vault.decrypt(stored_cipher or "")
+        if link_key and stored_key and stored_key != link_key:
+            # The update kept the original key and did not touch the status, so
+            # nothing changed. Refuse the handshake instead of letting one peer
+            # replace another's binding.
+            raise PeerKeyConflict(
+                "That server is already linked with a different key.")
+        # Only a handshake that matched (or newly bound) gets to refresh the
+        # request metadata, so a mismatched caller cannot rewrite the record.
+        cur.execute(
+            """UPDATE merge_request
+               SET hostname=%s, host=%s, remote_version=%s, last_seen=now()
+               WHERE server_uid=%s""",
+            ((hostname or "")[:300], (host or "")[:300],
+             (remote_version or "")[:64], server_uid))
         conn.commit()
-        cur.execute("SELECT status FROM merge_request WHERE server_uid=%s",
-                    (server_uid,))
-        status = cur.fetchone()[0]
         cur.close()
         return status
     finally:
         DB.release_connection(conn)
+
+
+def verify_incoming(token, purpose="api", allow_pending=False,
+                    require_request=True, ident=None):
+    """Check a token from another panel and report what it may do.
+
+    A peer allowed on this panel is bound to the key it presented in its first
+    handshake, and only that key may sign its data calls. The handshake and the
+    status poll are the only purposes that may still arrive signed with this
+    panel's own key, because that is how an unbound peer introduces itself.
+    Every other purpose requires a bound peer key.
+
+    Returns (claims, error) where error carries the HTTP status, the message
+    and an optional machine code ("link_key_required").
+    """
+    ident = ident or ensure_local_identity()
+    hinted = _unverified_claims(token or "")
+    issuer = hinted.get("iss")
+    # Only a bounded lookup key is taken from the unverified payload; nothing is
+    # trusted until the signature is checked below.
+    if not isinstance(issuer, str) or not 1 <= len(issuer) <= 64 or \
+            not set(issuer) <= _UID_ALLOWED:
+        return None, {"status": 401, "error": "Invalid server token."}
+    record = request_record(issuer)
+    peer_key = record.get("peer_key") or ""
+    local_key = ident.get("key") or ""
+    keys = [peer_key] if peer_key else []
+    if purpose in ("handshake", "status") or not peer_key:
+        # Bootstrap purposes must also keep working after the peer is bound: a
+        # linked panel always signs those with the receiving panel's key.
+        if local_key and local_key not in keys:
+            keys.append(local_key)
+    data = None
+    for key in keys:
+        data = verify_token(token, key)
+        if data:
+            break
+    if not data:
+        return None, {"status": 401, "error": "Invalid server token."}
+    if data.get("aud") and data.get("aud") != ident.get("server_uid"):
+        return None, {"status": 401, "error": "Invalid server token."}
+    if data.get("purpose") != purpose:
+        return None, {"status": 401, "error": "Invalid server token."}
+    # The audience is this panel's uid. The first handshake cannot know it yet
+    # (the add flow has not stored the peer uid), so allow an empty aud only for
+    # handshake; every later call must name this panel.
+    aud = data.get("aud")
+    if purpose == "handshake":
+        if aud and aud != ident.get("server_uid"):
+            return None, {"status": 401, "error": "Invalid server token."}
+    elif not aud or aud != ident.get("server_uid"):
+        return None, {"status": 401, "error": "Invalid server token."}
+    if not peer_key and purpose not in ("handshake", "status"):
+        # Never accept a data call that only proves possession of this panel's
+        # own key: any peer holding it could then act as any other peer.
+        return None, {"status": 401, "error": "That server has not bound a link key yet.",
+                      "code": "link_key_required"}
+    status = record.get("status")
+    if status is None:
+        if require_request:
+            return None, {"status": 401,
+                          "error": "This server has not requested access."}
+    elif status != "allowed" and not allow_pending:
+        return None, {"status": 401, "error": "This server is not allowed yet."}
+    if _remember_jti(data.get("iss"), data.get("jti"), data.get("exp")):
+        return None, {"status": 401, "error": "This server token was already used."}
+    return data, None
 
 
 def list_requests():
@@ -444,6 +666,8 @@ def normalize_target(host, port=None, base_path=""):
     path = path.rstrip("/")
     if path == "/":
         path = ""
+    if len(path) > 200:
+        raise ValueError("The panel path must be 200 characters or fewer.")
     name = parts.hostname or ""
     if not name:
         raise ValueError("That host is not valid.")
@@ -457,28 +681,38 @@ def create_server(name, host, port, base_path, key, created_by=""):
     key = (key or "").strip()
     if len(key) < 16:
         raise ValueError("The private key is too short. Paste the key shown on the other panel.")
+    if len(key) > 200 or any(ord(ch) < 32 or ord(ch) == 127 for ch in key):
+        raise ValueError("The private key is not valid. Paste the key shown on the other panel.")
     ensure_local_identity()
     server_id = uuid.uuid4().hex
     key_id = uuid.uuid4().hex
+    link_key = _new_key()
     conn = DB.get_connection()
     try:
         ensure_schema(conn)
-        cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO merge_serverkey (key_id, role, label, key_cipher)
-               VALUES (%s, 'remote', %s, %s)""",
-            (key_id, (name or target["host"])[:200], vault.encrypt(key)))
-        cur.execute(
-            """INSERT INTO merge_server
-                   (id, name, host, port, scheme, base_path, key_id, status,
-                    position, created_by)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending',
-                       COALESCE((SELECT MAX(position)+1 FROM merge_server), 0), %s)""",
-            (server_id, (name or target["host"])[:120], target["host"],
-             target["port"], target["scheme"], target["base_path"], key_id,
-             created_by or ""))
-        conn.commit()
-        cur.close()
+        conn.autocommit = False
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO merge_serverkey (key_id, role, label, key_cipher)
+                   VALUES (%s, 'remote', %s, %s)""",
+                (key_id, (name or target["host"])[:200], vault.encrypt(key)))
+            cur.execute(
+                """INSERT INTO merge_server
+                       (id, name, host, port, scheme, base_path, key_id,
+                        link_key_cipher, status, position, created_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending',
+                           COALESCE((SELECT MAX(position)+1 FROM merge_server), 0), %s)""",
+                (server_id, (name or target["host"])[:120], target["host"],
+                 target["port"], target["scheme"], target["base_path"], key_id,
+                 vault.encrypt(link_key), created_by or ""))
+            conn.commit()
+            cur.close()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.autocommit = True
     finally:
         DB.release_connection(conn)
     return server_id
@@ -510,6 +744,36 @@ def _key_for_server(row):
     if not key:
         raise ValueError("The key for that linked server cannot be read. Replace it.")
     return key
+
+
+def _link_key_for_server(row):
+    """The key this panel signs DATA calls with for one linked peer.
+
+    New links get a key generated for that relationship only, so a different
+    peer that holds this panel's bootstrap key cannot mint a token claiming to
+    be this panel. Links created before that column existed fall back to the
+    local identity key, which keeps them working until they are re-added.
+    """
+    key = row.get("link_key")
+    if key:
+        return key
+    cipher = row.get("link_key_cipher")
+    if not cipher and row.get("id"):
+        conn = DB.get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT link_key_cipher FROM merge_server WHERE id=%s",
+                (row["id"],))
+            found = cur.fetchone()
+            cur.close()
+            cipher = found[0] if found else None
+        finally:
+            DB.release_connection(conn)
+    key = vault.decrypt(cipher or "")
+    if key:
+        return key
+    return ensure_local_identity()["key"]
 
 
 def list_servers(include_pending=True):
@@ -551,7 +815,8 @@ def get_server(server_id, include_key=False):
         cur = conn.cursor()
         cur.execute(
             """SELECT m.id, m.name, m.host, m.port, m.scheme, m.base_path,
-                      m.key_id, m.server_uid, m.remote_hostname, m.remote_version,
+                      m.key_id, m.link_key_cipher, m.server_uid,
+                      m.remote_hostname, m.remote_version,
                       m.status, m.approved, m.last_error, m.last_seen, m.position,
                       m.created_by, m.created_at, k.key_cipher
                FROM merge_server m
@@ -565,7 +830,9 @@ def get_server(server_id, include_key=False):
         out = dict(zip(cols, row))
         if include_key:
             out["key"] = vault.decrypt(out["key_cipher"])
+            out["link_key"] = vault.decrypt(out.get("link_key_cipher") or "")
         out.pop("key_cipher", None)
+        out.pop("link_key_cipher", None)
         out.update(version_state(out.get("remote_version")))
         cur.close()
         return out
@@ -649,18 +916,26 @@ def delete_server(server_id):
     conn = DB.get_connection()
     try:
         ensure_schema(conn)
-        cur = conn.cursor()
-        cur.execute("SELECT key_id FROM merge_server WHERE id=%s", (server_id,))
-        row = cur.fetchone()
-        if not row:
+        conn.autocommit = False
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT key_id FROM merge_server WHERE id=%s", (server_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.rollback()
+                return False
+            cur.execute("DELETE FROM merge_server WHERE id=%s", (server_id,))
+            cur.execute("DELETE FROM merge_serverkey WHERE key_id=%s", (row[0],))
+            cur.execute("DELETE FROM merge_user_access WHERE server_id=%s", (server_id,))
+            conn.commit()
             cur.close()
-            return False
-        cur.execute("DELETE FROM merge_server WHERE id=%s", (server_id,))
-        cur.execute("DELETE FROM merge_serverkey WHERE key_id=%s", (row[0],))
-        cur.execute("DELETE FROM merge_user_access WHERE server_id=%s", (server_id,))
-        conn.commit()
-        cur.close()
-        return True
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.autocommit = True
     finally:
         DB.release_connection(conn)
 
@@ -832,7 +1107,16 @@ def server_ws_url(server, path=""):
 
 
 def make_server_token(server, subject="server", role="admin", scopes=None,
-                      purpose="api", ttl=120):
+                      purpose="api", ttl=120, bootstrap=False):
+    """A short-lived token for one call to a linked panel.
+
+    bootstrap is only for the two calls that an unbound peer makes: the
+    handshake and the status poll. They are signed with the receiving panel's
+    key because that is the only key both sides already know. Every data call
+    is signed with the key generated for this one link, which the receiver
+    bound at handshake time, so holding another peer's key never grants data
+    access.
+    """
     ident = ensure_local_identity()
     claims = {
         "iss": ident["server_uid"],
@@ -845,7 +1129,13 @@ def make_server_token(server, subject="server", role="admin", scopes=None,
         "hostname": _local_label(),
         "version": panel_version(),
     }
-    return sign_token(_key_for_server(server), claims, ttl=ttl)
+    key = _key_for_server(server) if bootstrap else _link_key_for_server(server)
+    return sign_token(key, claims, ttl=ttl)
+
+
+def _needs_link_key(data):
+    """True for the 401 that means the other side has not bound our key yet."""
+    return isinstance(data, dict) and data.get("code") == "link_key_required"
 
 
 def _open_request(url, token, method="GET", body=None, timeout=10,
@@ -871,11 +1161,24 @@ def http_call(server, path, token, method="GET", body=None, timeout=10):
     url = server_url(server, path)
     try:
         with _open_request(url, token, method=method, body=body, timeout=timeout) as resp:
-            raw = resp.read(5_000_000)
+            limit = 5_000_000
+            raw = resp.read(limit + 1)
+            if len(raw) > limit:
+                message = "The remote response is too large to read."
+                return 502, {"error": message}, message
             try:
-                return resp.status, json.loads(raw or b"{}"), ""
+                data = json.loads(raw) if raw else None
             except Exception:
+                data = None
+            if not isinstance(data, dict):
+                if 200 <= resp.status < 300:
+                    # A 2xx with an empty, short or non-object body is not a
+                    # success: the caller would otherwise act on partial or
+                    # missing data as if the peer had answered.
+                    message = "The remote panel returned an invalid response."
+                    return 502, {"error": message}, message
                 return resp.status, {"raw": raw.decode("utf-8", "replace")}, ""
+            return resp.status, data, ""
     except urllib.error.HTTPError as e:
         try:
             raw = e.read(1_000_000)
@@ -890,24 +1193,39 @@ def http_call(server, path, token, method="GET", body=None, timeout=10):
         return 0, None, f"{type(e).__name__}: {e}"
 
 
-def handshake(server_id):
+def handshake(server_id, timeout=8):
     """Introduce this panel to the remote one, or refresh a known link.
 
     Returns a dict that is safe to hand back to the browser. The local record is
-    updated with the remote uid, hostname and status.
+    updated with the remote uid, hostname and status. The body carries this
+    panel's own key as link_key so the receiver can bind it to this uid; that is
+    the only moment the key crosses the wire.
     """
     server = get_server(server_id, include_key=True)
     if not server:
         return {"ok": False, "error": "That server is no longer listed."}
-    token = make_server_token(server, scopes=["handshake"], purpose="handshake")
+    link_key = _link_key_for_server(server)
+    token = make_server_token(server, scopes=["handshake"], purpose="handshake",
+                              bootstrap=True)
     code, data, err = http_call(
         server, "/api/merge/handshake", token, method="POST",
-        body={"hostname": _local_label(), "host": _local_label()}, timeout=8)
+        body={"hostname": _local_label(), "host": _local_label(),
+              "link_key": link_key}, timeout=timeout)
     if code == 0:
         update_server(server_id, status="down", last_error=err[:500])
         return {"ok": False, "status": "down", "error": err}
     if code != 200 or not isinstance(data, dict):
         msg = (data or {}).get("error") or err or f"HTTP {code}"
+        if code in (401, 403):
+            update_server(server_id, status="denied", approved=False,
+                          last_error=str(msg)[:500])
+            return {"ok": False, "status": "denied", "error": msg}
+        if code == 409:
+            # This panel already has a different key bound for us. It is not a
+            # network failure, so do not present it as one.
+            update_server(server_id, status="pending", approved=False,
+                          last_error=str(msg)[:500])
+            return {"ok": False, "status": "key_mismatch", "error": msg}
         update_server(server_id, status="down", last_error=str(msg)[:500])
         return {"ok": False, "status": "down", "error": msg}
     status = data.get("status") or "pending"
@@ -940,13 +1258,21 @@ def handshake(server_id):
     return result
 
 
-def refresh_status(server_id, timeout=5):
+def refresh_status(server_id, timeout=5, repaired=False):
+    started = time.monotonic()
+
+    def remaining():
+        """Keep the whole check, including a key repair, inside its budget."""
+        return max(0.05, timeout - (time.monotonic() - started))
+
     server = get_server(server_id, include_key=True)
     if not server or not server.get("server_uid"):
         return {"ok": False, "status": server.get("status") if server else "gone",
                 "error": "No handshake has completed yet."}
-    token = make_server_token(server, scopes=["status"], purpose="status")
-    code, data, err = http_call(server, "/api/merge/status", token, timeout=timeout)
+    token = make_server_token(server, scopes=["status"], purpose="status",
+                              bootstrap=True)
+    code, data, err = http_call(server, "/api/merge/status", token,
+                                timeout=remaining())
     if code == 0:
         update_server(server_id, status="down", last_error=err[:500])
         return {"ok": False, "status": "down", "error": err}
@@ -958,6 +1284,13 @@ def refresh_status(server_id, timeout=5):
             return {"ok": False, "status": "denied", "error": msg}
         update_server(server_id, status="down", last_error=str(msg)[:500])
         return {"ok": False, "status": "down", "error": msg}
+    if data.get("link_key_required") and not repaired:
+        # An allowed link from before per-peer keys: the other side has no key
+        # bound for this panel. Its handshake is idempotent and binds the key;
+        # poll once more so the caller sees the repaired state. Both steps share
+        # the original timeout budget.
+        handshake(server_id, timeout=remaining())
+        return refresh_status(server_id, timeout=remaining(), repaired=True)
     status = data.get("status") or "pending"
     approved = status == "allowed"
     remote_version = str(data.get("version") or "")[:64]
@@ -976,22 +1309,105 @@ def refresh_status(server_id, timeout=5):
     return result
 
 
+def prune_requests(uid_prefix=""):
+    """Drop stale handshakes, then keep only the newest 200 pending ones.
+
+    uid_prefix is for tests: it limits the delete to rows whose uid starts
+    with that string so a test never removes another suite's pending request
+    from the shared database. Production calls this with no prefix.
+    """
+    conn = DB.get_connection()
+    try:
+        ensure_schema(conn)
+        cur = conn.cursor()
+        clause, params = "", []
+        if uid_prefix:
+            clause = " AND left(server_uid, %s) = %s"
+            params = [len(uid_prefix), uid_prefix]
+        cur.execute(
+            """DELETE FROM merge_request
+               WHERE status IN ('pending', 'denied')
+                 AND (requested_at < now() - interval '30 days'
+                      OR last_seen < now() - interval '30 days')""" + clause,
+            params)
+        removed = cur.rowcount
+        cur.execute(
+            """DELETE FROM merge_request
+               WHERE status = 'pending'
+                 AND server_uid NOT IN (
+                     SELECT server_uid FROM merge_request
+                     WHERE status = 'pending'
+                     ORDER BY last_seen DESC, requested_at DESC, server_uid
+                     LIMIT 200)""" + clause,
+            params)
+        removed += cur.rowcount
+        conn.commit()
+        cur.close()
+        return removed
+    finally:
+        DB.release_connection(conn)
+
+
 def refresh_all_status(timeout=4):
     """Best-effort background sweep. One dead panel never blocks the others."""
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    try:
+        prune_requests()
+    except Exception:
+        pass
+
+    servers = [s for s in list_servers() if s.get("server_uid")]
     out = {}
-    for server in list_servers():
-        if not server.get("server_uid"):
-            continue
-        try:
-            out[server["id"]] = refresh_status(server["id"], timeout=timeout)
-        except Exception as e:
-            message = f"{type(e).__name__}: {e}"
-            try:
-                update_server(server["id"], status="down", last_error=message[:500])
-            except Exception:
-                pass
-            out[server["id"]] = {"ok": False, "status": "down",
-                                 "error": message}
+    if not servers:
+        return out
+
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError):
+        budget = 4.0
+    budget = max(0.0, budget)
+    deadline = time.monotonic() + budget
+    workers = max(1, min(8, len(servers)))
+    executor = ThreadPoolExecutor(max_workers=workers,
+                                  thread_name_prefix="merge-status")
+
+    def check(server_id):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"ok": False, "status": "down",
+                    "error": "Status check timed out."}
+        return refresh_status(server_id, timeout=min(budget, remaining))
+
+    futures = {}
+    try:
+        for server in servers:
+            futures[executor.submit(check, server["id"])] = server
+        done, _ = wait(list(futures),
+                        timeout=max(0.0, deadline - time.monotonic()))
+        for future, server in futures.items():
+            if future in done:
+                try:
+                    out[server["id"]] = future.result()
+                except Exception as e:
+                    message = f"{type(e).__name__}: {e}"
+                    try:
+                        update_server(server["id"], status="down",
+                                      last_error=message[:500])
+                    except Exception:
+                        pass
+                    out[server["id"]] = {"ok": False, "status": "down",
+                                         "error": message}
+            else:
+                # Do not persist "down" for work that was cancelled before it
+                # started: the peer was never contacted, and a busy sweep with
+                # more servers than workers would flap healthy links. A check
+                # that is still running writes its own result when it finishes.
+                future.cancel()
+                out[server["id"]] = {"ok": False, "status": "down",
+                                     "error": "Status check timed out."}
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     return out
 
 
@@ -1007,6 +1423,15 @@ def call_for_user(server, username, role, path, method="GET", body=None,
                               scopes=scopes, purpose="api")
     code, data, err = http_call(server, path, token, method=method, body=body,
                                 timeout=timeout)
+    if code == 401 and _needs_link_key(data):
+        # An allowed link from before per-peer keys. One handshake binds this
+        # panel's key on the other side and the call is retried once with a
+        # token signed by it.
+        handshake(server["id"])
+        token = make_server_token(server, subject=username, role=role,
+                                  scopes=scopes, purpose="api")
+        code, data, err = http_call(server, path, token, method=method,
+                                    body=body, timeout=timeout)
     if code == 0:
         update_server(server["id"], status="down", last_error=err[:500])
     elif code == 401:
@@ -1029,29 +1454,35 @@ def open_download(server, username, role, path, timeout=30):
     scopes = scopes_for(username, role, server)
     if "disk" not in scopes:
         return None, "Not permitted for this server."
-    token = make_server_token(server, subject=username, role=role,
-                              scopes=scopes, purpose="api")
     url = server_url(server, "/api/merge/download?" +
                      urllib.parse.urlencode({"path": path}))
-    try:
-        resp = _open_request(url, token, timeout=timeout)
-        update_server(server["id"], status="connected", approved=True,
-                      last_error="")
-        return resp, ""
-    except urllib.error.HTTPError as e:
+    for attempt in (0, 1):
+        token = make_server_token(server, subject=username, role=role,
+                                  scopes=scopes, purpose="api")
         try:
-            body = json.loads(e.read(2000) or b"{}")
-            message = body.get("error") or f"HTTP {e.code}"
-        except Exception:
-            message = f"HTTP {e.code}"
-        if e.code == 401:
-            update_server(server["id"], status="denied", approved=False,
-                          last_error=str(message)[:500])
-        return None, message
-    except Exception as e:
-        message = f"{type(e).__name__}: {e}"
-        update_server(server["id"], status="down", last_error=message[:500])
-        return None, message
+            resp = _open_request(url, token, timeout=timeout)
+            update_server(server["id"], status="connected", approved=True,
+                          last_error="")
+            return resp, ""
+        except urllib.error.HTTPError as e:
+            try:
+                body = json.loads(e.read(2000) or b"{}")
+                message = body.get("error") or f"HTTP {e.code}"
+            except Exception:
+                body = {}
+                message = f"HTTP {e.code}"
+            if e.code == 401 and _needs_link_key(body) and attempt == 0:
+                handshake(server["id"])
+                continue
+            if e.code == 401:
+                update_server(server["id"], status="denied", approved=False,
+                              last_error=str(message)[:500])
+            return None, message
+        except Exception as e:
+            message = f"{type(e).__name__}: {e}"
+            update_server(server["id"], status="down", last_error=message[:500])
+            return None, message
+    return None, "That server needs its link key refreshed."
 
 
 def upload_file(server, username, role, folder, name, fileobj, size,
@@ -1060,56 +1491,66 @@ def upload_file(server, username, role, folder, name, fileobj, size,
     scopes = scopes_for(username, role, server)
     if "disk" not in scopes:
         return 403, {"error": "Not permitted for this server."}
-    token = make_server_token(server, subject=username, role=role,
-                              scopes=scopes, purpose="api")
     parts = urllib.parse.urlsplit(server_url(server, "/api/merge/upload"))
     path = parts.path + "?" + urllib.parse.urlencode({"path": folder or "",
                                                       "name": name})
-    conn = None
-    try:
-        if parts.scheme == "https":
-            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443,
-                                               timeout=timeout,
-                                               context=ssl.create_default_context())
-        else:
-            conn = http.client.HTTPConnection(parts.hostname, parts.port or 80,
-                                              timeout=timeout)
-        conn.putrequest("POST", path)
-        conn.putheader("Authorization", "Bearer " + token)
-        conn.putheader("Cookie", "argus_merge=" + token)
-        conn.putheader("Content-Type", "application/octet-stream")
-        conn.putheader("Content-Length", str(int(size)))
-        conn.endheaders()
-        sent = 0
-        while True:
-            chunk = fileobj.read(1024 * 1024)
-            if not chunk:
-                break
-            conn.send(chunk)
-            sent += len(chunk)
-        resp = conn.getresponse()
-        raw = resp.read(2_000_000)
-        try:
-            data = json.loads(raw or b"{}")
-        except Exception:
-            data = {"error": raw.decode("utf-8", "replace")[:500]}
-        if resp.status == 200:
-            update_server(server["id"], status="connected", approved=True,
-                          last_error="")
-        elif resp.status == 401:
-            update_server(server["id"], status="denied", approved=False,
-                          last_error=str(data.get("error") or "access denied")[:500])
-        return resp.status, data
-    except Exception as e:
-        message = f"{type(e).__name__}: {e}"
-        try:
-            update_server(server["id"], status="down", last_error=message[:500])
-        except Exception:
-            pass
-        return 0, {"error": message}
-    finally:
-        if conn:
+    for attempt in (0, 1):
+        token = make_server_token(server, subject=username, role=role,
+                                  scopes=scopes, purpose="api")
+        if attempt:
             try:
-                conn.close()
+                fileobj.seek(0)
+            except Exception:
+                return 0, {"error": "The upload could not be restarted."}
+        conn = None
+        try:
+            if parts.scheme == "https":
+                conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443,
+                                                   timeout=timeout,
+                                                   context=ssl.create_default_context())
+            else:
+                conn = http.client.HTTPConnection(parts.hostname, parts.port or 80,
+                                                  timeout=timeout)
+            conn.putrequest("POST", path)
+            conn.putheader("Authorization", "Bearer " + token)
+            conn.putheader("Cookie", "argus_merge=" + token)
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(int(size)))
+            conn.endheaders()
+            sent = 0
+            while True:
+                chunk = fileobj.read(1024 * 1024)
+                if not chunk:
+                    break
+                conn.send(chunk)
+                sent += len(chunk)
+            resp = conn.getresponse()
+            raw = resp.read(2_000_000)
+            try:
+                data = json.loads(raw or b"{}")
+            except Exception:
+                data = {"error": raw.decode("utf-8", "replace")[:500]}
+            if resp.status == 200:
+                update_server(server["id"], status="connected", approved=True,
+                              last_error="")
+            elif resp.status == 401:
+                if _needs_link_key(data) and attempt == 0:
+                    handshake(server["id"])
+                    continue
+                update_server(server["id"], status="denied", approved=False,
+                              last_error=str(data.get("error") or "access denied")[:500])
+            return resp.status, data
+        except Exception as e:
+            message = f"{type(e).__name__}: {e}"
+            try:
+                update_server(server["id"], status="down", last_error=message[:500])
             except Exception:
                 pass
+            return 0, {"error": message}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return 0, {"error": "That server needs its link key refreshed."}

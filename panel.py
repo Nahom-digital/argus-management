@@ -36,6 +36,7 @@ import asyncio
 import logging
 import subprocess
 import tempfile
+import threading
 import ipaddress
 from contextlib import asynccontextmanager
 
@@ -88,14 +89,33 @@ SERVER_RUNTIME = {"host": None, "port": None}
 # ---------------------------------------------------------------------------
 def _load_jwt_secret() -> str:
     path = os.path.join(_PROJECT_DIR, ".session_secret")
-    if os.path.exists(path):
+    s = ""
+    try:
         with open(path) as f:
             s = f.read().strip()
-        if s:
-            return s
+    except OSError:
+        pass
+    if s:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            # A read-only filesystem must not take the panel down; the secret
+            # is still usable, only its mode cannot be tightened right now.
+            pass
+        return s
     s = os.urandom(32).hex()
-    with open(path, "w") as f:
-        f.write(s)
+    try:
+        flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            # Never truncate a symlink target planted in the install directory.
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(s)
+    except OSError as e:
+        # An unwritable install directory must not stop the panel from starting.
+        # The in-memory secret only means sessions do not survive a restart.
+        logging.error(f"could not persist the session secret: {e}")
     return s
 
 _JWT_SECRET = _load_jwt_secret()
@@ -105,58 +125,120 @@ _JWT_SECRET = _load_jwt_secret()
 # delete when a password changes. Instead every token records the auth epoch it
 # was minted under; bumping the stored epoch retires every token in circulation
 # at once. That is what makes "reset the password" actually evict an intruder.
-_EPOCH_CACHE = {"value": None, "read_at": 0.0}
-_EPOCH_TTL = 15.0          # seconds; bounds the per-request settings lookup
+#
+# Both epochs are mirrored in memory and read on every request without touching
+# the database. The lifespan primes them before the app serves anything, then a
+# background task refreshes them every _EPOCH_TTL seconds. 5 seconds is tighter
+# than the old 15s/10s cache windows, so a change made by another process is
+# revoked at least as quickly as before. Changes made by this process update
+# the cache immediately in _bump_auth_epoch/_forget_user_epoch.
+_EPOCH_TTL = 5.0
+_EPOCH_LOCK = threading.Lock()
+_EPOCH_CACHE = {"value": 0, "ready": False}
+_USER_EPOCH_CACHE = {}
+_EPOCH_GENERATION = 0
 
 def _auth_epoch() -> int:
-    now = time.time()
-    if _EPOCH_CACHE["value"] is None or now - _EPOCH_CACHE["read_at"] > _EPOCH_TTL:
+    """Memory only: this runs for every request and must never do I/O."""
+    return int(_EPOCH_CACHE["value"] or 0)
+
+def _read_user_epochs():
+    conn = DB.get_connection()
+    try:
+        # Includes tombstoned names. Reading only panel_user would drop a
+        # deleted account and make its epoch look like 0 again on the next
+        # refresh, revalidating a token that was just revoked.
+        return panel_users.epoch_map(conn)
+    finally:
+        DB.release_connection(conn)
+
+def _refresh_epoch_cache() -> int:
+    """One DB round trip for both epoch sources. Startup and the background
+    refresher call this; request handlers never do. A local bump wins over a
+    slower refresh that read the database before that bump."""
+    global _EPOCH_CACHE, _USER_EPOCH_CACHE
+    generation = _EPOCH_GENERATION
+    value = int(DB.get_setting("auth_epoch", "0") or 0)
+    users = _read_user_epochs()
+    with _EPOCH_LOCK:
+        if generation != _EPOCH_GENERATION:
+            return value
+        # Swap complete objects rather than mutating the ones request threads
+        # are reading. A reader sees either the old pair or the new pair.
+        _EPOCH_CACHE = {"value": value, "ready": True}
+        _USER_EPOCH_CACHE = dict(users)
+    return value
+
+def _prime_epoch_cache() -> bool:
+    """Cold start: load before the app serves. If the database is unavailable,
+    fail closed (auth is refused until a refresh succeeds) and let the
+    background task retry rather than doing a blocking lookup per request."""
+    global _EPOCH_CACHE, _USER_EPOCH_CACHE
+    try:
+        _refresh_epoch_cache()
+        return True
+    except Exception as e:
+        with _EPOCH_LOCK:
+            _EPOCH_CACHE = {"value": 0, "ready": False}
+            _USER_EPOCH_CACHE = {}
+        logging.error(f"session epoch cache could not be primed; failing closed: {e}")
+        return False
+
+async def _epoch_refresh_loop():
+    while True:
         try:
-            _EPOCH_CACHE["value"] = int(DB.get_setting("auth_epoch", "0") or 0)
-        except Exception:
-            # A database blip must not sign everybody out mid-session.
-            if _EPOCH_CACHE["value"] is None:
-                _EPOCH_CACHE["value"] = 0
-        _EPOCH_CACHE["read_at"] = now
-    return _EPOCH_CACHE["value"]
+            await asyncio.sleep(_EPOCH_TTL)
+        except asyncio.CancelledError:
+            return
+        try:
+            await DB.run(_refresh_epoch_cache)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logging.warning(f"session epoch refresh failed: {e}")
 
 def _bump_auth_epoch() -> int:
-    nxt = _auth_epoch() + 1
+    global _EPOCH_GENERATION, _EPOCH_CACHE
+    with _EPOCH_LOCK:
+        nxt = int(_EPOCH_CACHE["value"] or 0) + 1
     DB.set_setting("auth_epoch", nxt)
-    _EPOCH_CACHE["value"], _EPOCH_CACHE["read_at"] = nxt, time.time()
+    with _EPOCH_LOCK:
+        _EPOCH_GENERATION += 1
+        _EPOCH_CACHE = {"value": nxt, "ready": True}
     return nxt
 
 # The epoch above is global: bumping it signs out everybody, which is right for
 # the admin changing their own password and wrong for the admin resetting one
 # staff member's. So each staff row carries its own epoch too, and a token is
-# valid only while both still match. Cached briefly because it is read on every
-# single request; _forget_user_epoch() makes a reset take effect immediately
-# for the path that performed it.
-_USER_EPOCH_CACHE = {}
-_USER_EPOCH_TTL = 10.0
-
+# valid only while both still match. The whole table is cached in memory and
+# refreshed with the global epoch.
 def _user_epoch(username: str) -> int:
+    """Memory only: see _auth_epoch."""
     if not username:
         return 0
-    now = time.time()
-    hit = _USER_EPOCH_CACHE.get(username)
-    if hit and now - hit[1] <= _USER_EPOCH_TTL:
-        return hit[0]
+    return int(_USER_EPOCH_CACHE.get(username, 0) or 0)
+
+def _forget_user_epoch(username: str) -> None:
+    """Refresh one account after an admin changed it, so a reset or narrowed
+    grant set takes effect on its very next request instead of at the next
+    background sweep."""
+    global _EPOCH_GENERATION, _USER_EPOCH_CACHE
+    if not username:
+        return
     try:
         conn = DB.get_connection()
         try:
             value = panel_users.auth_epoch_for(conn, username)
         finally:
             DB.release_connection(conn)
-    except Exception:
-        # A database blip must not sign anybody out mid-session. Reuse the last
-        # known value, and only fall back to 0 if we have never read one.
-        return hit[0] if hit else 0
-    _USER_EPOCH_CACHE[username] = (value, now)
-    return value
-
-def _forget_user_epoch(username: str) -> None:
-    _USER_EPOCH_CACHE.pop(username, None)
+    except Exception as e:
+        logging.warning(f"could not refresh session epoch for {username}: {e}")
+        return
+    with _EPOCH_LOCK:
+        _EPOCH_GENERATION += 1
+        users = dict(_USER_EPOCH_CACHE)
+        users[username] = int(value or 0)
+        _USER_EPOCH_CACHE = users
 
 # How long a signed session cookie is good for. Stated once so the cookie, the
 # token claim and the row in the sessions log cannot disagree about when a
@@ -182,6 +264,11 @@ def _get_token_data(token: str):
             return None
         data = json.loads(payload)
         if data.get("exp", 0) <= int(time.time()):
+            return None
+        # If the epoch cache could not be primed (database down at startup),
+        # refuse every session until a refresh succeeds instead of treating an
+        # unknown epoch as zero and accepting stale tokens.
+        if not _EPOCH_CACHE.get("ready"):
             return None
         # Tokens minted before the current epoch were revoked by a password change.
         if int(data.get("ae", 0)) != _auth_epoch():
@@ -2107,7 +2194,7 @@ async def _merge_status_loop():
     dead host. One sweep runs in the DB thread and never raises into the app."""
     while True:
         try:
-            await DB.run(merge_servers.refresh_all_status, 4)
+            await DB.run_net(merge_servers.refresh_all_status, 4)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -2139,15 +2226,27 @@ async def lifespan(app: FastAPI):
         merge_servers.ensure_local_identity()
     except Exception as e:
         logging.error(f"merge identity failed: {e}")
+    # Prime the session epoch cache before serving, then keep it fresh without
+    # putting a database lookup on the request path.
+    try:
+        await DB.run(_prime_epoch_cache)
+    except Exception as e:
+        logging.error(f"session epoch cache prime failed; failing closed: {e}")
+    epoch_task = asyncio.create_task(_epoch_refresh_loop())
     merge_task = asyncio.create_task(_merge_status_loop())
     write_log("INFO", "SYSTEM", "Management panel started", actor="system", detail=f"pid={os.getpid()}")
     yield
     merge_task.cancel()
-    try:
-        await merge_task
-    except asyncio.CancelledError:
-        pass
+    epoch_task.cancel()
+    for task in (merge_task, epoch_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     write_log("INFO", "SYSTEM", "Management panel stopped", actor="system")
+    # Stop the outbound linked-server pool. The DB pool is left to process exit
+    # so a connection still checked out by a request is not yanked away.
+    DB.close_net_pool()
 
 app = FastAPI(title="Management", lifespan=lifespan)
 # Added first => innermost, so it sees the path after the prefix is stripped and
@@ -2407,9 +2506,11 @@ async def api_account_password(request: Request):
             # update_user already did.
             await DB.run(_bump_auth_epoch)
             _close_local_terminals()
+            await _close_merge_proxies()
         else:
-            _forget_user_epoch(username)
+            await DB.run(_forget_user_epoch, username)
             _close_local_terminals(username)
+            await _close_merge_proxies(username)
     except Exception as e:
         logging.error(f"password change failed: {e}")
         return JSONResponse(status_code=500, content={"error": "Could not update the password."})
@@ -2545,26 +2646,52 @@ async def api_identity_avatar_set(request: Request):
     if not _authed(request):
         return _need_auth()
     username = _admin_name(request)
+    limit = identity.MAX_UPLOAD
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > identity.MAX_UPLOAD:
+    if declared.isdigit() and int(declared) > limit:
         return JSONResponse(status_code=413, content={
-            "error": f"Use a file under {identity.MAX_UPLOAD // 1024} KB."})
-    raw = await request.body()
-    if len(raw) > identity.MAX_UPLOAD:
-        return JSONResponse(status_code=413, content={
-            "error": f"Use a file under {identity.MAX_UPLOAD // 1024} KB."})
+            "error": f"Use a file under {limit // 1024} KB."})
+    # Stage the body the same way the disk upload does: never read more than
+    # the limit into memory, and remove the staging file whether the upload is
+    # refused, abandoned, or stored.
     try:
+        fd, temp_path = tempfile.mkstemp(prefix=".argus-avatar-")
+    except OSError as e:
+        logging.error(f"could not create an avatar staging file: {e}")
+        return JSONResponse(status_code=500, content={"error": "Could not store that picture."})
+    total = 0
+    too_large = False
+    try:
+        with os.fdopen(fd, "wb") as out:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > limit:
+                    too_large = True
+                    break
+                out.write(chunk)
+        if too_large:
+            return JSONResponse(status_code=413, content={
+                "error": f"Use a file under {limit // 1024} KB."})
+        with open(temp_path, "rb") as fh:
+            raw = fh.read()
         ok, detail = await DB.run(_identity_work, identity.set_avatar, username, raw)
+        if not ok:
+            write_log("WARN", "SETTINGS", "Picture refused", actor=username,
+                      ip=_client_ip(request), detail=detail, status="denied")
+            return JSONResponse(status_code=400, content={"error": detail})
+        write_log("ACTION", "SETTINGS", "Picture changed", actor=username,
+                  ip=_client_ip(request), detail=f"{detail}, {total} bytes uploaded")
+        return {"status": "ok", "kind": detail}
     except Exception as e:
         logging.error(f"avatar upload failed: {e}")
         return JSONResponse(status_code=500, content={"error": "Could not store that picture."})
-    if not ok:
-        write_log("WARN", "SETTINGS", "Picture refused", actor=username,
-                  ip=_client_ip(request), detail=detail, status="denied")
-        return JSONResponse(status_code=400, content={"error": detail})
-    write_log("ACTION", "SETTINGS", "Picture changed", actor=username,
-              ip=_client_ip(request), detail=f"{detail}, {len(raw)} bytes uploaded")
-    return {"status": "ok", "kind": detail}
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
 
 @app.delete("/api/account/avatar")
 async def api_identity_avatar_clear(request: Request):
@@ -2751,6 +2878,7 @@ async def api_recover(request: Request):
     except Exception as e:
         logging.error(f"epoch bump after recovery failed: {e}")
     _close_local_terminals()
+    await _close_merge_proxies()
 
     write_log("ACTION", "SECURITY", "Password reset with a recovery code", actor=username,
               ip=ip, detail=f"{left} code(s) remaining; all sessions signed out")
@@ -3093,7 +3221,7 @@ async def api_merge_server_add(request: Request):
     except Exception as e:
         logging.error(f"linked-server add failed: {e}")
         return JSONResponse(status_code=500, content={"error": "Could not save that server."})
-    result = await DB.run(merge_servers.handshake, server_id)
+    result = await DB.run_net(merge_servers.handshake, server_id)
     write_log("ACTION", "SERVER", "Added linked server", actor=_admin_name(request),
               ip=_client_ip(request), target=(body.get("host") or "")[:200],
               detail=result.get("status", ""))
@@ -3109,13 +3237,18 @@ async def api_merge_server_key(request: Request, server_id: str):
     if denied:
         return denied
     body = await _json_body(request)
+    row = await DB.run(merge_servers.get_server, server_id, False)
     try:
         ok = await DB.run(merge_servers.replace_server_key, server_id, body.get("key"))
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     if not ok:
         return JSONResponse(status_code=404, content={"error": "No such server."})
-    result = await DB.run(merge_servers.handshake, server_id)
+    issuer = (row or {}).get("server_uid") or ""
+    if issuer:
+        _merge_revoke_bump(issuer)
+    await _end_merge_proxies(server_id)
+    result = await DB.run_net(merge_servers.handshake, server_id)
     write_log("ACTION", "SECURITY", "Replaced linked-server key",
               actor=_admin_name(request), ip=_client_ip(request),
               target=server_id, detail=result.get("status", ""))
@@ -3145,8 +3278,10 @@ async def api_merge_rotate_key(request: Request):
         return denied
     ident = await DB.run(merge_servers.rotate_local_key)
     # The old key may have been shared with every linked panel; cut their live
-    # root shells too, not just future token checks.
+    # root shells too, not just future token checks. The generation bump
+    # catches a session that is still between approval and registration.
     _close_merge_terminals()
+    _merge_revoke_all()
     write_log("ACTION", "SECURITY", "Rotated linked-server key",
               actor=_admin_name(request), ip=_client_ip(request),
               target=ident.get("server_uid", ""))
@@ -3180,7 +3315,9 @@ async def api_merge_request_decide(request: Request, server_uid: str):
         return JSONResponse(status_code=404, content={"error": "No such request."})
     if action == "deny":
         # Revocation is immediate: do not leave a root shell open from the panel
-        # whose access was just withdrawn.
+        # whose access was just withdrawn. The generation bump also covers one
+        # that has not reached _TERMS yet.
+        _merge_revoke_bump(server_uid)
         _close_merge_terminals(server_uid)
     write_log("ACTION", "SECURITY",
               "Allowed linked server" if action == "allow" else "Denied linked server",
@@ -3199,9 +3336,9 @@ async def api_merge_server_retry(request: Request, server_id: str):
     if not row:
         return JSONResponse(status_code=404, content={"error": "No such server."})
     if row.get("server_uid"):
-        result = await DB.run(merge_servers.refresh_status, server_id)
+        result = await DB.run_net(merge_servers.refresh_status, server_id)
     else:
-        result = await DB.run(merge_servers.handshake, server_id)
+        result = await DB.run_net(merge_servers.handshake, server_id)
     return {"status": "ok", "result": result,
             "server": await DB.run(merge_servers.get_server, server_id)}
 
@@ -3228,35 +3365,31 @@ async def api_merge_server_delete(request: Request, server_id: str):
 # Linked management servers: what another panel may call
 #
 # These routes are exempt from the Cloudflare edge gate in _CloudflareOnly and
-# do their own work: verify the JWT with this panel's private key, check the
-# issuer is an allowed request, then check the scope the token was minted for.
+# do their own work: verify the JWT against the key that peer bound at
+# handshake time (or this panel's key for the first handshake and the status
+# poll), check the issuer is an allowed request, then check the scope the token
+# was minted for.
 # ---------------------------------------------------------------------------
 async def _merge_local_identity():
     return await DB.run(merge_servers.ensure_local_identity)
 
 
-def _merge_verify(data, ident):
-    if not data:
-        return None
-    if data.get("aud") and data.get("aud") != ident.get("server_uid"):
-        return None
-    return data
+def _merge_token_error(err):
+    content = {"error": (err or {}).get("error") or "Invalid server token."}
+    if (err or {}).get("code"):
+        content["code"] = err["code"]
+    return JSONResponse(status_code=int((err or {}).get("status") or 401),
+                        content=content)
 
 
 async def _merge_incoming(request: Request, required_scope=None, purpose="api",
                           allow_pending=False):
     ident = await _merge_local_identity()
     token = merge_servers._token_from_request(request)
-    data = _merge_verify(merge_servers.verify_token(token, ident.get("key", "")), ident)
-    if not data or data.get("purpose") != purpose:
-        return None, JSONResponse(status_code=401, content={"error": "Invalid server token."})
-    issuer = data.get("iss")
-    status = await DB.run(merge_servers.request_status, issuer)
-    if not status:
-        return None, JSONResponse(status_code=401, content={"error": "This server has not requested access."})
-    if status != "allowed" and not allow_pending:
-        return None, JSONResponse(status_code=401,
-                                  content={"error": "This server is not allowed yet."})
+    data, err = await DB.run(merge_servers.verify_incoming, token, purpose,
+                             allow_pending, True, ident)
+    if err:
+        return None, _merge_token_error(err)
     scopes = data.get("scopes") or []
     if required_scope and required_scope not in scopes:
         return None, JSONResponse(status_code=401, content={"error": "That scope is not granted."})
@@ -3267,13 +3400,22 @@ async def _merge_incoming(request: Request, required_scope=None, purpose="api",
 async def api_merge_handshake(request: Request):
     ident = await _merge_local_identity()
     token = merge_servers._token_from_request(request)
-    data = _merge_verify(merge_servers.verify_token(token, ident.get("key", "")), ident)
-    if not data or data.get("purpose") != "handshake":
-        return JSONResponse(status_code=401, content={"error": "Invalid server token."})
+    data, err = await DB.run(merge_servers.verify_incoming, token, "handshake",
+                             True, False, ident)
+    if err:
+        return _merge_token_error(err)
     try:
         body = await request.json()
     except Exception:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
+    link_key = body.get("link_key")
+    if not isinstance(link_key, str) or not 16 <= len(link_key) <= 200 or \
+            any(ord(ch) < 32 or ord(ch) == 127 for ch in link_key):
+        return JSONResponse(status_code=400, content={
+            "error": "The link key is missing or not valid.",
+            "code": "link_key_invalid"})
     hostname = (body.get("hostname") or data.get("hostname") or "")
     # Prefer the address this request actually came from over a self-reported
     # string: the request row is there to tell the admin where to look.
@@ -3281,15 +3423,24 @@ async def api_merge_handshake(request: Request):
     # The token is signed, so its version claim cannot be invented by the
     # request body or a middle hop.
     remote_version = str(data.get("version") or "")[:64]
-    status = await DB.run(merge_servers.record_request, data.get("iss"),
-                          hostname, host, "", remote_version)
+    try:
+        status = await DB.run(merge_servers.record_request, data.get("iss"),
+                              hostname, host, "", remote_version, link_key)
+    except merge_servers.PeerKeyConflict as e:
+        return JSONResponse(status_code=409, content={
+            "error": str(e), "code": "link_key_mismatch"})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    record = await DB.run(merge_servers.request_record, data.get("iss"))
     write_log("INFO", "SECURITY", "Linked server handshake",
               actor=f"merge:{str(data.get('iss'))[:12]}",
               ip=_client_ip(request), target=(hostname or host)[:200],
-              detail=f"status={status} version={remote_version or 'unknown'}")
+              detail=f"status={status} bound={bool(record.get('has_peer_key'))} "
+                     f"version={remote_version or 'unknown'}")
     return {"status": "allowed" if status == "allowed" else status,
             "server_uid": ident.get("server_uid"),
             "hostname": ident.get("label"),
+            "key_bound": bool(record.get("has_peer_key")),
             "version": merge_servers.panel_version()}
 
 
@@ -3298,9 +3449,12 @@ async def api_merge_status(request: Request):
     data, err = await _merge_incoming(request, purpose="status", allow_pending=True)
     if err:
         return err
-    status = await DB.run(merge_servers.request_status, data.get("iss"))
+    record = await DB.run(merge_servers.request_record, data.get("iss"))
+    status = record.get("status")
     ident = await _merge_local_identity()
     return {"status": "allowed" if status == "allowed" else status,
+            "link_key_required": bool(status == "allowed" and
+                                      not record.get("has_peer_key")),
             "server_uid": ident.get("server_uid"),
             "hostname": ident.get("label"),
             "version": merge_servers.panel_version()}
@@ -3433,7 +3587,12 @@ async def api_merge_upload(request: Request, path: str = "", name: str = ""):
     data, err = await _merge_incoming(request, required_scope="disk")
     if err:
         return err
-    directory, dest, reason = System.resolve_upload(path, name, None, staff=False)
+    # The role comes from the signed token, not the request body: a staff
+    # account with the disk scope still cannot aim a root-owned upload at a
+    # system path. Missing role claims fall back to the restrictive side.
+    role = data.get("role") or "staff"
+    directory, dest, reason = System.resolve_upload(
+        path, name, None, staff=role != "admin")
     if reason:
         code = 409 if reason == "exists" else 403 if reason == "blocked" else 400
         return JSONResponse(status_code=code, content={
@@ -3560,7 +3719,7 @@ async def api_merge_remote_static(request: Request, server_id: str):
     perms, server, scopes, err = await _merge_access(request, server_id)
     if err:
         return err
-    code, data, msg = await DB.run(
+    code, data, msg = await DB.run_net(
         merge_servers.call_for_user, server, perms.get("username", ""),
         perms.get("role"), "/api/merge/static", "GET", None, None, 10)
     if code != 200:
@@ -3575,7 +3734,7 @@ async def api_merge_remote_stats(request: Request, server_id: str):
     perms, server, scopes, err = await _merge_access(request, server_id)
     if err:
         return err
-    code, data, msg = await DB.run(
+    code, data, msg = await DB.run_net(
         merge_servers.call_for_user, server, perms.get("username", ""),
         perms.get("role"), "/api/merge/stats", "GET", None, None, 8)
     if code != 200:
@@ -3591,7 +3750,7 @@ async def api_merge_remote_processes(request: Request, server_id: str, by: str =
     perms, server, scopes, err = await _merge_access(request, server_id, required)
     if err:
         return err
-    code, data, msg = await DB.run(
+    code, data, msg = await DB.run_net(
         merge_servers.call_for_user, server, perms.get("username", ""),
         perms.get("role"), f"/api/merge/processes?by={'mem' if by == 'mem' else 'cpu'}",
         "GET", None, None, 10)
@@ -3608,7 +3767,7 @@ async def api_merge_remote_connections(request: Request, server_id: str,
     perms, server, scopes, err = await _merge_access(request, server_id, "network")
     if err:
         return err
-    code, data, msg = await DB.run(
+    code, data, msg = await DB.run_net(
         merge_servers.call_for_user, server, perms.get("username", ""),
         perms.get("role"),
         "/api/merge/connections" + ("?established=1" if established else ""),
@@ -3626,7 +3785,7 @@ async def api_merge_remote_files(request: Request, server_id: str, path: str = "
     if err:
         return err
     from urllib.parse import urlencode
-    code, data, msg = await DB.run(
+    code, data, msg = await DB.run_net(
         merge_servers.call_for_user, server, perms.get("username", ""),
         perms.get("role"), "/api/merge/files?" + urlencode({"path": path}),
         "GET", None, None, 15)
@@ -3642,7 +3801,7 @@ async def api_merge_remote_download(request: Request, server_id: str, path: str 
     perms, server, scopes, err = await _merge_access(request, server_id, "disk")
     if err:
         return err
-    resp, error = await DB.run(
+    resp, error = await DB.run_net(
         merge_servers.open_download, server, perms.get("username", ""),
         perms.get("role"), path, 30)
     if not resp:
@@ -3675,7 +3834,7 @@ async def api_merge_remote_delete(request: Request, server_id: str):
     if err:
         return err
     body = await _json_body(request)
-    code, data, msg = await DB.run(
+    code, data, msg = await DB.run_net(
         merge_servers.call_for_user, server, perms.get("username", ""),
         perms.get("role"), "/api/merge/delete", "DELETE",
         {"path": body.get("path") or ""}, None, 15)
@@ -3715,7 +3874,7 @@ async def api_merge_remote_upload(request: Request, server_id: str,
         if too_large:
             return JSONResponse(status_code=413, content={"error": f"Use a file under {_upload_limit_text()}."})
         with open(temp_path, "rb") as fh:
-            code, data = await DB.run(
+            code, data = await DB.run_net(
                 merge_servers.upload_file, server, perms.get("username", ""),
                 perms.get("role"), path, name, fh, total, 3600)
         if code != 200:
@@ -3767,6 +3926,13 @@ async def api_service_action(request: Request, name: str, action: str):
     perms, denied = await _require(request, _grant(needed))
     if denied:
         return denied
+    # SSH is admin-only everywhere else (the dedicated status and toggle
+    # routes), so a staff account must not be able to stop or restart it
+    # through the generic service controls either.
+    if _norm_service(name) in ("ssh.service", "sshd.service") and \
+            perms.get("role") != "admin":
+        return JSONResponse(status_code=403,
+                            content={"error": "Only an admin can do that."})
     ok, message = await DB.run(control_service, name, action)
     write_log("ACTION" if ok else "ERROR", "SERVICE", f"{action} service",
               actor=_admin_name(request), ip=_client_ip(request), target=name,
@@ -3987,6 +4153,7 @@ async def api_users_create(request: Request):
     except Exception as e:
         msg = "That username is already taken." if "unique" in str(e).lower() else "Could not create the user."
         return JSONResponse(status_code=400, content={"error": msg})
+    await DB.run(_forget_user_epoch, username)
     if "servers" in body:
         await DB.run(merge_servers.set_user_access, username, body.get("servers") or [])
     write_log("ACTION", "SECURITY", "Created panel user", actor=_admin_name(request),
@@ -4055,14 +4222,20 @@ async def api_users_update(request: Request, username: str):
         return JSONResponse(status_code=404, content={"error": "No such user."})
     if "servers" in body:
         await DB.run(merge_servers.set_user_access, username, body.get("servers") or [])
+        # Removing a linked server from an account must also close any terminal
+        # it already has open there. Closing all of this account's linked
+        # terminals is deliberate: narrowing either direction is a security
+        # action, and the user can reopen the ones they still have.
+        await _close_merge_proxies(username)
         notes.append("server access changed")
     # Drop the cached epoch so a reset or a narrowed grant set takes hold on the
     # target's very next request rather than up to ten seconds later.
-    _forget_user_epoch(username)
+    await DB.run(_forget_user_epoch, username)
     narrowed = (old_grants is not None and "grants" in fields
                 and panel_users._is_narrowing(old_grants, fields["grants"]))
     if narrowed or "password" in fields:
         _close_local_terminals(username)
+        await _close_merge_proxies(username)
     write_log("ACTION", "SECURITY", "Updated panel user", actor=_admin_name(request),
               ip=_client_ip(request), target=username, detail="; ".join(notes))
     return {"status": "ok"}
@@ -4084,7 +4257,11 @@ async def api_users_delete(request: Request, username: str):
     ok = await DB.run(_delete_panel_user, username)
     if not ok:
         return JSONResponse(status_code=404, content={"error": "No such user."})
+    # The tombstone is already stored; drop the cached epoch too so this
+    # worker rejects the deleted person's token on its very next request.
+    await DB.run(_forget_user_epoch, username)
     _close_local_terminals(username)
+    await _close_merge_proxies(username)
     await DB.run(merge_servers.delete_user_access, username)
     write_log("ACTION", "SECURITY", "Deleted panel user", actor=_admin_name(request),
               ip=_client_ip(request), target=username)
@@ -4202,7 +4379,7 @@ def _db_add_column(name, col_name, col_type):
 async def api_db_row_insert(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _grant("db_write"))
+    perms, denied = await _require(request, _is_admin)
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -4221,7 +4398,7 @@ async def api_db_row_insert(request: Request, name: str):
 async def api_db_row_update(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _grant("db_write"))
+    perms, denied = await _require(request, _is_admin)
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -4243,7 +4420,7 @@ async def api_db_row_update(request: Request, name: str):
 async def api_db_row_delete(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _grant("db_write"))
+    perms, denied = await _require(request, _is_admin)
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -4264,7 +4441,7 @@ async def api_db_row_delete(request: Request, name: str):
 async def api_db_add_column(request: Request, name: str):
     if not _authed(request):
         return _need_auth()
-    perms, denied = await _require(request, _grant("db_write"))
+    perms, denied = await _require(request, _is_admin)
     if denied:
         return denied
     if name not in _DB_SCHEMA_TABLES:
@@ -5522,6 +5699,9 @@ async def api_mail_sync(request: Request):
 async def api_ssh_status(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     try:
         active = subprocess.run(["systemctl", "is-active", "ssh"], capture_output=True, text=True).stdout.strip()
         enabled = subprocess.run(["systemctl", "is-enabled", "ssh"], capture_output=True, text=True).stdout.strip()
@@ -5533,6 +5713,9 @@ async def api_ssh_status(request: Request):
 async def api_ssh_toggle(request: Request):
     if not _authed(request):
         return _need_auth()
+    perms, denied = await _require(request, _is_admin)
+    if denied:
+        return denied
     body = await request.json()
     enable = bool(body.get("enable"))
     cmds = ([["systemctl", "enable", "ssh"], ["systemctl", "start", "ssh"]] if enable
@@ -5889,20 +6072,43 @@ def _term_close_if(sid, mt):
 # delete route looks them up here and asks each remote shell to end.
 _MERGE_LIVE = {}
 
+# Incoming linked sessions are approved once, then accepted before their PTY is
+# registered. A deny or key replacement in that window is invisible to the
+# _TERMS sweep, so each issuer also carries a generation those actions bump.
+_MERGE_REVOKE_GEN = {}
+_MERGE_WS_MAX = 1024 * 1024
+_MERGE_SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _merge_revoke_gen(issuer):
+    key = str(issuer or "")
+    return _MERGE_REVOKE_GEN.setdefault(key, 0)
+
+
+def _merge_revoke_bump(issuer):
+    key = str(issuer or "")
+    _MERGE_REVOKE_GEN[key] = _MERGE_REVOKE_GEN.get(key, 0) + 1
+
+
+def _merge_revoke_all():
+    for key in list(_MERGE_REVOKE_GEN):
+        _MERGE_REVOKE_GEN[key] += 1
+
 
 class _MergeProxy:
-    __slots__ = ("server_id", "browser", "remote", "sid", "gone")
+    __slots__ = ("server_id", "browser", "remote", "sid", "owner", "gone")
 
-    def __init__(self, server_id, browser, sid):
+    def __init__(self, server_id, browser, sid, owner=""):
         self.server_id = server_id
         self.browser = browser
         self.remote = None
         self.sid = sid
+        self.owner = owner
         self.gone = False
 
 
-def _merge_proxy_open(server_id, browser, sid):
-    proxy = _MergeProxy(server_id, browser, sid)
+def _merge_proxy_open(server_id, browser, sid, owner=""):
+    proxy = _MergeProxy(server_id, browser, sid, owner)
     _MERGE_LIVE.setdefault(server_id, []).append(proxy)
     return proxy
 
@@ -5942,6 +6148,25 @@ async def _end_merge_proxies(server_id):
     """Close the live outbound terminals of a linked server that was removed."""
     for proxy in list(_MERGE_LIVE.get(server_id, ())):
         await _end_merge_proxy(proxy)
+
+
+async def _close_merge_proxies(username=None):
+    """Close outbound linked terminals opened by a panel account.
+
+    The shell lives on the other panel, so dropping the browser socket alone
+    would leave it running. Ask the peer to kill it first, the same way a
+    deleted linked server is handled. Local PTY tabs are left to
+    _close_local_terminals.
+    """
+    for server_id in list(_MERGE_LIVE):
+        for proxy in list(_MERGE_LIVE.get(server_id, ())):
+            if username is not None and proxy.owner != username:
+                continue
+            await _end_merge_proxy(proxy)
+            try:
+                await proxy.browser.close()
+            except Exception:
+                pass
 
 def _close_merge_terminals(issuer=""):
     """Close inbound linked sessions, all of them or just one issuer."""
@@ -6181,20 +6406,43 @@ async def merge_terminal_ws(websocket: WebSocket):
     if not server or not server.get("approved"):
         await websocket.close(code=1008)
         return
-    sid = (websocket.query_params.get("sid") or secrets.token_hex(8)).strip()[:64]
+    sid = (websocket.query_params.get("sid") or "").strip()
+    if sid and not _MERGE_SID_RE.fullmatch(sid):
+        await websocket.close(code=1008)
+        return
+    if not sid:
+        sid = secrets.token_hex(8)
     rows, cols = _clamp_term_dims(websocket.query_params.get("rows"),
                                   websocket.query_params.get("cols"))
-    persist = (websocket.query_params.get("persist") or "") in ("1", "true", "yes", "on")
+    # Persist belongs to local tabs, which their owner can reattach to. A
+    # linked session has no local record here, so never ask the peer to keep
+    # its PTY alive after this browser leaves.
     token = merge_servers.make_server_token(
         server, subject=username, role="admin", scopes=merge_servers.ADMIN_SCOPES,
         purpose="api", ttl=120)
-    url = (merge_servers.server_ws_url(server, "/ws/merge/terminal") + "?" +
-           f"sid=mt_{sid}&rows={rows}&cols={cols}"
-           f"&persist={'1' if persist else '0'}")
-    await websocket.accept()
-    proxy = _merge_proxy_open(server_id, websocket, sid)
+    from urllib.parse import urlencode
+    url = merge_servers.server_ws_url(server, "/ws/merge/terminal") + "?" + urlencode({
+        "sid": f"mt_{sid}", "rows": rows, "cols": cols, "persist": "0"})
+    # Register before the accept/dial so a delete in that window can flag this
+    # proxy instead of missing a session that has no live entry yet.
+    proxy = _merge_proxy_open(server_id, websocket, sid, owner=username)
     remote = None
     try:
+        await websocket.accept()
+        # Also re-read after the accept, for a row removed just before this
+        # proxy was registered. Either way the handler self-closes.
+        if not await DB.run(merge_servers.get_server, server_id, False):
+            proxy.gone = True
+        if proxy.gone:
+            await _end_merge_proxy(proxy)
+            try:
+                await websocket.send_text(
+                    "\r\n\x1b[31mThat server was removed.\x1b[0m\r\n")
+            except Exception:
+                pass
+            await websocket.close(code=1008)
+            _merge_proxy_done(proxy)
+            return
         import inspect
         import websockets
         # The bearer token stays in a header so it cannot end up in a proxy or
@@ -6207,7 +6455,7 @@ async def merge_terminal_ws(websocket: WebSocket):
         header_kw = ("additional_headers" if "additional_headers" in params
                      else "extra_headers")
         remote = await websockets.connect(
-            url, max_size=None, open_timeout=12, close_timeout=3,
+            url, max_size=_MERGE_WS_MAX, open_timeout=12, close_timeout=3,
             **{header_kw: {"Authorization": "Bearer " + token}})
     except Exception as e:
         _merge_proxy_done(proxy)
@@ -6235,11 +6483,23 @@ async def merge_terminal_ws(websocket: WebSocket):
                 await remote.send(t)
 
     async def remote_to_browser():
-        async for msg in remote:
-            if isinstance(msg, bytes):
-                await websocket.send_bytes(msg)
-            else:
-                await websocket.send_text(msg)
+        try:
+            async for msg in remote:
+                if isinstance(msg, bytes):
+                    await websocket.send_bytes(msg)
+                else:
+                    await websocket.send_text(msg)
+        except Exception as e:
+            code = getattr(e, "code", None)
+            if code is None:
+                code = getattr(getattr(e, "rcvd", None), "code", None)
+            text = str(e).lower()
+            if code == 1009 or "too big" in text or "1009" in text:
+                logging.warning(
+                    f"linked terminal: peer message exceeded {_MERGE_WS_MAX} "
+                    "bytes; closing proxy")
+                return
+            raise
 
     tasks = []
     try:
@@ -6276,16 +6536,24 @@ async def merge_terminal_ws(websocket: WebSocket):
 @app.websocket("/ws/merge/terminal")
 async def merge_remote_terminal_ws(websocket: WebSocket):
     """The receiving side of a linked terminal. Authenticated by the server JWT
-    in the Authorization header, not by a browser session cookie."""
+    in the Authorization header, not by a browser session cookie. The token must
+    be signed with the key this panel bound for that peer at handshake time."""
     token = merge_servers._ws_token(websocket)
     ident = await _merge_local_identity()
-    data = _merge_verify(merge_servers.verify_token(token, ident.get("key", "")), ident)
-    if not data or data.get("purpose") != "api":
+    # Capture the issuer's revocation generation before the verify await. A
+    # deny or key rotation that lands while verification is in flight bumps it
+    # and sweeps _TERMS, which does not contain this PTY yet. Comparing the
+    # captured value after registration closes that window.
+    hinted_issuer = str(
+        merge_servers._unverified_claims(token).get("iss") or "")
+    revoke_gen = _MERGE_REVOKE_GEN.get(hinted_issuer, 0)
+    data, err = await DB.run(merge_servers.verify_incoming, token, "api",
+                             False, True, ident)
+    if err or not data:
         await websocket.close(code=1008)
         return
-    status = await DB.run(merge_servers.request_status, data.get("iss"))
     scopes = data.get("scopes") or []
-    if status != "allowed" or "terminal" not in scopes or data.get("role") != "admin":
+    if "terminal" not in scopes or data.get("role") != "admin":
         await websocket.close(code=1008)
         return
     qp = websocket.query_params
@@ -6303,6 +6571,10 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
     if mt is not None and mt.dead:
         _term_close(sid)
         mt = None
+    # Linked sessions never stay on. Their issuer has no record of this PTY and
+    # cannot reattach to it, so a kept shell would only be orphaned here. A
+    # local tab is different: its owner can reconnect to it.
+    persist = False
     if mt is None:
         try:
             mt = _ManagedTerm(sid, persist, rows, cols, owner=owner)
@@ -6312,15 +6584,24 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
             return
         _TERMS[sid] = mt
     else:
-        if persist and not mt.persist:
-            # Attaching must not downgrade Stay: only an explicit persist
-            # control message from a view may turn it off.
-            mt.persist = True
+        # A linked session created before this rule may still have persist on;
+        # force it off so it cannot outlive this browser either.
+        mt.persist = False
         # Re-attaching to a session that outlived its first browser: only take
         # the connecting view's size when nobody else is watching. Resizing a
         # pty another browser is actively using would reflow its screen.
         if not mt.subscribers:
             mt.resize(rows, cols)
+    if _MERGE_REVOKE_GEN.get(str(data.get("iss") or ""), 0) != revoke_gen:
+        # Approval was withdrawn or the key rotated while this socket was being
+        # verified or accepted, before the sweep could see the session. End it
+        # now.
+        _term_close_if(sid, mt)
+        try:
+            await websocket.close(code=1008)
+        except Exception:
+            pass
+        return
     # Snapshot and subscribe in one synchronous block so the replay cannot
     # overlap the live queue, then send the handshake and that snapshot.
     q: asyncio.Queue = asyncio.Queue()
@@ -6365,8 +6646,8 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
                         mt.resize(*_clamp_term_dims(r, c))
                     except Exception:
                         pass
-            if "persist" in ctrl:
-                mt.persist = bool(ctrl["persist"])
+            # persist is deliberately ignored for linked sessions; they end
+            # with their browser.
             if ctrl.get("kill"):
                 if not ctrl.get("force") and len(mt.subscribers) > 1:
                     # Another view of this linked shell is attached; closing
@@ -6382,7 +6663,9 @@ async def merge_remote_terminal_ws(websocket: WebSocket):
     finally:
         mt.subscribers.discard(q)
         out_task.cancel()
-        kept = mt.persist and not mt.dead
+        # A linked PTY is never kept for a later attachment; see the persist
+        # note above. The last view always ends it.
+        kept = False
         if not kept and not mt.subscribers:
             _term_close_if(sid, mt)
         write_log("ACTION", "TERMINAL",

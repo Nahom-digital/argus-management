@@ -95,6 +95,8 @@ def test_a_session_with_no_os_account_is_not_pretended_to_be_jailed():
     assert System.PtySession(run_as="somebody", jail=True).jail is True
 
 
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="the jail test needs a non-root home; root's home is /root")
 @pytest.mark.skipif(not System.jail_available(),
                     reason="bubblewrap is not installed on this machine")
 def test_a_real_jailed_shell_cannot_walk_out_of_its_home(tmp_path):

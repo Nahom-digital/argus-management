@@ -529,7 +529,7 @@ async function loadRemoteStatic(){
     if(!r) return;
     const d=await r.json();
     if(_srvActive!==id) return;
-    if(!r.ok){ showRemoteDown(d.error||'That server is unreachable.'); return; }
+    if(!r.ok){ showRemoteDown(d.error||'That server is unreachable.', d.server_status); return; }
     const active=document.activeElement;
     if(active&&grid.contains(active)&&active.tagName==='BUTTON'){ remoteStaticLoaded=true; return; }
     grid.innerHTML=renderDeviceInfo(d);
@@ -538,14 +538,18 @@ async function loadRemoteStatic(){
   }catch(e){}
   finally{ if(remoteStaticBusyFor===id) remoteStaticBusyFor=null; }
 }
-function showRemoteDown(message){
+function showRemoteDown(message, status){
   const down=$('remote-down'), live=$('remote-live');
-  if(down){ down.hidden=false; down.innerHTML=`<div class="empty-state"><b>That server is not answering.</b><br>${esc(message||'')}</div>`; }
+  let title='That server is not answering.';
+  if(status==='pending') title='Waiting for approval.';
+  else if(status==='denied') title='This panel is not allowed on that server.';
+  else if(status==='connected') title='That request was refused.';
+  if(down){ down.hidden=false; down.innerHTML=`<div class="empty-state"><b>${esc(title)}</b><br>${esc(message||'')}</div>`; }
   if(live) live.hidden=true;
   stopRemotePolling();
   remoteStaticLoaded=false;
   const s=remoteServer(_srvActive);
-  if(s&&String(s.status||'').toLowerCase()!=='down'){ s.status='down'; s.last_error=message||s.last_error; renderServerRail(); renderRemoteMeta(); }
+  if(s&&status&&String(s.status||'').toLowerCase()!==String(status).toLowerCase()){ s.status=status; s.last_error=message||s.last_error; renderServerRail(); renderRemoteMeta(); }
   syncRemoteChrome();
 }
 function showRemoteUp(){
@@ -567,7 +571,7 @@ async function pollRemoteStats(){
     if(!r) return;
     const d=await r.json();
     if(_srvActive!==id) return;
-    if(!r.ok){ showRemoteDown(d.error||'That server is unreachable.'); return; }
+    if(!r.ok){ showRemoteDown(d.error||'That server is unreachable.', d.server_status); return; }
     showRemoteUp();
     if(d.cpu_percent!=null){
       pushHist(remoteCpuHist,d.cpu_percent);
@@ -1699,8 +1703,11 @@ async function addLinkedServer(){
       }else if(hs.ok&&hs.status==='connected'){
         fb.textContent='Server linked. It appears in the Server page.';
         fb.classList.add('ok');
-      }else if(hs.ok&&hs.status==='denied'){
+      }else if(hs.status==='denied'){
         fb.textContent='Saved. That panel has denied this server; its admin must allow it in Server Configuration.';
+        fb.classList.add('err');
+      }else if(hs.status==='key_mismatch'){
+        fb.textContent='Saved, but that panel already has a different key for this server. Remove the link there and re-add it, or replace the key here.';
         fb.classList.add('err');
       }else if(hs.ok){
         fb.textContent='Request sent. That panel\'s admin must allow it in Server Configuration before the server appears.';
@@ -1754,11 +1761,12 @@ async function replaceLinkedServerKey(id){
       headers:{'Content-Type':'application/json'},body:JSON.stringify({key:key.trim()})});
     const d=await r.json();
     if(!r.ok){ appToast(d.error||'Could not replace the key','err'); return; }
-    const st=(d.result||{}).status;
+    const st=(d.result||{}).status, hsErr=(d.result||{}).error;
     const msg=st==='connected'?'Key replaced, server connected'
       :st==='pending'?'Key replaced, waiting for approval'
       :st==='denied'?'Key replaced, but that panel has not allowed this server'
-      :'Key replaced; the server did not answer';
+      :st==='key_mismatch'?'Key replaced, but that panel is linked to a different key. Remove and re-add the link there.'
+      :'Key replaced; '+(hsErr||'the server did not answer');
     appToast(msg,st==='connected'?'ok':st==='pending'||st==='denied'?'info':'err',7000);
     loadLinkedServers(); loadMergeRequests();
   }catch(e){ appToast('Request failed','err'); }
@@ -1925,7 +1933,10 @@ function grantFormHtml(values, opts){
   const readonly=!!(opts&&opts.readonly), idp=(opts&&opts.idPrefix)||'g';
   if(!_GRANT_DEFS||!_GRANT_DEFS.length) return '<div class="empty-state">No permissions defined.</div>';
   return (_GRANT_GROUPS||[]).map(group=>{
-    const defs=_GRANT_DEFS.filter(g=>g.group===group.key);
+    // db_write is retained in the registry so stored grants keep loading, but
+    // every DB write route is admin-only now, so offering it to staff would be
+    // a control that does nothing.
+    const defs=_GRANT_DEFS.filter(g=>g.group===group.key&&g.key!=='db_write');
     if(!defs.length) return '';
     const rows=defs.map(g=>{
       const val=values&&(g.key in values)?values[g.key]:g.default;
@@ -4146,7 +4157,7 @@ function termRenderTabs(){
     const dot=document.createElement('span'); dot.className='tt-dot'+(tab.persist?' on':''); dot.title=tab.persist?'Stay on':'Stay off';
     const nm=document.createElement('span'); nm.className='tt-name'; nm.textContent=tab.name;
     const x=document.createElement('button'); x.className='tt-x'; x.textContent='×'; x.onclick=(e)=>{ e.stopPropagation(); termCloseTab(tab.sid); };
-    chip.appendChild(dot); chip.appendChild(nm); chip.appendChild(x); chip.onclick=()=>termActivate(tab.sid); bar.insertBefore(chip,addBtn);
+    if(!tab.server) chip.appendChild(dot); chip.appendChild(nm); chip.appendChild(x); chip.onclick=()=>termActivate(tab.sid); bar.insertBefore(chip,addBtn);
   });
 }
 function termAddTab(){ const tab=termMakeTab(genSid(),null,false); termTabs.push(tab); termRenderTabs(); termStoreSave(); termActivate(tab.sid); }
@@ -4343,7 +4354,7 @@ function termBuildPanel(tab){
       '<button class="term-tool t-select" type="button" aria-pressed="false" title="Select text with the mouse instead of sending mouse events to apps like PI or opencode"><svg class="ic"><use href="#ic-square"/></svg><span>Select</span></button>'+
     '</div>'+
     '<span class="term-title">'+esc(termTitle)+'</span><span class="term-status">connecting…</span>'+
-    '<label class="term-stay" title="Keep this session running even after you close the site"><input type="checkbox"'+(tab.persist?' checked':'')+'><span>Stay on</span></label>'+
+    (tab.server?'':'<label class="term-stay" title="Keep this session running even after you close the site"><input type="checkbox"'+(tab.persist?' checked':'')+'><span>Stay on</span></label>')+
     '<button class="term-clear t-copy" type="button" title="Copy the selected terminal text"><svg class="ic"><use href="#ic-copy"/></svg><span>Copy</span></button>'+
     '<button class="term-clear t-clear">Clear</button><button class="term-clear t-recon">Reconnect</button>'+
     '<button class="term-clear t-full" type="button" aria-pressed="false" title="Fullscreen terminal"><svg class="ic"><use href="#ic-maximize-2"/></svg><span>Fullscreen</span></button>'+
@@ -4366,7 +4377,7 @@ function termBuildPanel(tab){
   const screenBox=document.createElement('div'); screenBox.className='term-screen-box'; host.appendChild(screenBox);
   tab.els={wrap,host,status,stay,screenBox};
   termApplyDisplayBox(tab);
-  stay.addEventListener('change',()=>{
+  if(stay) stay.addEventListener('change',()=>{
     tab.persist=stay.checked;
     if(tab.ws&&tab.ws.readyState===WebSocket.OPEN){
       try{ tab.ws.send(JSON.stringify({persist:tab.persist})); }catch(e){}

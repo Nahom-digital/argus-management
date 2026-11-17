@@ -323,6 +323,14 @@ def test_an_exited_local_shell_closes_the_websocket(client, monkeypatch):
     assert "gone" not in panel._TERMS
 
 
+def _linked_token(issuer="issuerA"):
+    """A decodable token for the linked-terminal tests. Their verification is
+    monkeypatched, but the handler still has to read the issuer from the token
+    before it can look up the peer."""
+    return panel.merge_servers.sign_token(
+        "test-key-that-is-long-enough", {"iss": issuer, "purpose": "api"})
+
+
 def test_an_exited_linked_shell_closes_the_websocket(client, monkeypatch):
     """The receiving side of a linked terminal has the same pump and must close
     too, so the local proxy sees EOF and the browser gets onclose."""
@@ -334,12 +342,16 @@ def test_an_exited_linked_shell_closes_the_websocket(client, monkeypatch):
     monkeypatch.setattr(panel, "_merge_local_identity", identity)
     monkeypatch.setattr(panel.merge_servers, "verify_token",
                         lambda token, key: {"purpose": "api", "iss": "issuerA",
-                                            "sub": "alice", "role": "admin",
+                                            "aud": "local", "sub": "alice",
+                                            "role": "admin",
                                             "scopes": ["terminal"]})
-    monkeypatch.setattr(panel.merge_servers, "request_status",
-                        lambda issuer: "allowed")
+    monkeypatch.setattr(panel.merge_servers, "request_record",
+                        lambda issuer: {"status": "allowed",
+                                        "has_peer_key": True,
+                                        "peer_key": "local-key"})
 
-    with client.websocket_connect("/ws/merge/terminal?sid=dead") as ws:
+    with client.websocket_connect(
+            "/ws/merge/terminal?sid=dead&token=" + _linked_token()) as ws:
         assert json.loads(ws.receive_text())["sid"] == "mr_dead"
         term = panel._TERMS["mr_dead"]
         subs = _subscribed(term)
@@ -366,12 +378,17 @@ def test_a_linked_sid_owned_by_another_peer_is_refused(client, monkeypatch):
     monkeypatch.setattr(panel, "_merge_local_identity", identity)
     monkeypatch.setattr(panel.merge_servers, "verify_token",
                         lambda token, key: {"purpose": "api", "iss": "issuerB",
-                                            "sub": "bob", "role": "admin",
+                                            "aud": "local", "sub": "bob",
+                                            "role": "admin",
                                             "scopes": ["terminal"]})
-    monkeypatch.setattr(panel.merge_servers, "request_status",
-                        lambda issuer: "allowed")
+    monkeypatch.setattr(panel.merge_servers, "request_record",
+                        lambda issuer: {"status": "allowed",
+                                        "has_peer_key": True,
+                                        "peer_key": "local-key"})
 
-    with client.websocket_connect("/ws/merge/terminal?sid=bound") as ws:
+    with client.websocket_connect(
+            "/ws/merge/terminal?sid=bound&token="
+            + _linked_token("issuerB")) as ws:
         _expect_close(ws)
 
     assert panel._TERMS.get("mr_bound") is old
@@ -389,10 +406,13 @@ def test_a_linked_terminal_clamps_its_size_and_leaves_other_views_alone(
     monkeypatch.setattr(panel, "_merge_local_identity", identity)
     monkeypatch.setattr(panel.merge_servers, "verify_token",
                         lambda token, key: {"purpose": "api", "iss": "issuerA",
-                                            "sub": "alice", "role": "admin",
+                                            "aud": "local", "sub": "alice",
+                                            "role": "admin",
                                             "scopes": ["terminal"]})
-    monkeypatch.setattr(panel.merge_servers, "request_status",
-                        lambda issuer: "allowed")
+    monkeypatch.setattr(panel.merge_servers, "request_record",
+                        lambda issuer: {"status": "allowed",
+                                        "has_peer_key": True,
+                                        "peer_key": "local-key"})
 
     term = _FakeTerm("mr_shared", True, 24, 80,
                      owner="merge:issuerA:alice")
@@ -401,13 +421,15 @@ def test_a_linked_terminal_clamps_its_size_and_leaves_other_views_alone(
     panel._TERMS["mr_shared"] = term
 
     with client.websocket_connect(
-            "/ws/merge/terminal?sid=shared&persist=1&rows=50&cols=200") as ws:
+            "/ws/merge/terminal?sid=shared&persist=1&rows=50&cols=200&token="
+            + _linked_token()) as ws:
         assert json.loads(ws.receive_text())["sid"] == "mr_shared"
         assert len(_subscribed(term)) == 2
         assert (term.rows, term.cols) == (24, 80)
 
     with client.websocket_connect(
-            "/ws/merge/terminal?sid=big&rows=99999&cols=-9") as ws:
+            "/ws/merge/terminal?sid=big&rows=99999&cols=-9&token="
+            + _linked_token()) as ws:
         assert json.loads(ws.receive_text())["sid"] == "mr_big"
         big = panel._TERMS["mr_big"]
         assert (big.rows, big.cols) == (panel._TERM_ROWS_MAX,
